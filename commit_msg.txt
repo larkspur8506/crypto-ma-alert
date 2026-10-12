@@ -1,12 +1,8 @@
-init: 双均线(6MA)趋势系统信号提醒服务
+fix: 修启动崩溃（DB(path) 少参、缺 python-multipart）+ 加装配冒烟测试
 
-- app/strategy.py  纯 stdlib 核心（SMA/EMA、band 分位密集、突破入场、SMA20 离场）
-- app/market.py    MEXC 合约 K 线 + 降级链 + 完整性校验（根数/单调/新鲜度）
-- app/sizing.py    以损定仓 → MEXC 张数/名义/保证金/强平价
-- app/engine.py    walk() 纯状态机（线上 tick 与 dry-run 共用）+ 提醒文案
-- app/notify.py    企业微信 + Telegram 双通道（重试、分段、成功后才去重）
-- app/main.py      FastAPI + APScheduler + 状态页/确认页/参数页
-- tests/           32 项单测
-- scripts/         dry-run 回放 + 信号级/回合级交叉验证
-
-口径与回测引擎逐笔一致（14/14、24/24 回合）；只提醒不下单。
+- app/main.py: db = DB() → DB(DB_PATH)，否则容器启动即 TypeError
+- requirements.txt: 补 python-multipart（FastAPI 用 Form/request.form() 时必需，
+  缺失会在 import 期 RuntimeError，容器同样起不来）
+- tests/test_app_smoke.py: 新增装配层冒烟测试（import app.main + 路由注册 + 配置覆盖），
+  专门抓这类「单测全绿但容器起不来」的问题
+- ci.yml: 测试前先 pip install -r requirements.txt，否则冒烟测试会被 skip

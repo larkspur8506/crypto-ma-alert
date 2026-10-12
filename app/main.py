@@ -19,7 +19,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("cma")
 
 DB_PATH = os.environ.get("DB_PATH", "/app/data/crypto_ma.db")
-db = DB()
+db = DB(DB_PATH)
 config = Config()
 notifier = get_notifier(config)
 scheduler = None
