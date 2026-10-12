@@ -312,6 +312,9 @@ async def confirm_post(pid: int, request: Request):
             stop = float(str(form.get("actual_stop") or row["stop_price"]))
         except ValueError:
             raise HTTPException(400, "数值格式错误")
+        err = engine.validate_stop_side(row["side"] or 1, entry, stop)
+        if err:
+            raise HTTPException(400, err)
         placed = bool(form.get("stop_placed"))
         db.confirm_position(pid, entry, qty, stop, placed)
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"

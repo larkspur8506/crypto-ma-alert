@@ -126,6 +126,19 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     ])
 
 
+def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
+    """校验止损价在正确一侧：做多必须低于入场、做空必须高于入场。返回错误文案或 None。
+
+    确认流里用户手填的止损价必须过这一关——做空填成下方止损会静默污染 R 统计，
+    而且实盘上那个止损单方向是反的（等于没有保护）。
+    """
+    if side == 1 and stop >= entry:
+        return f"做多的止损价必须低于入场价（你填的是 入场 {entry:,.2f} / 止损 {stop:,.2f}）"
+    if side == -1 and stop <= entry:
+        return f"做空的止损价必须高于入场价（你填的是 入场 {entry:,.2f} / 止损 {stop:,.2f}）"
+    return None
+
+
 def format_missed(cfg, sig: strategy.Signal) -> str:
     return "\n".join([
         f"{cfg.alert_prefix}⚠️ 错过的信号（补报）",

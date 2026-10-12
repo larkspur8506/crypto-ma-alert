@@ -159,8 +159,10 @@ class DB:
             return
         entry = p["actual_entry"] or p["entry_price"]
         stop = p["actual_stop"] or p["stop_price"]
-        risk = entry - stop
-        r = (exit_price - entry) / risk if risk > 0 else 0.0
+        side = p["side"] or 1
+        risk = abs(entry - stop)
+        move = (exit_price - entry) if side == 1 else (entry - exit_price)
+        r = move / risk if risk > 0 else 0.0
         self.conn.execute(
             "UPDATE positions SET status='closed', exit_price=?, exit_reason=?, r_multiple=?, closed_at=? "
             "WHERE id=?", (exit_price, exit_reason, r, now(), pid))

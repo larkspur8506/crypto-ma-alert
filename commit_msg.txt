@@ -1,19 +1,17 @@
-feat: 支持做空（跌破密集区 + 收盘<MA200 趋势过滤）
+fix: 做空执行链路的两个 bug（R 统计 + 止损方向校验）
 
-背景：早期按日线口径得出「做空均R≈0」并据此关掉了做空，但用线上 4h 参数重测后
-做空是正期望的（均R +0.115，t=1.49）。裸做空很差（年化 +8.1%/回撤 35.9%），
-加上「收盘价 < SMA200 才做空」的趋势过滤后，组合年化从 +35.0% 提到 +49.6%、
-回撤 24.2%→30.7%。做空本质是熊市保险（2018 +30.5R、2022 +13.5R；牛市年份亏）。
+加做空时只验证了「信号正确」和「确认页显示方向」，没有走完整条执行链路，漏掉两个做空专属 bug：
 
-- strategy: Signal 加 side；evaluate_entry 支持双向（做空需收盘<MA200，可配置/关闭）；
-  compute_indicators 增加 sma200；exit_triggered 支持 side（做空=收盘站上 SMA20）
-- sizing: size_order 支持 side（做空止损在上方）
-- db: positions 新增 side 列 + 轻量迁移（ALTER TABLE，老库自动补列）
-- engine: walk 双向离场判定（做空看 high>=stop、收盘站上 SMA20）；提醒文案改为
-  做多/做空、开多/开空、止损单「买入平仓」；确认页显示方向
-- config: ENABLE_LONG / ENABLE_SHORTS / SHORT_REGIME_MA，且都可在 /admin/rules 改
-- tests: 新增 10 项做空单测（信号/过滤/离场/仓位），共 43 项
-- xvalidate / xvalidate_roundtrips: 改为双向比对
+1. db.close_position 用了只做多的 R 公式：
+     risk = entry - stop                       # 做空时 risk 为负
+     r = (exit_price - entry)/risk if risk > 0 else 0.0
+   做空的 risk 恒为负 → 命中 else 分支 → **每笔做空的 r_multiple 都记成 0.0**。
+   而周报的均R/总R/胜率全部读这个字段 → 盈利的空单不计入胜率、做空对统计贡献为 0。
+   修：按 side 算方向，risk 取绝对值。
 
-验证：信号级 BTC 125多+40空 / ETH 136多+60空 与回测引擎完全相同；
-回合级 BTC 14多7空 / ETH 24多9空 逐笔一致。
+2. 确认流不校验止损方向：做空可以填一个低于入场价的止损，系统静默接受。
+   开仓路径有校验（size_order 会抛错），确认路径没有。
+   修：新增 engine.validate_stop_side()，确认页对方向填反的止损返回 400 并提示。
+
+测试：新增 tests/test_positions.py（12 项）——做空/做多的 R 双向回归、实际成交价优先、
+周报胜率计入空单、止损方向校验 4 例、做空靠 bar.high 触发止损的状态机回归。共 55 项全绿。
