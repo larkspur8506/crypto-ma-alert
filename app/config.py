@@ -43,6 +43,11 @@ class Config:
     band_quantile: float = _env_f("BAND_QUANTILE", strategy.BAND_QUANTILE)
     min_squeeze_bars: int = _env_i("MIN_SQUEEZE_BARS", strategy.MIN_SQUEEZE_BARS)
 
+    # 方向：做空必须带趋势过滤（回测：裸做空年化仅 +8%/回撤 36%；加 MA200 过滤后组合年化 +49.6%）
+    enable_long: bool = _env("ENABLE_LONG", "true").lower() in ("1", "true", "yes")
+    enable_shorts: bool = _env("ENABLE_SHORTS", "true").lower() in ("1", "true", "yes")
+    short_regime_ma: int = _env_i("SHORT_REGIME_MA", strategy.REGIME_MA)
+
     # 服务
     base_url: str = _env("BASE_URL", "https://ma.222677.xyz")
     admin_token: str = _env("ADMIN_TOKEN")
@@ -66,13 +71,22 @@ class Config:
             self.token_secret = self.admin_token or "dev-secret-change-me"
 
     # ---- DB 可覆盖项 ----
-    OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max")
+    OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
+                   "enable_shorts", "short_regime_ma")
 
     def apply_db(self, values: dict) -> "Config":
         for k in self.OVERRIDABLE:
-            if k in values and values[k] not in (None, ""):
-                try:
-                    setattr(self, k, float(values[k]))
-                except (TypeError, ValueError):
-                    continue
+            if k not in values or values[k] in (None, ""):
+                continue
+            raw = values[k]
+            cur = getattr(self, k, None)
+            try:
+                if isinstance(cur, bool) or str(raw).strip().lower() in ("true", "false"):
+                    setattr(self, k, str(raw).strip().lower() in ("true", "1", "yes"))
+                elif isinstance(cur, int):
+                    setattr(self, k, int(float(raw)))
+                else:
+                    setattr(self, k, float(raw))
+            except (TypeError, ValueError):
+                continue
         return self

@@ -50,14 +50,14 @@ def max_safe_leverage(stop_dist: float, mmr: float = MAINTENANCE_MARGIN_RATE) ->
 
 
 def size_order(symbol: str, entry_price: float, stop_price: float, equity: float,
-               risk_pct: float, leverage: float = 5.0) -> Order:
-    """按「单笔风险 = 权益 × risk_pct」倒算 MEXC 合约张数。"""
+               risk_pct: float, leverage: float = 5.0, side: int = 1) -> Order:
+    """按「单笔风险 = 权益 × risk_pct」倒算 MEXC 合约张数（多空同一套公式）。"""
     contract_size, step, min_vol, _ = SPECS[symbol]
     if entry_price <= 0 or equity <= 0 or risk_pct <= 0:
         raise ValueError("entry_price / equity / risk_pct 必须为正")
-    risk_unit = entry_price - stop_price
+    risk_unit = (entry_price - stop_price) if side == 1 else (stop_price - entry_price)
     if risk_unit <= 0:
-        raise ValueError("止损价必须低于入场价（v1 只做多）")
+        raise ValueError("做多要求止损低于入场价，做空要求止损高于入场价")
 
     risk_u = equity * risk_pct
     stop_dist = risk_unit / entry_price

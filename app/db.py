@@ -10,10 +10,13 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import time
 from typing import Any, Dict, List, Optional
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS configuration (
@@ -26,6 +29,7 @@ CREATE TABLE IF NOT EXISTS positions (
     symbol TEXT NOT NULL,
     signal_bar_ms INTEGER NOT NULL,
     status TEXT NOT NULL,              -- pending | open | closed | ignored
+    side INTEGER NOT NULL DEFAULT 1,   -- +1 做多 / -1 做空
     entry_price REAL NOT NULL,         -- 信号建议入场价（次根开盘）
     stop_price REAL NOT NULL,
     stop_dist REAL NOT NULL,
@@ -84,7 +88,15 @@ class DB:
         self.conn = sqlite3.connect(path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """轻量迁移：老库补新列（CREATE TABLE IF NOT EXISTS 不会改已存在的表）。"""
+        cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
+        if "side" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN side INTEGER NOT NULL DEFAULT 1")
+            logger.info("[db] 迁移：positions 新增 side 列")
 
     # ---------------- configuration
     def get_config(self) -> Dict[str, str]:
@@ -116,12 +128,13 @@ class DB:
             "ORDER BY signal_bar_ms DESC LIMIT 1", (symbol,)).fetchone()
 
     def create_position(self, **kw) -> int:
-        cols = ("symbol, signal_bar_ms, status, entry_price, stop_price, stop_dist, contracts, "
+        cols = ("symbol, signal_bar_ms, status, side, entry_price, stop_price, stop_dist, contracts, "
                 "coin_qty, notional, risk_u, created_at, equity_at_entry")
-        vals = (kw["symbol"], kw["signal_bar_ms"], kw.get("status", "pending"), kw["entry_price"],
-                kw["stop_price"], kw["stop_dist"], kw["contracts"], kw["coin_qty"], kw["notional"],
-                kw["risk_u"], now(), kw.get("equity_at_entry"))
-        cur = self.conn.execute(f"INSERT OR IGNORE INTO positions({cols}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", vals)
+        vals = (kw["symbol"], kw["signal_bar_ms"], kw.get("status", "pending"), kw.get("side", 1),
+                kw["entry_price"], kw["stop_price"], kw["stop_dist"], kw["contracts"],
+                kw["coin_qty"], kw["notional"], kw["risk_u"], now(), kw.get("equity_at_entry"))
+        cur = self.conn.execute(
+            f"INSERT OR IGNORE INTO positions({cols}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
         self.conn.commit()
         return cur.lastrowid
 

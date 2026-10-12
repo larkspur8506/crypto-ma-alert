@@ -1,8 +1,19 @@
-fix: 修启动崩溃（DB(path) 少参、缺 python-multipart）+ 加装配冒烟测试
+feat: 支持做空（跌破密集区 + 收盘<MA200 趋势过滤）
 
-- app/main.py: db = DB() → DB(DB_PATH)，否则容器启动即 TypeError
-- requirements.txt: 补 python-multipart（FastAPI 用 Form/request.form() 时必需，
-  缺失会在 import 期 RuntimeError，容器同样起不来）
-- tests/test_app_smoke.py: 新增装配层冒烟测试（import app.main + 路由注册 + 配置覆盖），
-  专门抓这类「单测全绿但容器起不来」的问题
-- ci.yml: 测试前先 pip install -r requirements.txt，否则冒烟测试会被 skip
+背景：早期按日线口径得出「做空均R≈0」并据此关掉了做空，但用线上 4h 参数重测后
+做空是正期望的（均R +0.115，t=1.49）。裸做空很差（年化 +8.1%/回撤 35.9%），
+加上「收盘价 < SMA200 才做空」的趋势过滤后，组合年化从 +35.0% 提到 +49.6%、
+回撤 24.2%→30.7%。做空本质是熊市保险（2018 +30.5R、2022 +13.5R；牛市年份亏）。
+
+- strategy: Signal 加 side；evaluate_entry 支持双向（做空需收盘<MA200，可配置/关闭）；
+  compute_indicators 增加 sma200；exit_triggered 支持 side（做空=收盘站上 SMA20）
+- sizing: size_order 支持 side（做空止损在上方）
+- db: positions 新增 side 列 + 轻量迁移（ALTER TABLE，老库自动补列）
+- engine: walk 双向离场判定（做空看 high>=stop、收盘站上 SMA20）；提醒文案改为
+  做多/做空、开多/开空、止损单「买入平仓」；确认页显示方向
+- config: ENABLE_LONG / ENABLE_SHORTS / SHORT_REGIME_MA，且都可在 /admin/rules 改
+- tests: 新增 10 项做空单测（信号/过滤/离场/仓位），共 43 项
+- xvalidate / xvalidate_roundtrips: 改为双向比对
+
+验证：信号级 BTC 125多+40空 / ETH 136多+60空 与回测引擎完全相同；
+回合级 BTC 14多7空 / ETH 24多9空 逐笔一致。

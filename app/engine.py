@@ -47,6 +47,7 @@ class PositionState:
     status: str = "pending"
     actual_entry: Optional[float] = None
     actual_stop: Optional[float] = None
+    side: int = 1
 
     @property
     def eff_entry(self) -> float:
@@ -55,6 +56,14 @@ class PositionState:
     @property
     def eff_stop(self) -> float:
         return float(self.actual_stop or self.stop_price)
+
+    @property
+    def action_label(self) -> str:
+        return "多单" if self.side == 1 else "空单"
+
+    @property
+    def close_side(self) -> str:
+        return "卖出平仓" if self.side == 1 else "买入平仓"
 
 
 @dataclass
@@ -99,13 +108,16 @@ def confirm_url(cfg, position_id: int, action: str = "view") -> str:
 def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool = False) -> str:
     if stale:
         return format_missed(cfg, sig)
+    long = sig.is_long
+    stop_note = f"距离 {sig.stop_dist * 100:.2f}%" + ("" if long else "，在价格上方")
     return "\n".join([
-        f"{cfg.alert_prefix}{sig.symbol} 做多信号（4h 收盘 {fmt_ms(sig.bar_open_ms)} UTC）",
+        f"{cfg.alert_prefix}{sig.symbol} {sig.action}信号（4h 收盘 {fmt_ms(sig.bar_open_ms)} UTC）",
         f"入场：市价（当前 {fmt_money(sig.entry_price)}）",
-        f"止损触发价：{fmt_money(sig.stop_price)}（距离 {sig.stop_dist * 100:.2f}%）",
-        f"下单：逐仓 {cfg.leverage:.0f}x / 市价 / 单位选 USDT / 输入 {fmt_money(order.notional)} USDT",
+        f"止损触发价：{fmt_money(sig.stop_price)}（{stop_note}）",
+        f"下单：逐仓 {cfg.leverage:.0f}x / 市价 / 单位选 USDT / 输入 {fmt_money(order.notional)} USDT"
+        f" → 点【{sig.open_button}】",
         f"      （核对持仓价值 ≈ {fmt_money(order.notional)}U，约 {order.contracts} 张）",
-        f"止损单：计划委托，触发价 {fmt_money(sig.stop_price)}，市价平仓，触发参考=最新成交价",
+        f"止损单：计划委托，触发价 {fmt_money(sig.stop_price)}，{sig.close_side}，触发参考=最新成交价",
         f"止盈：不设",
         f"风险：{order.risk_u:.1f}U（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%），"
         f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U",
@@ -117,7 +129,7 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
 def format_missed(cfg, sig: strategy.Signal) -> str:
     return "\n".join([
         f"{cfg.alert_prefix}⚠️ 错过的信号（补报）",
-        f"{sig.symbol} 在 {fmt_ms(sig.bar_open_ms)} UTC 的 4h 收盘触发入场"
+        f"{sig.symbol} 在 {fmt_ms(sig.bar_open_ms)} UTC 的 4h 收盘触发{sig.action}"
         f"（当时入场 {fmt_money(sig.entry_price)}，止损 {fmt_money(sig.stop_price)}）",
         f"该信号已超过一根 4h，入场价已变、风险几何失效，不建议追。仅作记录。",
     ])
@@ -126,15 +138,17 @@ def format_missed(cfg, sig: strategy.Signal) -> str:
 def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms: int,
                 position_id: int, stale: bool = False, bars_held: int = 0) -> str:
     entry, stop = pos.eff_entry, pos.eff_stop
-    risk = entry - stop
-    r = (exit_price - entry) / risk if risk > 0 else 0.0
-    why = {"stop": "触发止损单", "ma20": "4h 收盘跌破 SMA20", "manual": "手动平仓"}.get(reason, reason)
+    risk = abs(entry - stop)
+    r = (exit_price - entry) / risk if pos.side == 1 else (entry - exit_price) / risk
+    r = r if risk > 0 else 0.0
+    ma_note = "4h 收盘跌破 SMA20" if pos.side == 1 else "4h 收盘站上 SMA20"
+    why = {"stop": "触发止损单", "ma20": ma_note, "manual": "手动平仓"}.get(reason, reason)
     head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
     return "\n".join([
-        f"{cfg.alert_prefix}{pos.symbol} {head}（{fmt_ms(bar_ms)} UTC 收盘）",
+        f"{cfg.alert_prefix}{pos.symbol} {pos.action_label} {head}（{fmt_ms(bar_ms)} UTC 收盘）",
         f"原因：{why}",
         f"参考离场价：{fmt_money(exit_price)}（本次约 {r:+.2f}R，持仓约 {bars_held * 4} 小时）",
-        f"建议：4 小时内市价平仓；平仓后确认委托列表已空（撤掉残留止损单）",
+        f"建议：4 小时内市价平仓（{pos.close_side}）；平仓后确认委托列表已空（撤掉残留止损单）",
         f"确认平仓：{confirm_url(cfg, position_id, 'close')}",
     ])
 
@@ -159,11 +173,12 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
         is_latest = (i == latest_closed_i)
         if position is not None:
             bar = bars[i]
-            hit_stop = bar.low <= position.eff_stop
+            hit_stop = (bar.low <= position.eff_stop) if position.side == 1 \
+                else (bar.high >= position.eff_stop)
             # 入场当根（信号 bar 的下一根）只允许止损离场，MA20 离场从再下一根起
             # —— 与回测引擎的 `u > ei` 守卫一致
             is_entry_bar = (bar.open_ms - position.signal_bar_ms) == INTERVAL_MS
-            hit_ma20 = (not is_entry_bar) and strategy.exit_triggered(bars, ind, i)
+            hit_ma20 = (not is_entry_bar) and strategy.exit_triggered(bars, ind, i, position.side)
             if hit_stop or hit_ma20:
                 events.append(Event(kind="exit", symbol=symbol, bar_ms=bar.open_ms, is_latest=is_latest,
                                     exit_price=(position.eff_stop if hit_stop else bar.close),
@@ -173,16 +188,19 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
         if position is None:
             sig = strategy.evaluate_entry(symbol, bars, ind, squeeze, i,
                                           entry_price=bars[i + 1].open,
-                                          stop_min=cfg.stop_min, stop_max=cfg.stop_max)
+                                          stop_min=cfg.stop_min, stop_max=cfg.stop_max,
+                                          allow_long=cfg.enable_long,
+                                          allow_short=cfg.enable_shorts,
+                                          short_regime_ma=cfg.short_regime_ma)
             if sig is not None:
                 order = size_order(symbol, sig.entry_price, sig.stop_price, cfg.equity,
-                                   cfg.risk_pct, cfg.leverage)
+                                   cfg.risk_pct, cfg.leverage, side=sig.side)
                 events.append(Event(kind=("entry" if is_latest else "entry_missed"), symbol=symbol,
                                     bar_ms=sig.bar_open_ms, is_latest=is_latest, sig=sig, order=order))
                 if is_latest:
                     position = PositionState(symbol=symbol, entry_price=sig.entry_price,
                                              stop_price=sig.stop_price, contracts=order.contracts,
-                                             signal_bar_ms=sig.bar_open_ms)
+                                             signal_bar_ms=sig.bar_open_ms, side=sig.side)
     return events, position
 
 
@@ -193,7 +211,7 @@ def _row_to_state(row) -> PositionState:
                          stop_price=row["stop_price"], contracts=row["contracts"],
                          signal_bar_ms=row["signal_bar_ms"], position_id=row["id"],
                          status=row["status"], actual_entry=row["actual_entry"],
-                         actual_stop=row["actual_stop"])
+                         actual_stop=row["actual_stop"], side=row["side"] or 1)
 
 
 def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
@@ -251,7 +269,7 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None) -> List[str]:
                 row = None
                 position = None
             elif ev.kind == "entry":
-                pid = db.create_position(symbol=symbol, signal_bar_ms=ev.bar_ms,
+                pid = db.create_position(symbol=symbol, signal_bar_ms=ev.bar_ms, side=ev.sig.side,
                                          entry_price=ev.sig.entry_price, stop_price=ev.sig.stop_price,
                                          stop_dist=ev.sig.stop_dist, contracts=ev.order.contracts,
                                          coin_qty=ev.order.coin_qty, notional=ev.order.notional,

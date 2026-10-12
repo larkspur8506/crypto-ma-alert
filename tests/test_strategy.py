@@ -57,6 +57,12 @@ def flat_bar(prev, px):
     return S.Bar(open_ms=prev.open_ms + STEP, open=px, high=px, low=px, close=px, volume=1.0)
 
 
+def prep(bars):
+    """返回 (indicators, squeeze_flags)。"""
+    ind = S.compute_indicators(bars)
+    return ind, S.squeeze_flags(ind["band"])
+
+
 class TestIndicators(unittest.TestCase):
     def test_sma(self):
         out = S.sma_series([1, 2, 3, 4, 5], 3)
@@ -168,7 +174,99 @@ class TestSignals(unittest.TestCase):
         ind2 = S.compute_indicators(bars2)
         self.assertTrue(S.exit_triggered(bars2, ind2, len(bars2) - 1))
 
+def squeeze_then_breakdown(n_trend=200, n_flat=200, p1=130.0, drop_pct=0.045):
+    """趋势后横盘（密集）→ 一根向下跌破 band 下沿的 bar → 次根（入场参考）。
+
+    返回 (bars, 跌破 bar 下标)。末端收盘 124.15 同时低于 SMA200(≈130)，
+    因此做空的趋势过滤会放行。
+    """
+    base = trend_then_flat(n_trend, n_flat, 100.0, p1)
+    last = base[-1]
+    px = p1 * (1 - drop_pct)
+    brk = S.Bar(open_ms=last.open_ms + STEP, open=p1, high=p1, low=px, close=px)
+    nxt = S.Bar(open_ms=brk.open_ms + STEP, open=px, high=px, low=px, close=px)
+    return base + [brk, nxt], len(base)
+
+
+class TestShorts(unittest.TestCase):
+    def test_short_signal_fires_below_band(self):
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        sig = S.evaluate_entry("BTC_USDT", bars, ind, sq, i, entry_price=bars[i + 1].open,
+                               allow_long=False, allow_short=True)
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.side, -1)
+        self.assertEqual(sig.action, "做空")
+        self.assertEqual(sig.open_button, "开空")
+        self.assertEqual(sig.close_side, "买入平仓")
+        self.assertGreater(sig.stop_price, sig.entry_price, "做空止损必须在入场价上方")
+        self.assertAlmostEqual(sig.stop_price, ind["ma_max"][i])
+        self.assertTrue(0.015 <= sig.stop_dist <= 0.10)
+
+    def test_long_not_triggered_on_breakdown(self):
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        self.assertIsNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                           entry_price=bars[i + 1].open, allow_short=False))
+
+    def test_regime_filter_blocks_short_above_ma200(self):
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        ind["sma200"] = [0.0] * len(bars)          # 价格远高于 MA200 → 应拦下
+        self.assertIsNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                           entry_price=bars[i + 1].open, allow_long=False))
+        ind["sma200"] = [1e9] * len(bars)          # 价格远低于 MA200 → 放行
+        self.assertIsNotNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                              entry_price=bars[i + 1].open, allow_long=False))
+
+    def test_regime_filter_can_be_disabled(self):
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        ind["sma200"] = [0.0] * len(bars)
+        self.assertIsNotNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                              entry_price=bars[i + 1].open,
+                                              allow_long=False, short_regime_ma=0))
+
+    def test_short_stop_distance_filter(self):
+        bars, i = squeeze_then_breakdown(drop_pct=0.40)     # 跌太狠 → 距离超 10%
+        ind, sq = prep(bars)
+        self.assertIsNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                           entry_price=bars[i + 1].open, allow_long=False))
+
+    def test_exit_triggered_inverted_for_short(self):
+        bars = trend_then_flat()
+        ind = S.compute_indicators(bars)
+        last = bars[-1]
+        self.assertFalse(S.exit_triggered(bars, ind, len(bars) - 1, side=-1),
+                         "横盘时收盘等于 SMA20，做空也不应离场")
+        up = S.Bar(open_ms=last.open_ms + STEP, open=140.0, high=140.0, low=140.0, close=140.0)
+        bars2 = bars + [up]
+        ind2 = S.compute_indicators(bars2)
+        self.assertTrue(S.exit_triggered(bars2, ind2, len(bars2) - 1, side=-1),
+                        "做空：收盘站上 SMA20 应离场")
+        self.assertFalse(S.exit_triggered(bars2, ind2, len(bars2) - 1, side=1))
+
+    def test_scan_can_return_both_sides(self):
+        bars, _ = squeeze_then_breakdown()
+        shorts = S.scan(bars, "BTC_USDT", sides=(-1,))
+        longs = S.scan(bars, "BTC_USDT", sides=(1,))
+        self.assertTrue(all(s.side == -1 for s in shorts))
+        self.assertTrue(all(s.side == 1 for s in longs))
+
+
 class TestSizing(unittest.TestCase):
+    def test_short_sizing_mirrors_long(self):
+        entry, stop = 100_000.0, 103_000.0            # 做空：止损在上方 3%
+        o = size_order("BTC_USDT", entry, stop, 1000.0, 0.02, 5.0, side=-1)
+        self.assertAlmostEqual(o.notional, 20 / 0.03, delta=10.0)   # 1 张=10U，取整误差 ≤10U
+        self.assertAlmostEqual(o.risk_u, 20.0, delta=0.7)
+        self.assertGreater(o.max_safe_leverage, 5.0)
+
+    def test_short_requires_stop_above(self):
+        with self.assertRaises(ValueError):
+            size_order("BTC_USDT", 100.0, 99.0, 1000.0, 0.02, 5.0, side=-1)
+
+
     def test_mexc_btc_contract_conversion(self):
         entry = 84_000.0
         stop = entry * 0.975                                 # 止损 2.5%

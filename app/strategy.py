@@ -30,6 +30,7 @@ STOP_MIN = 0.015           # 止损距离下限（太窄是噪音）
 STOP_MAX = 0.10            # 止损距离上限（配合逐仓 5x：强平 -19.5% 永远晚于止损）
 
 WARMUP_BARS = 120          # SMA120 需要的最小根数
+REGIME_MA = 200            # 做空趋势过滤：只在收盘价低于该均线时做空（回测验证过）
 # 算一次有效分位需要：250 根窗口 + 120 根预热（band 在前 119 根为 None）
 MIN_BARS_REQUIRED = BAND_WINDOW + WARMUP_BARS + 2
 
@@ -47,18 +48,31 @@ class Bar:
 @dataclass(frozen=True)
 class Signal:
     symbol: str
-    bar_index: int            # 突破 bar 的下标
-    bar_open_ms: int          # 突破 bar 的开盘时间（幂等键的一部分）
+    bar_index: int            # 突破/跌破 bar 的下标
+    bar_open_ms: int          # 该 bar 的开盘时间（幂等键的一部分）
     entry_price: float        # 次根开盘价（= 提醒发出时的市价）
-    stop_price: float         # band 下沿
-    stop_dist: float          # (entry - stop) / entry
+    stop_price: float         # 做多=band 下沿；做空=band 上沿
+    stop_dist: float          # 止损距离（正数）
     ma_max: float
     ma_min: float
     band: float
+    side: int = 1             # +1 做多 / -1 做空
 
     @property
-    def side(self) -> int:
-        return 1              # v1 只做多
+    def is_long(self) -> bool:
+        return self.side == 1
+
+    @property
+    def action(self) -> str:
+        return "做多" if self.side == 1 else "做空"
+
+    @property
+    def open_button(self) -> str:
+        return "开多" if self.side == 1 else "开空"
+
+    @property
+    def close_side(self) -> str:
+        return "卖出平仓" if self.side == 1 else "买入平仓"
 
 
 # ---------------------------------------------------------------- 指标
@@ -123,6 +137,7 @@ def compute_indicators(bars: Sequence[Bar]) -> Dict[str, List[Optional[float]]]:
         if closes[i] > 0:
             band[i] = (hi - lo) / closes[i]
     out["ma_max"], out["ma_min"], out["band"] = ma_max, ma_min, band
+    out["sma200"] = sma_series(closes, REGIME_MA)      # 做空趋势过滤用
     return out
 
 
@@ -158,10 +173,13 @@ def squeeze_flags(band: Sequence[Optional[float]], window: int = BAND_WINDOW,
 
 def evaluate_entry(symbol: str, bars: Sequence[Bar], ind: Dict[str, List[Optional[float]]],
                    squeeze: Sequence[bool], i: int, entry_price: Optional[float] = None,
-                   stop_min: float = STOP_MIN, stop_max: float = STOP_MAX) -> Optional[Signal]:
-    """判断第 i 根是否为入场信号（突破 bar）。
+                   stop_min: float = STOP_MIN, stop_max: float = STOP_MAX,
+                   allow_long: bool = True, allow_short: bool = True,
+                   short_regime_ma: int = REGIME_MA) -> Optional[Signal]:
+    """判断第 i 根是否为入场信号（突破=做多 / 跌破=做空）。
 
     entry_price 传次根开盘价；不传则用第 i 根收盘价（仅用于回放对齐）。
+    做空额外要求：收盘价低于 short_regime_ma 均线（趋势过滤，回测验证；0 表示不过滤）。
     """
     if i < 1 or i >= len(bars):
         return None
@@ -170,37 +188,57 @@ def evaluate_entry(symbol: str, bars: Sequence[Bar], ind: Dict[str, List[Optiona
     ma_max, ma_min, band = ind["ma_max"], ind["ma_min"], ind["band"]
     if ma_max[i - 1] is None or ma_min[i - 1] is None or band[i - 1] is None:
         return None
-    if bars[i].close <= ma_max[i - 1]:
-        return None
 
     px = float(entry_price if entry_price is not None else bars[i].close)
-    stop = float(ma_min[i])          # 止损 = 突破 bar 自身的 band 下沿（与回测引擎口径一致）
-    if px <= 0 or stop >= px:
+    if px <= 0:
         return None
-    dist = (px - stop) / px
+    close = bars[i].close
+
+    side = 0
+    if allow_long and close > ma_max[i - 1]:
+        side = 1
+    elif allow_short and close < ma_min[i - 1]:
+        side = -1
+        if short_regime_ma:
+            regime = ind.get(f"sma{short_regime_ma}")
+            if not regime or regime[i] is None or close >= regime[i]:
+                return None
+    if side == 0:
+        return None
+
+    stop = float(ma_min[i]) if side == 1 else float(ma_max[i])
+    if side == 1 and stop >= px:
+        return None
+    if side == -1 and stop <= px:
+        return None
+    dist = abs(px - stop) / px
     if not (stop_min <= dist <= stop_max):
         return None
     return Signal(symbol=symbol, bar_index=i, bar_open_ms=bars[i].open_ms, entry_price=px,
                   stop_price=stop, stop_dist=dist, ma_max=float(ma_max[i - 1]),
-                  ma_min=float(ma_min[i]), band=float(band[i - 1]))
+                  ma_min=float(ma_min[i - 1]), band=float(band[i - 1]), side=side)
 
 
-def exit_triggered(bars: Sequence[Bar], ind: Dict[str, List[Optional[float]]], i: int) -> bool:
-    """第 i 根收盘是否触发离场（收盘 < SMA20）。"""
+def exit_triggered(bars: Sequence[Bar], ind: Dict[str, List[Optional[float]]], i: int,
+                   side: int = 1) -> bool:
+    """第 i 根收盘是否触发离场：做多=收盘 < SMA20；做空=收盘 > SMA20。"""
     sma20 = ind["sma20"][i]
     if sma20 is None:
         return False
-    return bars[i].close < sma20
+    return bars[i].close < sma20 if side == 1 else bars[i].close > sma20
 
 
-def scan(bars: Sequence[Bar], symbol: str = "", start: int = 0) -> List[Signal]:
+def scan(bars: Sequence[Bar], symbol: str = "", start: int = 0, sides=(1,),
+         short_regime_ma: int = REGIME_MA) -> List[Signal]:
     """对整段历史扫一遍信号（回放 / 回测用）。"""
     ind = compute_indicators(bars)
     sq = squeeze_flags(ind["band"])
     out: List[Signal] = []
     for i in range(max(start, 1), len(bars) - 1):
         nxt = bars[i + 1].open if i + 1 < len(bars) else None
-        s = evaluate_entry(symbol, bars, ind, sq, i, entry_price=nxt)
+        s = evaluate_entry(symbol, bars, ind, sq, i, entry_price=nxt,
+                           allow_long=(1 in sides), allow_short=(-1 in sides),
+                           short_regime_ma=short_regime_ma)
         if s:
             out.append(s)
     return out

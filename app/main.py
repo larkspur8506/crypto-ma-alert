@@ -128,7 +128,8 @@ def admin_status(request: Request, k: Optional[str] = None):
     _require_admin(request, k)
     cfg = current_config()
     rows = "".join(
-        f"<tr><td>{r['symbol']}</td><td>{r['status']}</td><td>{r['contracts']}</td>"
+        f"<tr><td>{r['symbol']}</td><td>{'多' if (r['side'] or 1) == 1 else '空'}</td>"
+        f"<td>{r['status']}</td><td>{r['contracts']}</td>"
         f"<td>{r['entry_price']:,.0f}</td><td>{r['stop_price']:,.0f}</td>"
         f"<td>{r['stop_dist'] * 100:.1f}%</td>"
         f"<td>{engine.fmt_ms(r['signal_bar_ms'])}</td>"
@@ -153,8 +154,8 @@ def admin_status(request: Request, k: Optional[str] = None):
     <h2>数据源健康</h2><table><tr><th>标的</th><th>状态</th><th>错误</th></tr>{feeds}</table>
     <h2>已处理到</h2><table><tr><th>标的</th><th>最后处理 bar</th></tr>{last_bars}</table>
     <h2>最近仓位/信号</h2>
-    <table><tr><th>标的</th><th>状态</th><th>张数</th><th>入场</th><th>止损</th><th>距离</th><th>信号 bar</th><th></th></tr>
-    {rows or "<tr><td colspan=8 class='muted'>暂无</td></tr>"}</table>
+    <table><tr><th>标的</th><th>方向</th><th>状态</th><th>张数</th><th>入场</th><th>止损</th><th>距离</th><th>信号 bar</th><th></th></tr>
+    {rows or "<tr><td colspan=9 class='muted'>暂无</td></tr>"}</table>
     <div class='card muted'>待确认（pending）的仓位按假设值计入统计；点「查看」可确认或忽略。</div>
     """
     resp = page("crypto-ma-alert", body)
@@ -229,11 +230,13 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     if a == "close":
         return _close_page(row)
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
+    side_txt = "做多" if (row["side"] or 1) == 1 else "做空"
+    stop_hint = "（价格下方）" if (row["side"] or 1) == 1 else "（价格上方）"
     body = f"""
     <h1>确认开仓 #{pid}</h1>
     <div class='card'>
-      <b>{row['symbol']}</b> 做多｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC<br>
-      建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>
+      <b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC<br>
+      建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>{stop_hint}
       （{row['stop_dist'] * 100:.2f}%）<br>
       建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜
       风险 {row['risk_u']:.1f}U
@@ -258,10 +261,11 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
 def _close_page(row) -> HTMLResponse:
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
+    side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
     body = f"""
     <h1>确认平仓 #{row['id']}</h1>
     <div class='card'>
-      <b>{row['symbol']}</b>｜入场 {entry:,.2f}｜止损 {stop:,.2f}
+      <b>{row['symbol']}</b> {side_txt}｜入场 {entry:,.2f}｜止损 {stop:,.2f}
     </div>
     <form method='post'>
       <input type='hidden' name='a' value='close'>
