@@ -1,17 +1,17 @@
-fix: 做空执行链路的两个 bug（R 统计 + 止损方向校验）
+fix: /admin/rules 做空开关实际不可用（表单缺字段 + apply_db 静默关闭）
 
-加做空时只验证了「信号正确」和「确认页显示方向」，没有走完整条执行链路，漏掉两个做空专属 bug：
+我此前声称「enable_long / enable_shorts / short_regime_ma 三个都能在 /admin/rules 改」，
+实际是错的——OVERRIDABLE 和 apply_db 支持它们，但**表单里没有这三个字段**，UI 上根本改不了。
 
-1. db.close_position 用了只做多的 R 公式：
-     risk = entry - stop                       # 做空时 risk 为负
-     r = (exit_price - entry)/risk if risk > 0 else 0.0
-   做空的 risk 恒为负 → 命中 else 分支 → **每笔做空的 r_multiple 都记成 0.0**。
-   而周报的均R/总R/胜率全部读这个字段 → 盈利的空单不计入胜率、做空对统计贡献为 0。
-   修：按 side 算方向，risk 取绝对值。
+1. config.py: OVERRIDABLE 补上 enable_long（原来能关做空却关不掉做多）
+2. main.py: /admin/rules 表单加「允许做多/允许做空」复选框 + 做空趋势过滤均线输入框；
+   POST 处理补上三个字段（复选框未勾选 = 不传 = 0）
+3. config.py apply_db: 修 fail-silent —— 原实现
+     if isinstance(cur, bool) or raw in ("true","false"):
+         setattr(k, raw in ("true","1","yes"))
+   收到无法识别的值（如 "abc"）时不抛异常，而是**静默把开关设成 False**。
+   对「是否允许做空」这种安全相关的开关，静默关闭比报错危险。
+   改为严格解析：识别不了就保留原值。
 
-2. 确认流不校验止损方向：做空可以填一个低于入场价的止损，系统静默接受。
-   开仓路径有校验（size_order 会抛错），确认路径没有。
-   修：新增 engine.validate_stop_side()，确认页对方向填反的止损返回 400 并提示。
-
-测试：新增 tests/test_positions.py（12 项）——做空/做多的 R 双向回归、实际成交价优先、
-周报胜率计入空单、止损方向校验 4 例、做空靠 bar.high 触发止损的状态机回归。共 55 项全绿。
+测试：新增 6 项（开关可覆盖性、双向开关、regime=0 关闭过滤、垃圾输入保留原值、
+关掉做空后信号被抑制）。共 61 项全绿。

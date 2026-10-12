@@ -157,5 +157,54 @@ class TestShortStateMachine(unittest.TestCase):
         self.assertAlmostEqual(ex[0].exit_price, entry_ev.sig.stop_price)
 
 
+class TestConfigOverrides(unittest.TestCase):
+    """做空开关必须能从 /admin/rules 热改（DB 覆盖 env，不重启）。"""
+
+    def setUp(self):
+        from app.config import Config
+        self.cfg = Config()
+
+    def test_direction_flags_overridable(self):
+        from app.config import Config
+        for k in ("enable_long", "enable_shorts", "short_regime_ma"):
+            self.assertIn(k, Config.OVERRIDABLE, f"{k} 不在 DB 可覆盖列表里")
+
+    def test_disable_shorts_from_db(self):
+        self.cfg.apply_db({"enable_shorts": 0})
+        self.assertFalse(self.cfg.enable_shorts)
+        self.cfg.apply_db({"enable_shorts": 1})
+        self.assertTrue(self.cfg.enable_shorts)
+
+    def test_disable_long_from_db(self):
+        self.cfg.apply_db({"enable_long": 0})
+        self.assertFalse(self.cfg.enable_long)
+        self.cfg.apply_db({"enable_long": 1})
+        self.assertTrue(self.cfg.enable_long)
+
+    def test_short_regime_ma_zero_disables_filter(self):
+        self.cfg.apply_db({"short_regime_ma": 0})
+        self.assertEqual(self.cfg.short_regime_ma, 0)
+        self.cfg.apply_db({"short_regime_ma": 100})
+        self.assertEqual(self.cfg.short_regime_ma, 100)
+
+    def test_garbage_ignored(self):
+        before = self.cfg.enable_shorts
+        self.cfg.apply_db({"enable_shorts": "abc"})
+        self.assertEqual(self.cfg.enable_shorts, before)
+
+    def test_disabled_short_side_suppresses_signal(self):
+        """关掉做空后，跌破信号不应再产生做空票。"""
+        from tests.test_strategy import squeeze_then_breakdown, prep
+        from app import strategy as S
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        self.cfg.apply_db({"enable_shorts": 0})
+        sig = S.evaluate_entry("BTC_USDT", bars, ind, sq, i, entry_price=bars[i + 1].open,
+                               allow_long=self.cfg.enable_long,
+                               allow_short=self.cfg.enable_shorts,
+                               short_regime_ma=self.cfg.short_regime_ma)
+        self.assertIsNone(sig, "关掉做空后不应再出做空信号")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

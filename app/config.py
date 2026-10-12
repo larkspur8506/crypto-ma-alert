@@ -72,18 +72,23 @@ class Config:
 
     # ---- DB 可覆盖项 ----
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
-                   "enable_shorts", "short_regime_ma")
+                   "enable_long", "enable_shorts", "short_regime_ma")
 
     def apply_db(self, values: dict) -> "Config":
         for k in self.OVERRIDABLE:
             if k not in values or values[k] in (None, ""):
                 continue
-            raw = values[k]
+            raw = str(values[k]).strip().lower()
             cur = getattr(self, k, None)
             try:
-                if isinstance(cur, bool) or str(raw).strip().lower() in ("true", "false"):
-                    setattr(self, k, str(raw).strip().lower() in ("true", "1", "yes"))
-                elif isinstance(cur, int):
+                if isinstance(cur, bool):
+                    # 严格解析：识别不了就保留原值，绝不静默关闭开关
+                    if raw in ("1", "true", "yes", "on"):
+                        setattr(self, k, True)
+                    elif raw in ("0", "false", "no", "off"):
+                        setattr(self, k, False)
+                    continue
+                if isinstance(cur, int):
                     setattr(self, k, int(float(raw)))
                 else:
                     setattr(self, k, float(raw))

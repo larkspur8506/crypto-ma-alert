@@ -179,6 +179,12 @@ def admin_rules(request: Request, k: Optional[str] = None):
       <p>杠杆(逐仓) <input name='leverage' value='{cfg.leverage}'></p>
       <p>止损距离下限 <input name='stop_min' value='{cfg.stop_min}'></p>
       <p>止损距离上限 <input name='stop_max' value='{cfg.stop_max}'></p>
+      <p><label><input type='checkbox' name='enable_long' {'checked' if cfg.enable_long else ''}>
+         允许做多</label>
+         <label><input type='checkbox' name='enable_shorts' {'checked' if cfg.enable_shorts else ''}>
+         允许做空</label></p>
+      <p>做空趋势过滤均线 <input name='short_regime_ma' value='{cfg.short_regime_ma}'>
+         （0 = 关闭过滤，不建议）</p>
       <button type='submit'>保存</button>
     </form>
     <div class='muted'>DB 值优先于环境变量。当前 DB 覆盖：{saved or '无'}</div>
@@ -191,7 +197,9 @@ def admin_rules(request: Request, k: Optional[str] = None):
 @app.post("/admin/rules")
 def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = Form(...),
                      leverage: str = Form(...), stop_min: str = Form(...), stop_max: str = Form(...),
-                     k: str = Form("")):
+                     enable_long: Optional[str] = Form(None),
+                     enable_shorts: Optional[str] = Form(None),
+                     short_regime_ma: str = Form("200"), k: str = Form("")):
     _require_admin(request, k)
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
                      ("stop_min", stop_min), ("stop_max", stop_max)]:
@@ -200,6 +208,14 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
         except ValueError:
             raise HTTPException(400, f"{key} 不是数字")
         db.set_config(key, val)
+    # 复选框：勾选=1，未勾选=不传 → 0
+    db.set_config("enable_long", 1 if enable_long else 0)
+    db.set_config("enable_shorts", 1 if enable_shorts else 0)
+    try:
+        int(float(short_regime_ma))
+    except ValueError:
+        raise HTTPException(400, "short_regime_ma 不是数字")
+    db.set_config("short_regime_ma", int(float(short_regime_ma)))
     return RedirectResponse(f"/admin/rules?k={k}", status_code=303)
 
 
