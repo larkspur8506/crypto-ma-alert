@@ -1,0 +1,12 @@
+init: 双均线(6MA)趋势系统信号提醒服务
+
+- app/strategy.py  纯 stdlib 核心（SMA/EMA、band 分位密集、突破入场、SMA20 离场）
+- app/market.py    MEXC 合约 K 线 + 降级链 + 完整性校验（根数/单调/新鲜度）
+- app/sizing.py    以损定仓 → MEXC 张数/名义/保证金/强平价
+- app/engine.py    walk() 纯状态机（线上 tick 与 dry-run 共用）+ 提醒文案
+- app/notify.py    企业微信 + Telegram 双通道（重试、分段、成功后才去重）
+- app/main.py      FastAPI + APScheduler + 状态页/确认页/参数页
+- tests/           32 项单测
+- scripts/         dry-run 回放 + 信号级/回合级交叉验证
+
+口径与回测引擎逐笔一致（14/14、24/24 回合）；只提醒不下单。
