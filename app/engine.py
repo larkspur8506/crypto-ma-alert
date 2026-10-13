@@ -233,12 +233,19 @@ def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms:
     r = r if risk > 0 else 0.0
     ma_note = "4h 收盘跌破 SMA20" if pos.side == 1 else "4h 收盘站上 SMA20"
     why = {"stop": "触发止损单", "ma20": ma_note, "manual": "手动平仓"}.get(reason, reason)
-    head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
+    # 止损是**交易所已成交**的事件，不能再说「4 小时内市价平仓」——照做等于反手开新仓。
+    if reason == "stop":
+        head = "止损补报" if stale else "止损提醒"
+        advice = (f"止损单应已在交易所触发（{pos.close_side}）：到 MEXC 核对持仓已平、无残留委托；"
+                  f"实际成交价与止损价不同就在确认页填真实平仓价")
+    else:
+        head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
+        advice = f"建议：4 小时内市价平仓（{pos.close_side}）；平仓后确认委托列表已空（撤掉残留止损单）"
     return "\n".join([
         f"{cfg.alert_prefix}{pos.symbol} {pos.action_label} {head}（{fmt_ms(bar_ms)} UTC 收盘）",
         f"原因：{why}",
         f"参考离场价：{fmt_money(exit_price)}（本次约 {r:+.2f}R，持仓约 {bars_held * 4} 小时）",
-        f"建议：4 小时内市价平仓（{pos.close_side}）；平仓后确认委托列表已空（撤掉残留止损单）",
+        advice,
         f"确认平仓：{confirm_url(cfg, position_id, 'close')}",
     ])
 

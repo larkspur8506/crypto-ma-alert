@@ -316,5 +316,40 @@ class TestRegimeNote(unittest.TestCase):
         self.assertEqual(engine.regime_note(1, 83000.0, 0.0)["text"], "")
 
 
+class TestStopExitAlertText(unittest.TestCase):
+    """止损提醒不能说「4 小时内市价平仓」——那是交易所已成交的事件，照做等于反手开仓。"""
+
+    def _cfg(self):
+        from app.config import Config
+        c = Config()
+        c.token_secret = "t"
+        c.base_url = "https://x.example"
+        return c
+
+    def _pos(self):
+        return engine.PositionState(symbol="BTC_USDT", entry_price=100_000.0, stop_price=103_000.0,
+                                    contracts=10, signal_bar_ms=0, position_id=7, side=-1,
+                                    actual_entry=100_000.0, actual_stop=103_000.0)
+
+    def test_stop_exit_says_check_exchange(self):
+        txt = engine.format_exit(self._cfg(), self._pos(), 103_000.0, "stop", 1_700_000_000_000, 7)
+        self.assertIn("止损提醒", txt)
+        self.assertIn("触发止损单", txt)
+        self.assertNotIn("4 小时内市价平仓", txt)
+        self.assertIn("核对持仓已平", txt)
+
+    def test_stop_exit_stale_variant(self):
+        txt = engine.format_exit(self._cfg(), self._pos(), 103_000.0, "stop",
+                                 1_700_000_000_000, 7, stale=True)
+        self.assertIn("止损补报", txt)
+        self.assertNotIn("4 小时内市价平仓", txt)
+
+    def test_ma20_exit_keeps_old_advice(self):
+        txt = engine.format_exit(self._cfg(), self._pos(), 98_000.0, "ma20", 1_700_000_000_000, 7)
+        self.assertIn("离场提醒", txt)
+        self.assertIn("4 小时内市价平仓", txt)
+        self.assertNotIn("止损提醒", txt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
