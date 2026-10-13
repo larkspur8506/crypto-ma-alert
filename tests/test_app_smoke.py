@@ -47,6 +47,48 @@ class TestAppAssembly(unittest.TestCase):
         mod.db.set_config("equity", 2000)
         self.assertEqual(mod.current_config().equity, 2000.0)
 
+    def test_edit_pages_summary_and_correction(self):
+        """回归：已确认/已平仓的仓位访问确认页应给只读摘要 + 修改按钮；显式修改能改正并重算 R。"""
+        try:
+            import fastapi                                            # noqa: F401
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        pid = mod.db.create_position(symbol="BTC_USDT", signal_bar_ms=1_700_000_200_000,
+                                     status="open", side=1, entry_price=100_000.0,
+                                     stop_price=97_000.0, stop_dist=0.03, contracts=6,
+                                     coin_qty=0.0006, notional=60.0, risk_u=18.0,
+                                     equity_at_entry=1000.0)
+        mod.db.confirm_position(pid, 100_000.0, 6, 97_000.0, True)
+        mod.db.close_position(pid, 103_000.0, "ma20", auto=True)
+        sec = mod.config.token_secret
+        with TestClient(mod.app) as client:
+            # a=view → 只读摘要（含状态与两个修改入口），不是空白表单
+            r = client.get(f"/c/{pid}", params={"a": "view", "t": mod.engine.sign_token(sec, pid, "view")})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("已平仓", r.text)
+            self.assertIn("修改开仓数据", r.text)
+            self.assertIn("修改平仓数据", r.text)
+            self.assertNotIn("按以上数值确认开仓", r.text)
+            # a=edit_close 表单 → 提交后更新离场价并重算 R
+            r = client.post(f"/c/{pid}", data={"a": "close", "edit": "1",
+                                               "t": mod.engine.sign_token(sec, pid, "close"),
+                                               "exit_price": "104000", "exit_reason": "ma20"})
+            self.assertEqual(r.status_code, 200)
+            self.assertAlmostEqual(mod.db.position_by_id(pid)["r_multiple"], (104_000 - 100_000) / 3_000)
+            # a=edit_open → 修改入场价，R 按新入场价重算，状态仍是 closed（不能被改回 open）
+            r = client.post(f"/c/{pid}", data={"a": "open", "edit": "1",
+                                               "t": mod.engine.sign_token(sec, pid, "open"),
+                                               "actual_entry": "101000", "actual_stop": "98000",
+                                               "actual_contracts": "6"})
+            self.assertEqual(r.status_code, 200)
+            row = mod.db.position_by_id(pid)
+            self.assertEqual(row["status"], "closed")
+            self.assertAlmostEqual(row["actual_entry"], 101_000.0)
+            self.assertAlmostEqual(row["r_multiple"], (104_000 - 101_000) / 3_000)
+
     def test_auto_closed_position_accepts_real_fill_once(self):
         """回归：系统自动按参考价关仓后，用户必须能补录真实成交价（覆盖一次），之后再提交才拒绝。"""
         try:

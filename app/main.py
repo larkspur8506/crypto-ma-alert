@@ -244,23 +244,43 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     if not row:
         raise HTTPException(404, "记录不存在")
     if a == "close":
-        return _close_page(row)
+        return _close_form(row)
+    if a == "edit_open":
+        return _entry_form(row, pid, editing=True)
+    if row["status"] == "pending":
+        return _entry_form(row, pid, editing=False)
+    # 已确认开仓 / 已平仓 → 只读摘要（改动必须点「修改」显式进入表单，防手滑覆盖）
+    return _summary(row, pid)
+
+
+def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
     side_txt = "做多" if (row["side"] or 1) == 1 else "做空"
     stop_hint = "（价格下方）" if (row["side"] or 1) == 1 else "（价格上方）"
     cfg = current_config()
     note = ""
-    try:
-        feed = market.fetch(row["symbol"])
-        ma200 = strategy.compute_indicators(feed.closed)["sma200"][-1] or 0.0
-        rn = engine.regime_note(row["side"] or 1, feed.bars[-1].close, ma200)
-        cls = {"warn": "bad", "ok": "muted"}.get(rn["level"], "muted")
-        if rn["text"]:
-            note = f"<p class='{cls}'>{rn['text']}</p>"
-    except Exception as e:                                              # noqa: BLE001
-        note = f"<p class='muted'>MA200 检查失败：{e}</p>"
+    if not editing:
+        try:
+            feed = market.fetch(row["symbol"])
+            ma200 = strategy.compute_indicators(feed.closed)["sma200"][-1] or 0.0
+            rn = engine.regime_note(row["side"] or 1, feed.bars[-1].close, ma200)
+            cls = {"warn": "bad", "ok": "muted"}.get(rn["level"], "muted")
+            if rn["text"]:
+                note = f"<p class='{cls}'>{rn['text']}</p>"
+        except Exception as e:                                              # noqa: BLE001
+            note = f"<p class='muted'>MA200 检查失败：{e}</p>"
+    else:
+        note = ("<p class='muted'>这是修改页：数值保存后会覆盖原来的记录"
+                f"（当前入场 {row['actual_entry'] or row['entry_price']:,.2f} / "
+                f"止损 {row['actual_stop'] or row['stop_price']:,.2f} / "
+                f"张数 {row['actual_contracts'] or row['contracts']}）。</p>")
+    cur_entry = (row["actual_entry"] or row["entry_price"]) if editing else row["entry_price"]
+    cur_stop = (row["actual_stop"] or row["stop_price"]) if editing else row["stop_price"]
+    cur_qty = (row["actual_contracts"] or row["contracts"]) if editing else row["contracts"]
+    edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
+    title = f"修改开仓数据 #{pid}" if editing else f"确认开仓 #{pid}"
     body = f"""
-    <h1>确认开仓 #{pid}</h1>
+    <h1>{title}</h1>
     <div class='card'>
       <b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC<br>
       建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>{stop_hint}
@@ -271,36 +291,72 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
       {note}
     </div>
     <form method='post'>
-      <input type='hidden' name='a' value='open'><input type='hidden' name='t' value='{tok("open")}'>
-      <p>实际成交均价 <input name='actual_entry' value='{row["entry_price"]:.2f}'></p>
+      <input type='hidden' name='a' value='open'><input type='hidden' name='t' value='{tok("open")}'>{edit_flag}
+      <p>实际成交均价 <input name='actual_entry' value='{cur_entry:.2f}'></p>
       <p>成交金额 USDT <input name='fill_amount' value='' placeholder='成交记录里的金额'>
         <span class='muted'>填了就按它换算张数（比下单时看到的预览张数准）</span></p>
-      <p>实际张数 <input name='actual_contracts' value='{row["contracts"]}'>
+      <p>实际张数 <input name='actual_contracts' value='{cur_qty}'>
         <span class='muted'>没填成交金额时用这个</span></p>
-      <p>实际止损触发价 <input name='actual_stop' value='{row['stop_price']:.2f}'></p>
-      <p><label><input type='checkbox' name='stop_placed' value='1' checked style='width:auto'> 已挂止损单</label></p>
-      <button type='submit'>按以上数值确认开仓</button>
+      <p>实际止损触发价 <input name='actual_stop' value='{cur_stop:.2f}'></p>
+      <p><label><input type='checkbox' name='stop_placed' value='1' {'checked' if row['stop_placed'] or not editing else ''} style='width:auto'> 已挂止损单</label></p>
+      <button type='submit'>{'保存修改' if editing else '按以上数值确认开仓'}</button>
     </form>
+    {"" if editing else f'''
     <form method='post' style='margin-top:8px'>
       <input type='hidden' name='a' value='ignore'><input type='hidden' name='t' value='{tok("ignore")}'>
       <button class='red' type='submit'>未开仓 / 忽略</button>
-    </form>
-    <div class='card muted'>状态：{row['status']}</div>
+    </form>'''}
+    <p><a class='btn gray' href='/c/{pid}?a=view&t={tok("view")}'>返回</a></p>
     """
-    return page(f"确认开仓 #{pid}", body)
+    return page(title, body)
 
 
-def _close_page(row) -> HTMLResponse:
+def _status_label(row) -> str:
+    return {"pending": "待确认", "open": "持仓中", "closed": "已平仓",
+            "ignored": "已忽略"}.get(row["status"], row["status"])
+
+
+def _summary(row, pid: int) -> HTMLResponse:
+    """只读摘要页：只显示当前记录 + 显式入口（修改 / 手动平仓）。"""
+    tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
+    side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
+    entry = row["actual_entry"] or row["entry_price"]
+    stop = row["actual_stop"] or row["stop_price"]
+    qty = row["actual_contracts"] or row["contracts"]
+    lines = [
+        f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC",
+        f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty} 张",
+    ]
+    if row["status"] == "closed":
+        lines.append(f"离场 <b>{row['exit_price'] or 0:,.2f}</b>（{row['exit_reason']}）"
+                     f"｜本次 <b>{row['r_multiple'] or 0:+.2f}R</b>")
+        if row["auto_closed"]:
+            lines.append("<span class='muted'>离场价是系统按参考价记录的；"
+                         "若与 MEXC 实际成交不同，点下面的修改按钮改正。</span>")
+    btns = []
+    if row["status"] in ("open", "closed"):
+        btns.append(f"<a class='btn' href='/c/{pid}?a=edit_open&t={tok('edit_open')}'>修改开仓数据</a>")
+    if row["status"] == "open":
+        btns.append(f"<a class='btn gray' href='/c/{pid}?a=close&t={tok('close')}'>手动平仓</a>")
+    if row["status"] == "closed":
+        btns.append(f"<a class='btn' href='/c/{pid}?a=edit_close&t={tok('edit_close')}'>修改平仓数据</a>")
+    body = (f"<h1>{_status_label(row)} #{pid}</h1>"
+            f"<div class='card'>{'<br>'.join(lines)}</div>"
+            f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")
+    return page(f"{_status_label(row)} #{pid}", body)
+
+
+def _close_form(row) -> HTMLResponse:
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
     hint = ""
-    if row["status"] == "closed" and row["auto_closed"]:
-        hint = (f"<p class='muted'>系统已按参考价 <b>{row['exit_price'] or 0:,.2f}</b> "
-                f"自动记录（{row['exit_reason']}，约 {row['r_multiple'] or 0:+.2f}R）。"
-                f"填 MEXC 成交记录里的真实平仓价覆盖它，R 会按新价重算。</p>")
+    if row["status"] == "closed":
+        hint = (f"<p class='muted'>当前记录：离场价 <b>{row['exit_price'] or 0:,.2f}</b>"
+                f"（{row['exit_reason']}，约 {row['r_multiple'] or 0:+.2f}R）。"
+                f"保存后按新价重算 R。</p>")
     body = f"""
-    <h1>确认平仓 #{row['id']}</h1>
+    <h1>录入平仓 #{row['id']}</h1>
     <div class='card'>
       <b>{row['symbol']}</b> {side_txt}｜入场 {entry:,.2f}｜止损 {stop:,.2f}
       {hint}
@@ -308,17 +364,19 @@ def _close_page(row) -> HTMLResponse:
     <form method='post'>
       <input type='hidden' name='a' value='close'>
       <input type='hidden' name='t' value='{engine.sign_token(config.token_secret, row["id"], "close")}'>
+      {'<input type="hidden" name="edit" value="1">' if row['status'] == 'closed' else ''}
       <p>实际平仓价 <input name='exit_price' value='{row["exit_price"] or 0:.2f}'></p>
       <p>离场原因
         <select name='exit_reason' style='background:#0f1115;color:#e6e6e6;padding:8px;border-radius:6px'>
-          <option value='ma20'>收到提醒后平仓</option>
-          <option value='stop'>止损单被触发</option>
-          <option value='manual'>手动提前平</option>
+          <option value='ma20' {'selected' if row['exit_reason'] == 'ma20' else ''}>收到提醒后平仓</option>
+          <option value='stop' {'selected' if row['exit_reason'] == 'stop' else ''}>止损单被触发</option>
+          <option value='manual' {'selected' if row['exit_reason'] == 'manual' else ''}>手动提前平</option>
         </select></p>
-      <button type='submit'>确认平仓</button>
+      <button type='submit'>保存平仓价</button>
     </form>
+    <p><a class='btn gray' href='/c/{row['id']}?a=view&t={engine.sign_token(config.token_secret, row['id'], "view")}'>返回</a></p>
     """
-    return page(f"确认平仓 #{row['id']}", body)
+    return page(f"录入平仓 #{row['id']}", body)
 
 
 @app.post("/c/{pid}", response_class=HTMLResponse)
@@ -338,12 +396,15 @@ async def confirm_post(pid: int, request: Request):
         db.ignore_position(pid)
         return page("已忽略", f"<h1>已忽略 #{pid}</h1><p>{row['symbol']} 这笔不计入统计。</p>")
     if a == "close":
-        # pending/open → 正常平仓；closed 且是系统自动按参考价关的 → 允许补录真实成交价覆盖。
-        # 已由用户确认过的（auto_closed=0）仍拒绝，防止重放旧页面污染统计。
+        editing = bool(form.get("edit"))
+        # pending/open → 正常平仓；closed + (系统自动关 或 从「修改平仓数据」进来) → 允许改正。
+        # 其余（已确认过的平仓 + 旧链接直接提交）仍拒绝，防止手滑覆盖。
         if row["status"] in ("pending", "open"):
             pass
-        elif not (row["status"] == "closed" and row["auto_closed"]):
-            raise HTTPException(400, f"该仓位已是 {row['status']} 且成交价已确认，不能重复平仓")
+        elif row["status"] == "closed" and (row["auto_closed"] or editing):
+            pass
+        else:
+            raise HTTPException(400, "该仓位已平仓且成交价已确认；如需改正请从确认页点「修改平仓数据」")
         try:
             px = float(str(form.get("exit_price") or row["entry_price"]))
         except ValueError:
@@ -352,8 +413,13 @@ async def confirm_post(pid: int, request: Request):
         db.close_position(pid, px, reason)
         return page("已平仓", f"<h1>已记录平仓 #{pid}</h1><p>{row['symbol']} @ {px:,.2f}（{reason}）</p>")
     if a == "open":
-        if row["status"] != "pending":
-            raise HTTPException(400, f"该仓位状态是 {row['status']}，只能确认 pending 的信号")
+        editing = bool(form.get("edit"))
+        if row["status"] == "pending":
+            pass
+        elif row["status"] in ("open", "closed") and editing:
+            pass          # 从「修改开仓数据」进来，允许改正
+        else:
+            raise HTTPException(400, f"该仓位状态是 {row['status']}；如需改正请从确认页点「修改开仓数据」")
         try:
             entry = float(str(form.get("actual_entry") or row["entry_price"]))
             stop = float(str(form.get("actual_stop") or row["stop_price"]))
@@ -380,7 +446,10 @@ async def confirm_post(pid: int, request: Request):
             except ValueError:
                 raise HTTPException(400, "张数不是数字")
         placed = bool(form.get("stop_placed"))
-        db.confirm_position(pid, entry, qty, stop, placed)
+        if row["status"] == "pending":
+            db.confirm_position(pid, entry, qty, stop, placed)
+        else:
+            db.update_fill(pid, entry, qty, stop, placed)   # 修改已确认的记录
         rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
                                  row["contracts"], entry, stop, qty, source)
         src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"

@@ -156,6 +156,24 @@ class DB:
             (actual_entry, actual_contracts, actual_stop, 1 if stop_placed else 0, now(), pid))
         self.conn.commit()
 
+    def update_fill(self, pid: int, actual_entry: float, actual_contracts: int,
+                    actual_stop: float, stop_placed: bool) -> None:
+        """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。"""
+        p = self.position_by_id(pid)
+        if not p:
+            return
+        risk = abs(actual_entry - actual_stop)
+        sets = "actual_entry=?, actual_contracts=?, actual_stop=?, stop_placed=?"
+        vals: List[Any] = [actual_entry, actual_contracts, actual_stop, 1 if stop_placed else 0]
+        if p["status"] == "closed" and p["exit_price"] is not None and risk > 0:
+            exit_px = float(p["exit_price"])
+            move = (exit_px - actual_entry) if (p["side"] or 1) == 1 else (actual_entry - exit_px)
+            sets += ", r_multiple=?"
+            vals.append(move / risk)
+        vals.append(pid)
+        self.conn.execute(f"UPDATE positions SET {sets} WHERE id=?", vals)
+        self.conn.commit()
+
     def ignore_position(self, pid: int) -> None:
         self.conn.execute("UPDATE positions SET status='ignored', closed_at=? WHERE id=?", (now(), pid))
         self.conn.commit()
