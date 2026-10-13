@@ -357,7 +357,7 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None) -> List[str]:
         for ev in events:
             if ev.kind == "exit":
                 if row is not None:
-                    db.close_position(row["id"], ev.exit_price, ev.reason)
+                    db.close_position(row["id"], ev.exit_price, ev.reason, auto=True)
                     text = format_exit(cfg, position or _row_to_state(row), ev.exit_price, ev.reason,
                                        ev.bar_ms, row["id"], stale=not ev.is_latest,
                                        bars_held=ev.bars_held)

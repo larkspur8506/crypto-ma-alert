@@ -47,6 +47,39 @@ class TestAppAssembly(unittest.TestCase):
         mod.db.set_config("equity", 2000)
         self.assertEqual(mod.current_config().equity, 2000.0)
 
+    def test_auto_closed_position_accepts_real_fill_once(self):
+        """回归：系统自动按参考价关仓后，用户必须能补录真实成交价（覆盖一次），之后再提交才拒绝。"""
+        try:
+            import fastapi                                            # noqa: F401
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        pid = mod.db.create_position(symbol="BTC_USDT", signal_bar_ms=1_700_000_100_000,
+                                     status="open", side=-1, entry_price=100_000.0,
+                                     stop_price=103_000.0, stop_dist=0.03, contracts=6,
+                                     coin_qty=0.0006, notional=60.0, risk_u=18.0,
+                                     equity_at_entry=1000.0)
+        mod.db.confirm_position(pid, 100_000.0, 6, 103_000.0, True)
+        # 引擎自动关仓（参考价），auto_closed=1
+        mod.db.close_position(pid, 99_000.0, "ma20", auto=True)
+        self.assertEqual(mod.db.position_by_id(pid)["auto_closed"], 1)
+        tok = mod.engine.sign_token(mod.config.token_secret, pid, "close")
+        with TestClient(mod.app) as client:
+            r = client.post(f"/c/{pid}", data={"a": "close", "t": tok,
+                                               "exit_price": "98500", "exit_reason": "ma20"})
+            self.assertEqual(r.status_code, 200, "自动关仓后应允许补录真实成交价")
+            row = mod.db.position_by_id(pid)
+            self.assertAlmostEqual(row["exit_price"], 98_500.0)
+            self.assertAlmostEqual(row["r_multiple"], (100_000 - 98_500) / 3_000)
+            self.assertEqual(row["auto_closed"], 0, "用户确认后应转为已确认状态")
+            # 再提交一次必须拒绝，且不覆盖已确认的成交价
+            r = client.post(f"/c/{pid}", data={"a": "close", "t": tok,
+                                               "exit_price": "97000", "exit_reason": "ma20"})
+            self.assertEqual(r.status_code, 400)
+            self.assertAlmostEqual(mod.db.position_by_id(pid)["exit_price"], 98_500.0)
+
     def test_confirm_actions_reject_wrong_status(self):
         """回归：确认动作必须带状态守卫——closed 的仓位不能被重复平仓/确认/忽略。
 

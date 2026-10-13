@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS positions (
     stop_placed INTEGER DEFAULT 0,
     exit_price REAL,
     exit_reason TEXT,                  -- stop | ma20 | manual
+    auto_closed INTEGER DEFAULT 0,     -- 1 = 系统按参考价自动关（用户可覆盖真实成交价）；0 = 用户已确认
     r_multiple REAL,
     equity_at_entry REAL,
     created_at REAL NOT NULL,
@@ -97,6 +98,12 @@ class DB:
         if "side" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN side INTEGER NOT NULL DEFAULT 1")
             logger.info("[db] 迁移：positions 新增 side 列")
+        if "auto_closed" not in cols:
+            self.conn.execute("ALTER TABLE positions ADD COLUMN auto_closed INTEGER DEFAULT 0")
+            # 历史行：引擎自动关的（exit_reason 为 stop/ma20）视为可覆盖，其余视为用户已确认
+            self.conn.execute("UPDATE positions SET auto_closed=1 "
+                              "WHERE status='closed' AND exit_reason IN ('stop','ma20')")
+            logger.info("[db] 迁移：positions 新增 auto_closed 列")
 
     # ---------------- configuration
     def get_config(self) -> Dict[str, str]:
@@ -153,7 +160,8 @@ class DB:
         self.conn.execute("UPDATE positions SET status='ignored', closed_at=? WHERE id=?", (now(), pid))
         self.conn.commit()
 
-    def close_position(self, pid: int, exit_price: float, exit_reason: str) -> None:
+    def close_position(self, pid: int, exit_price: float, exit_reason: str, auto: bool = False) -> None:
+        """关闭仓位。auto=True 表示引擎按参考价自动关（exit_price 只是参考，用户可覆盖）。"""
         p = self.position_by_id(pid)
         if not p:
             return
@@ -164,8 +172,9 @@ class DB:
         move = (exit_price - entry) if side == 1 else (entry - exit_price)
         r = move / risk if risk > 0 else 0.0
         self.conn.execute(
-            "UPDATE positions SET status='closed', exit_price=?, exit_reason=?, r_multiple=?, closed_at=? "
-            "WHERE id=?", (exit_price, exit_reason, r, now(), pid))
+            "UPDATE positions SET status='closed', exit_price=?, exit_reason=?, r_multiple=?, "
+            "auto_closed=?, closed_at=? WHERE id=?",
+            (exit_price, exit_reason, r, 1 if auto else 0, now(), pid))
         self.conn.commit()
 
     def recent_positions(self, limit: int = 20) -> List[sqlite3.Row]:

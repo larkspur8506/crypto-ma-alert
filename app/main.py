@@ -294,10 +294,16 @@ def _close_page(row) -> HTMLResponse:
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
+    hint = ""
+    if row["status"] == "closed" and row["auto_closed"]:
+        hint = (f"<p class='muted'>系统已按参考价 <b>{row['exit_price'] or 0:,.2f}</b> "
+                f"自动记录（{row['exit_reason']}，约 {row['r_multiple'] or 0:+.2f}R）。"
+                f"填 MEXC 成交记录里的真实平仓价覆盖它，R 会按新价重算。</p>")
     body = f"""
     <h1>确认平仓 #{row['id']}</h1>
     <div class='card'>
       <b>{row['symbol']}</b> {side_txt}｜入场 {entry:,.2f}｜止损 {stop:,.2f}
+      {hint}
     </div>
     <form method='post'>
       <input type='hidden' name='a' value='close'>
@@ -332,8 +338,12 @@ async def confirm_post(pid: int, request: Request):
         db.ignore_position(pid)
         return page("已忽略", f"<h1>已忽略 #{pid}</h1><p>{row['symbol']} 这笔不计入统计。</p>")
     if a == "close":
-        if row["status"] not in ("pending", "open"):
-            raise HTTPException(400, f"该仓位已是 {row['status']}，不能重复平仓")
+        # pending/open → 正常平仓；closed 且是系统自动按参考价关的 → 允许补录真实成交价覆盖。
+        # 已由用户确认过的（auto_closed=0）仍拒绝，防止重放旧页面污染统计。
+        if row["status"] in ("pending", "open"):
+            pass
+        elif not (row["status"] == "closed" and row["auto_closed"]):
+            raise HTTPException(400, f"该仓位已是 {row['status']} 且成交价已确认，不能重复平仓")
         try:
             px = float(str(form.get("exit_price") or row["entry_price"]))
         except ValueError:
