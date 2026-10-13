@@ -78,6 +78,12 @@ class TestAppAssembly(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertIn("当前记录", r.text)
             self.assertIn("103000.00", r.text)
+            # 提醒消息里的 a=close 链接：已录入（非 auto_closed）→ 只读摘要而非表单
+            r = client.get(f"/c/{pid}", params={"a": "close",
+                                                "t": mod.engine.sign_token(sec, pid, "close")})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("修改平仓数据", r.text)
+            self.assertNotIn("name='exit_price'", r.text)
             # a=edit_close 表单 → 提交后更新离场价并重算 R
             r = client.post(f"/c/{pid}", data={"a": "close", "edit": "1",
                                                "t": mod.engine.sign_token(sec, pid, "close"),

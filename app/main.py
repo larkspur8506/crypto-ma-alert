@@ -244,6 +244,10 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     if not row:
         raise HTTPException(404, "记录不存在")
     if a in ("close", "edit_close"):
+        # 提醒消息里的 a=close 链接：该仓尚未录入真实平仓价（系统自动关的）→ 直接给表单；
+        # 已经录入过（用户自己确认的）→ 给只读摘要，改正要走「修改平仓数据」按钮。
+        if a == "close" and row["status"] == "closed" and not row["auto_closed"]:
+            return _summary(row, pid)
         return _close_form(row)
     if a == "edit_open":
         return _entry_form(row, pid, editing=True)
