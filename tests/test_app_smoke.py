@@ -78,12 +78,6 @@ class TestAppAssembly(unittest.TestCase):
             self.assertEqual(r.status_code, 200)
             self.assertIn("当前记录", r.text)
             self.assertIn("103000.00", r.text)
-            # 提醒消息里的 a=close 链接：已录入（非 auto_closed）→ 只读摘要而非表单
-            r = client.get(f"/c/{pid}", params={"a": "close",
-                                                "t": mod.engine.sign_token(sec, pid, "close")})
-            self.assertEqual(r.status_code, 200)
-            self.assertIn("修改平仓数据", r.text)
-            self.assertNotIn("name='exit_price'", r.text)
             # a=edit_close 表单 → 提交后更新离场价并重算 R
             r = client.post(f"/c/{pid}", data={"a": "close", "edit": "1",
                                                "t": mod.engine.sign_token(sec, pid, "close"),
@@ -100,6 +94,17 @@ class TestAppAssembly(unittest.TestCase):
             self.assertEqual(row["status"], "closed")
             self.assertAlmostEqual(row["actual_entry"], 101_000.0)
             self.assertAlmostEqual(row["r_multiple"], (104_000 - 101_000) / 3_000)
+            self.assertEqual(row["auto_closed"], 0, "用户改过之后应视为已确认")
+            # 已录入完毕（auto_closed=0）→ 提醒消息里那条 a=close 链接应给只读摘要，不是表单
+            r = client.get(f"/c/{pid}", params={"a": "close",
+                                                "t": mod.engine.sign_token(sec, pid, "close")})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("修改平仓数据", r.text)
+            self.assertNotIn("name='exit_price'", r.text)
+            # 而 a=edit_close 仍必须是表单，否则改不了
+            r = client.get(f"/c/{pid}", params={"a": "edit_close",
+                                                "t": mod.engine.sign_token(sec, pid, "edit_close")})
+            self.assertIn("name='exit_price'", r.text)
 
     def test_auto_closed_position_accepts_real_fill_once(self):
         """回归：系统自动按参考价关仓后，用户必须能补录真实成交价（覆盖一次），之后再提交才拒绝。"""
