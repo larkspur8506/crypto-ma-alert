@@ -327,9 +327,13 @@ async def confirm_post(pid: int, request: Request):
         raise HTTPException(404, "记录不存在")
 
     if a == "ignore":
+        if row["status"] not in ("pending", "open"):
+            raise HTTPException(400, f"该仓位已是 {row['status']}，无需忽略")
         db.ignore_position(pid)
         return page("已忽略", f"<h1>已忽略 #{pid}</h1><p>{row['symbol']} 这笔不计入统计。</p>")
     if a == "close":
+        if row["status"] not in ("pending", "open"):
+            raise HTTPException(400, f"该仓位已是 {row['status']}，不能重复平仓")
         try:
             px = float(str(form.get("exit_price") or row["entry_price"]))
         except ValueError:
@@ -338,6 +342,8 @@ async def confirm_post(pid: int, request: Request):
         db.close_position(pid, px, reason)
         return page("已平仓", f"<h1>已记录平仓 #{pid}</h1><p>{row['symbol']} @ {px:,.2f}（{reason}）</p>")
     if a == "open":
+        if row["status"] != "pending":
+            raise HTTPException(400, f"该仓位状态是 {row['status']}，只能确认 pending 的信号")
         try:
             entry = float(str(form.get("actual_entry") or row["entry_price"]))
             stop = float(str(form.get("actual_stop") or row["stop_price"]))

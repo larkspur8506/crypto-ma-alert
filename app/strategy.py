@@ -1,14 +1,14 @@
 """双均线（6MA）趋势系统核心逻辑 — 纯 stdlib，无第三方依赖。
 
-规则（冻结版 v1，2026-10-12 与用户确认）：
+规则（冻结版 v2，2026-10-12 多空双向）：
 
-- 指标：SMA20/60/120 + EMA20/60/120（收盘价）
+- 指标：SMA20/60/120 + EMA20/60/120（收盘价）+ SMA200（做空趋势过滤）
 - 均线密集：band = (6均线max − 6均线min) / 收盘，要求 band ≤ 过去 250 根的最窄 20% 分位，
   且连续 ≥ 6 根成立
-- 入场（只做多）：本根收盘 > 上一根的 6均线max（band 上沿）
-  → 次根开盘市价入场；止损 = 上一根的 6均线min（band 下沿）
+- 入场：本根收盘 > 上一根的 6均线max → 做多 / 收盘 < 上一根的 6均线min 且收盘 < SMA200 → 做空
+  → 次根开盘市价入场；止损 = **本根**的 6均线min（做多）/ 6均线max（做空）
   → 止损距离必须落在 [1.5%, 10%]，否则放弃这笔
-- 离场：任一根收盘 < SMA20（止损优先于离场）
+- 离场：做多=收盘 < SMA20；做空=收盘 > SMA20（止损优先于离场；无固定止盈）
 
 本模块是**唯一**的信号口径来源：回测脚本、dry-run 回放、线上定时任务全部 import 它，
 避免「实盘代码与回测口径不一致」。
@@ -200,8 +200,12 @@ def evaluate_entry(symbol: str, bars: Sequence[Bar], ind: Dict[str, List[Optiona
     elif allow_short and close < ma_min[i - 1]:
         side = -1
         if short_regime_ma:
-            regime = ind.get(f"sma{short_regime_ma}")
-            if not regime or regime[i] is None or close >= regime[i]:
+            key = f"sma{short_regime_ma}"
+            if key not in ind:
+                # 可配置窗口不在 compute_indicators 的固定清单里 → 现算，绝不能静默吞掉做空信号
+                ind[key] = sma_series([b.close for b in bars], short_regime_ma)
+            regime = ind[key]
+            if regime[i] is None or close >= regime[i]:
                 return None
     if side == 0:
         return None

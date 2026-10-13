@@ -87,20 +87,27 @@ for symbol in CFG.symbols:
           f" ｜ 回测simulate {len(b)} 回合（多 {nb}/空 {len(b) - nb}） ===")
     n = min(len(a), len(b))
     bad = []
-    for k in range(n):
+    # 末端未平仓的回合（walk 留仓、无 out_ms；回测 simulate 在窗口末端强制平仓）单独核对方向与入场 bar
+    a_closed = [x for x in a if "out_ms" in x]
+    a_open = [x for x in a if "out_ms" not in x]
+    for k, (ak, bk) in enumerate(zip(a_closed, b)):
         # walk 的 entry 事件 bar_ms = **信号 bar**（幂等键），回测的 entry_i = 入场 bar = 信号 bar + 1
-        if (a[k]["in_ms"] + 14_400_000 != b[k]["in_ms"] or a[k]["out_ms"] != b[k]["out_ms"]
-                or a[k]["side"] != b[k]["side"]):
-            bad.append((k, a[k], b[k]))
+        if (ak["in_ms"] + 14_400_000 != bk["in_ms"] or ak["out_ms"] != bk["out_ms"]
+                or ak["side"] != bk["side"]):
+            bad.append((k, ak, bk))
     print(f"  前 {n} 个回合中不一致：{len(bad)}")
     for k, x, y in bad[:3]:
         print(f"    #{k} walk side={x['side']} in={pd.to_datetime(x['in_ms'], unit='ms')} "
-              f"out={pd.to_datetime(x['out_ms'], unit='ms')}")
+              f"out={pd.to_datetime(x.get('out_ms', 0), unit='ms')}")
         print(f"        bt  side={y['side']} in={pd.to_datetime(y['in_ms'], unit='ms')} "
               f"out={pd.to_datetime(y['out_ms'], unit='ms')}")
+    if a_open:
+        print(f"  窗口末端未平仓：{len(a_open)} 笔（walk 留仓、回测末端强平，不计入逐笔比对）")
+        for x in a_open:
+            print(f"    walk side={x['side']} 信号bar={pd.to_datetime(x['in_ms'], unit='ms')}")
     if len(a) == len(b) and not bad:
-        rs_walk = [x["r"] for x in a if "r" in x]
-        rs_bt = [x["r"] for x in b]
+        rs_walk = [x["r"] for x in a_closed]
+        rs_bt = [t["r"] for t in b[:len(a_closed)]]
         dmax = max((abs(p - q) for p, q in zip(rs_walk, rs_bt)), default=0)
         avg = sum(rs_walk) / len(rs_walk) if rs_walk else 0
         print(f"  ✅ 回合完全一致；R 最大差 {dmax:.4f}（差异来自回测按名义计费、walk 未计费）")

@@ -47,6 +47,49 @@ class TestAppAssembly(unittest.TestCase):
         mod.db.set_config("equity", 2000)
         self.assertEqual(mod.current_config().equity, 2000.0)
 
+    def test_confirm_actions_reject_wrong_status(self):
+        """回归：确认动作必须带状态守卫——closed 的仓位不能被重复平仓/确认/忽略。
+
+        旧实现对任意状态都照单全收，重放旧页面即可覆盖 exit_price / r_multiple 污染统计。
+        """
+        try:
+            import fastapi                                            # noqa: F401
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        pid = mod.db.create_position(symbol="BTC_USDT", signal_bar_ms=1_700_000_000_000,
+                                     status="pending", side=-1, entry_price=100_000.0,
+                                     stop_price=103_000.0, stop_dist=0.03, contracts=6,
+                                     coin_qty=0.0006, notional=60.0, risk_u=18.0,
+                                     equity_at_entry=1000.0)
+        tok = mod.engine.sign_token(mod.config.token_secret, pid, "close")
+        with TestClient(mod.app) as client:
+            # pending → close 一次合法
+            r = client.post(f"/c/{pid}", data={"a": "close", "t": tok,
+                                               "exit_price": "95000", "exit_reason": "ma20"})
+            self.assertEqual(r.status_code, 200)
+            row = mod.db.position_by_id(pid)
+            self.assertAlmostEqual(row["r_multiple"], (100_000 - 95_000) / 3_000)
+            # closed 后重复 close / open / ignore 都必须 400，且原 r_multiple 不被覆盖
+            r = client.post(f"/c/{pid}", data={"a": "close", "t": tok,
+                                               "exit_price": "99000", "exit_reason": "ma20"})
+            self.assertEqual(r.status_code, 400, "closed 仓位不能重复平仓")
+            row = mod.db.position_by_id(pid)
+            self.assertAlmostEqual(row["r_multiple"], (100_000 - 95_000) / 3_000)
+            tok_open = mod.engine.sign_token(mod.config.token_secret, pid, "open")
+            r = client.post(f"/c/{pid}", data={"a": "open", "t": tok_open,
+                                               "actual_entry": "100000",
+                                               "actual_stop": "103000",
+                                               "actual_contracts": "6"})
+            self.assertEqual(r.status_code, 400, "非 pending 仓位不能确认开仓")
+            self.assertEqual(mod.db.position_by_id(pid)["status"], "closed")
+            tok_ign = mod.engine.sign_token(mod.config.token_secret, pid, "ignore")
+            r = client.post(f"/c/{pid}", data={"a": "ignore", "t": tok_ign})
+            self.assertEqual(r.status_code, 400, "closed 仓位不能忽略")
+            self.assertEqual(mod.db.position_by_id(pid)["status"], "closed")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

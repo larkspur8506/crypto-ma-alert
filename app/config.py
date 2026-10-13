@@ -1,6 +1,7 @@
-"""运行时配置：env 优先，其次 SQLite configuration 表（用户可改的参数）。
+"""运行时配置：DB configuration 表优先，其次 env，最后代码默认。
 
-DB 列 > env > 代码默认 —— 改代码默认值不会影响线上已有 DB 行。
+DB 列 > env > 代码默认 —— 改代码默认值不会影响线上已有 DB 行；
+改 /admin/rules 落 DB 即生效，无需重启。
 """
 from __future__ import annotations
 

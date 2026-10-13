@@ -227,6 +227,27 @@ class TestShorts(unittest.TestCase):
                                               entry_price=bars[i + 1].open,
                                               allow_long=False, short_regime_ma=0))
 
+    def test_custom_regime_window_computed_on_the_fly(self):
+        """回归：short_regime_ma 设成非 200 窗口时，过滤线必须现算而不是静默吞掉做空。
+
+        旧实现 ind.get(f"sma{window}") 拿不到 → 全部做空信号无声消失。
+        """
+        bars, i = squeeze_then_breakdown()
+        ind, sq = prep(bars)
+        del ind["sma200"]                          # 模拟 compute_indicators 没算过该窗口
+        # sma100 = 横盘段价格均值附近，明显低于跌破后的价格 → 过滤应放行
+        sig = S.evaluate_entry("BTC_USDT", bars, ind, sq, i, entry_price=bars[i + 1].open,
+                               allow_long=False, short_regime_ma=100)
+        self.assertIsNotNone(sig, "自定义过滤窗口查不到时必须现算，不能吞掉做空信号")
+        assert sig is not None
+        self.assertEqual(sig.side, -1)
+        self.assertIn("sma100", ind)               # 且缓存进 ind，同一 dict 内不重算
+        # 同一窗口下，把过滤线设成 0（价格必在均线上方）→ 应拦下（证明 sma100 真的参与了判定）
+        ind["sma100"] = [0.0] * len(bars)
+        self.assertIsNone(S.evaluate_entry("BTC_USDT", bars, ind, sq, i,
+                                           entry_price=bars[i + 1].open,
+                                           allow_long=False, short_regime_ma=100))
+
     def test_short_stop_distance_filter(self):
         bars, i = squeeze_then_breakdown(drop_pct=0.40)     # 跌太狠 → 距离超 10%
         ind, sq = prep(bars)
