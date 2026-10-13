@@ -43,6 +43,29 @@
 
 ## 4. 日常运维命令
 
+### 控制接口（2026-10-13 在本机真服务上实测）
+
+```bash
+BASE=https://ma.222677.xyz ; K=$ADMIN_TOKEN      # 面板与后台接口都要 ?k=，否则 401
+
+curl -s "$BASE/health"                            # 含 hl_mode / hl_kill
+curl -s "$BASE/api/hl/status?k=$K" | python3 -m json.tool | head -40   # 面板数据源
+curl -s "$BASE/hl?k=$K" -o /tmp/hl.html           # 监控面板
+
+# 切换模式（form 编码；切 live 时若无凭据会被 400 拒绝 —— 这是故意的）
+curl -s -X POST -d "mode=dry&k=$K" "$BASE/admin/hl/mode"
+curl -s -X POST -d "mode=off&k=$K" "$BASE/admin/hl/mode"
+
+# kill switch（on=1 暂停自动交易，仍允许人工平仓；解除用 on=0）
+curl -s -X POST -d "on=1&k=$K" "$BASE/admin/hl/kill"
+curl -s -X POST -d "on=0&k=$K" "$BASE/admin/hl/kill"
+
+# 手动触发一次 tick（跑真实行情，dry 模式不会下单）
+curl -s -X POST "$BASE/admin/tick?k=$K"
+```
+
+### 服务器侧
+
 ```bash
 # 容器状态与日志
 ssh oracle1 'sudo -n docker ps --format "{{.Names}}\t{{.Status}}" | grep crypto-ma'
