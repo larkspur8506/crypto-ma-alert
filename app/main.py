@@ -67,8 +67,14 @@ def _job_tick() -> None:
 def _job_heartbeat() -> None:
     cfg = current_config()
     text = engine.heartbeat_text(db, cfg)
-    ok = bool(notifier and notifier.send_message(text))
-    db.log_alert(None, None, "heartbeat", text, ok)
+    if cfg.heartbeat_push:
+        ok = bool(notifier and notifier.send_message(text))
+        db.log_alert(None, None, "heartbeat", text, ok)
+        return
+    # 静默信标：只落库不推送（每日巡检已把同样信息汇总给用户）。
+    # kind='heartbeat_local' 仅供 cma_watch.py / cma_status.py 判断调度器存活。
+    db.log_alert(None, None, "heartbeat_local", text, True)
+    logger.info("心跳（未推送，仅落库）:\n%s", text)
 
 
 def _job_weekly() -> None:
@@ -182,7 +188,9 @@ def admin_rules(request: Request, k: Optional[str] = None):
       <p><label><input type='checkbox' name='enable_long' {'checked' if cfg.enable_long else ''}>
          允许做多</label>
          <label><input type='checkbox' name='enable_shorts' {'checked' if cfg.enable_shorts else ''}>
-         允许做空</label></p>
+         允许做空</label>
+         <label><input type='checkbox' name='heartbeat_push' {'checked' if cfg.heartbeat_push else ''}>
+         每天推送心跳（默认关：信息已在每日巡检里）</label></p>
       <p>做空趋势过滤均线 <input name='short_regime_ma' value='{cfg.short_regime_ma}'>
          （0 = 关闭过滤，不建议）</p>
       <button type='submit'>保存</button>
@@ -199,6 +207,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
                      leverage: str = Form(...), stop_min: str = Form(...), stop_max: str = Form(...),
                      enable_long: Optional[str] = Form(None),
                      enable_shorts: Optional[str] = Form(None),
+                     heartbeat_push: Optional[str] = Form(None),
                      short_regime_ma: str = Form("200"), k: str = Form("")):
     _require_admin(request, k)
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
@@ -211,6 +220,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
     # 复选框：勾选=1，未勾选=不传 → 0
     db.set_config("enable_long", 1 if enable_long else 0)
     db.set_config("enable_shorts", 1 if enable_shorts else 0)
+    db.set_config("heartbeat_push", 1 if heartbeat_push else 0)
     try:
         int(float(short_regime_ma))
     except ValueError:

@@ -55,6 +55,9 @@ class Config:
     token_secret: str = _env("TOKEN_SECRET")
     dry_run: bool = _env("DRY_RUN", "false").lower() in ("1", "true", "yes")
     tz: str = _env("TZ", "UTC")
+    # 心跳默认**只落库不推送**（静默信标）：每日巡检已覆盖同样信息，避免重复；
+    # 看守/巡检脚本靠 alert_logs 里的心跳行判断调度器存活。设 true 恢复每天推送。
+    heartbeat_push: bool = _env("HEARTBEAT_PUSH", "false").lower() in ("1", "true", "yes")
 
     # 推送
     wechat_webhook: str = _env("WECHAT_WEBHOOK_URL")
@@ -73,7 +76,7 @@ class Config:
 
     # ---- DB 可覆盖项 ----
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
-                   "enable_long", "enable_shorts", "short_regime_ma")
+                   "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push")
 
     def apply_db(self, values: dict) -> "Config":
         for k in self.OVERRIDABLE:

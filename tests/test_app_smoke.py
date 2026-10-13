@@ -38,6 +38,33 @@ class TestAppAssembly(unittest.TestCase):
         for p in ("/health", "/admin", "/admin/rules", "/admin/logs", "/c/{pid}"):
             self.assertIn(p, paths, f"路由 {p} 未注册")
 
+    def test_heartbeat_is_silent_beacon_by_default(self):
+        """心跳默认只落库不推送（避免与每日巡检重复），但必须留下 kind='heartbeat_local' 供看守判断。"""
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        pushed = []
+
+        class Boom:
+            def send_message(self, text):
+                pushed.append(text)
+                return True
+
+        mod.notifier = Boom()
+        mod.db.set_config("heartbeat_push", 0)
+        mod._job_heartbeat()
+        self.assertEqual(pushed, [], "默认不应推送心跳")
+        kinds = [r["kind"] for r in mod.db.recent_alerts(5)]
+        self.assertIn("heartbeat_local", kinds)
+        # 打开开关后应恢复推送
+        mod.db.set_config("heartbeat_push", 1)
+        mod._job_heartbeat()
+        self.assertEqual(len(pushed), 1, "开关打开后应推送")
+        self.assertIn("heartbeat", [r["kind"] for r in mod.db.recent_alerts(5)])
+
     def test_config_db_override_path(self):
         try:
             import fastapi                                            # noqa: F401

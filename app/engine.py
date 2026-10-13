@@ -33,6 +33,15 @@ def fmt_ms(ms: int) -> str:
     return dt.datetime.fromtimestamp(ms / 1000, dt.timezone.utc).strftime("%m-%d %H:%M")
 
 
+def fmt_bar_close(ms: int) -> str:
+    """bar 的**收盘时刻**（开盘时间 + 4h）。
+
+    提醒里报「收盘时间」而不是 bar 的开盘时间：bar 用开盘时间标识（20:00 那根 = 20:00~24:00），
+    但用户看到「10-12 20:00 UTC 收盘」会以为信号晚了 4 小时，与自己的下单时间对不上。
+    """
+    return fmt_ms(ms + INTERVAL_MS)
+
+
 def fmt_money(x: float) -> str:
     return f"{x:,.0f}"
 
@@ -114,7 +123,7 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     long = sig.is_long
     stop_note = f"距离 {sig.stop_dist * 100:.2f}%" + ("" if long else "，在价格上方")
     return "\n".join([
-        f"{cfg.alert_prefix}{sig.symbol} {sig.action}信号（4h 收盘 {fmt_ms(sig.bar_open_ms)} UTC）",
+        f"{cfg.alert_prefix}{sig.symbol} {sig.action}信号（4h 收盘 {fmt_bar_close(sig.bar_open_ms)} UTC）",
         f"入场：市价（当前 {fmt_money(sig.entry_price)}）",
         f"止损触发价：{fmt_money(sig.stop_price)}（{stop_note}）",
         f"下单：逐仓 {cfg.leverage:.0f}x / 市价 / 单位选 USDT / 输入 {fmt_money(order.notional)} USDT"
@@ -220,7 +229,7 @@ def regime_note(side: int, price: float, ma200: float) -> dict:
 def format_missed(cfg, sig: strategy.Signal) -> str:
     return "\n".join([
         f"{cfg.alert_prefix}⚠️ 错过的信号（补报）",
-        f"{sig.symbol} 在 {fmt_ms(sig.bar_open_ms)} UTC 的 4h 收盘触发{sig.action}"
+        f"{sig.symbol} 在 {fmt_bar_close(sig.bar_open_ms)} UTC 的 4h 收盘触发{sig.action}"
         f"（当时入场 {fmt_money(sig.entry_price)}，止损 {fmt_money(sig.stop_price)}）",
         f"该信号已超过一根 4h，入场价已变、风险几何失效，不建议追。仅作记录。",
     ])
@@ -243,7 +252,7 @@ def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms:
         head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
         advice = f"建议：4 小时内市价平仓（{pos.close_side}）；平仓后确认委托列表已空（撤掉残留止损单）"
     return "\n".join([
-        f"{cfg.alert_prefix}{pos.symbol} {pos.action_label} {head}（{fmt_ms(bar_ms)} UTC 收盘）",
+        f"{cfg.alert_prefix}{pos.symbol} {pos.action_label} {head}（{fmt_bar_close(bar_ms)} UTC 收盘）",
         f"原因：{why}",
         f"参考离场价：{fmt_money(exit_price)}（本次约 {r:+.2f}R，持仓约 {bars_held * 4} 小时）",
         advice,
