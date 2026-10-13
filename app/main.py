@@ -10,7 +10,7 @@ from typing import Optional
 from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
-from app import engine, market, strategy
+from app import engine, market, sizing, strategy
 from app.config import Config
 from app.db import DB
 from app.notify import get_notifier
@@ -248,6 +248,7 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
     side_txt = "做多" if (row["side"] or 1) == 1 else "做空"
     stop_hint = "（价格下方）" if (row["side"] or 1) == 1 else "（价格上方）"
+    cfg = current_config()
     body = f"""
     <h1>确认开仓 #{pid}</h1>
     <div class='card'>
@@ -255,13 +256,17 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
       建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>{stop_hint}
       （{row['stop_dist'] * 100:.2f}%）<br>
       建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜
-      风险 {row['risk_u']:.1f}U
+      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =
+      {cfg.equity * cfg.risk_pct:.1f}U）
     </div>
     <form method='post'>
       <input type='hidden' name='a' value='open'><input type='hidden' name='t' value='{tok("open")}'>
-      <p>实际成交价 <input name='actual_entry' value='{row["entry_price"]:.2f}'></p>
-      <p>实际张数 <input name='actual_contracts' value='{row["contracts"]}'></p>
-      <p>实际止损触发价 <input name='actual_stop' value='{row["stop_price"]:.2f}'></p>
+      <p>实际成交均价 <input name='actual_entry' value='{row["entry_price"]:.2f}'></p>
+      <p>成交金额 USDT <input name='fill_amount' value='' placeholder='成交记录里的金额'>
+        <span class='muted'>填了就按它换算张数（比下单时看到的预览张数准）</span></p>
+      <p>实际张数 <input name='actual_contracts' value='{row["contracts"]}'>
+        <span class='muted'>没填成交金额时用这个</span></p>
+      <p>实际止损触发价 <input name='actual_stop' value='{row['stop_price']:.2f}'></p>
       <p><label><input type='checkbox' name='stop_placed' value='1' checked style='width:auto'> 已挂止损单</label></p>
       <button type='submit'>按以上数值确认开仓</button>
     </form>
@@ -324,18 +329,47 @@ async def confirm_post(pid: int, request: Request):
     if a == "open":
         try:
             entry = float(str(form.get("actual_entry") or row["entry_price"]))
-            qty = int(float(str(form.get("actual_contracts") or row["contracts"])))
             stop = float(str(form.get("actual_stop") or row["stop_price"]))
         except ValueError:
             raise HTTPException(400, "数值格式错误")
         err = engine.validate_stop_side(row["side"] or 1, entry, stop)
         if err:
             raise HTTPException(400, err)
+        raw_amount = str(form.get("fill_amount") or "").strip()
+        source = "contracts"
+        if raw_amount:
+            try:
+                amount = float(raw_amount)
+            except ValueError:
+                raise HTTPException(400, "成交金额不是数字")
+            try:
+                qty = sizing.contracts_from_amount(row["symbol"], entry, amount)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            source = "amount"
+        else:
+            try:
+                qty = int(float(str(form.get("actual_contracts") or row["contracts"])))
+            except ValueError:
+                raise HTTPException(400, "张数不是数字")
         placed = bool(form.get("stop_placed"))
         db.confirm_position(pid, entry, qty, stop, placed)
+        rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
+                                 row["contracts"], entry, stop, qty, source)
+        src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"
+                   if source == "amount" else "按你填的张数")
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"
+        notes = "".join(f"<li>{n}</li>" for n in rev["notes"])
+        review = (f"<div class='card {'bad' if rev['level'] == 'warn' else 'muted'}'>"
+                  f"风险体检：实际风险 <b>{rev['risk_u']:.1f}U</b>"
+                  f"（权益的 {rev['risk_u'] / rev['equity'] * 100:.1f}%）｜"
+                  f"止损距离 {rev['stop_dist'] * 100:.2f}%｜名义 {rev['notional']:,.0f}U｜"
+                  f"保证金 {rev['margin']:,.0f}U"
+                  + (f"<ul>{notes}</ul>" if notes else "　✅ 与目标一致")
+                  + "</div>")
         return page("已确认", f"<h1>已确认开仓 #{pid}</h1>"
-                              f"<p>{row['symbol']} @ {entry:,.2f}，{qty} 张，止损 {stop:,.2f}</p>{warn}")
+                              f"<p>{row['symbol']} @ {entry:,.2f}，{qty} 张，止损 {stop:,.2f}<br>"
+                              f"<span class='muted'>{src_txt}</span></p>{warn}{review}")
     raise HTTPException(400, f"未知操作 {a}")
 
 

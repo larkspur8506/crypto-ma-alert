@@ -4,3 +4,4 @@ __pycache__/
 *.db-journal
 .cache/
 .env
+commit_msg.txt

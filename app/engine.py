@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app import market, strategy
+from app.sizing import SPECS as CONTRACT_SPECS
+from app.sizing import metrics as sizing_metrics
 from app.sizing import size_order
 
 logger = logging.getLogger(__name__)
@@ -137,6 +139,60 @@ def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
     if side == -1 and stop <= entry:
         return f"做空的止损价必须高于入场价（你填的是 入场 {entry:,.2f} / 止损 {stop:,.2f}）"
     return None
+
+
+def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: int,
+                entry: float, stop: float, contracts: int, source: str = "contracts") -> dict:
+    """确认开仓后按**真实成交**做一次风险体检（纯计算，不落库）。
+
+    为什么需要：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额
+    （N = 风险U ÷ 止损距离）。用户晚入场时成交价会漂，同一批张数的
+    止损距离与实际风险就都变了：
+
+    - 做空晚入场（价格已涨）→ 止损更近、风险变小、更容易被噪音扫掉；
+    - 做多晚入场（价格已跌）→ 止损更远、**实际风险超过目标**。
+
+    所以必须在成交后回算一次并把偏差讲清楚，而不是让用户以为
+    「填了提醒里的金额 = 风险就是 2%」。
+    """
+    contract_size = CONTRACT_SPECS[symbol][0]
+    m = sizing_metrics(symbol, entry, stop, contracts, cfg.leverage)
+    target = cfg.equity * cfg.risk_pct
+    drift = (entry - suggested_entry) / suggested_entry if suggested_entry else 0.0
+    notes: List[str] = []
+
+    if abs(drift) >= 0.005:
+        notes.append(
+            f"成交价 {entry:,.2f} 比信号价 {suggested_entry:,.2f} "
+            f"{'高' if drift > 0 else '低'} {abs(drift) * 100:.2f}%"
+            f"（信号价是提醒那一刻的参考价，偏差来自延迟入场）")
+
+    if not (cfg.stop_min - 1e-9 <= m["stop_dist"] <= cfg.stop_max + 1e-9):
+        notes.append(
+            f"止损距离 {m['stop_dist'] * 100:.2f}% 已超出 {cfg.stop_min * 100:.0f}%~"
+            f"{cfg.stop_max * 100:.0f}% 的验证区间 —— 这笔的风险几何与回测口径不一致")
+
+    dev = (m["risk_u"] - target) / target if target else 0.0
+    if abs(dev) >= 0.2:
+        notes.append(
+            f"实际风险 {m['risk_u']:.1f}U（权益 {cfg.equity:,.0f}U 的 "
+            f"{m['risk_u'] / cfg.equity * 100:.1f}%）偏离目标 {target:.0f}U {dev * 100:+.0f}%")
+        if m["risk_unit"] > 0:
+            want = int(target / (m["risk_unit"] * contract_size))
+            cap = int((target / cfg.stop_min) / entry / contract_size) if entry > 0 else 0
+            extra = (f"；止损距离低于 {cfg.stop_min * 100:.0f}% 下限，"
+                     f"系统名义上限（风险U/下限）只能到 {cap} 张，超了就是隐性加杠杆"
+                     if want > cap else "")
+            notes.append(f"若要正好 {target:.0f}U 风险应开 {want} 张（本次 {contracts} 张）{extra}")
+
+    if source == "amount" and suggested_contracts and contracts < suggested_contracts * 0.6:
+        notes.append(
+            f"按金额换算出的 {contracts} 张明显少于建议 {suggested_contracts} 张 —— 核对一下"
+            f"填的是不是成交记录里的『成交金额（仓位价值）』；保证金 × {cfg.leverage:.0f} 才是名义")
+
+    return {"level": "warn" if notes else "ok", "notes": notes, "contracts": contracts,
+            "source": source, "entry": entry, "stop": stop, "drift": drift,
+            "target_risk_u": target, "equity": cfg.equity, **m}
 
 
 def format_missed(cfg, sig: strategy.Signal) -> str:

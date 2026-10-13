@@ -13,6 +13,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import engine                                          # noqa: E402
+from app import sizing                                          # noqa: E402
 from app.db import DB                                           # noqa: E402
 
 
@@ -204,6 +205,85 @@ class TestConfigOverrides(unittest.TestCase):
                                allow_short=self.cfg.enable_shorts,
                                short_regime_ma=self.cfg.short_regime_ma)
         self.assertIsNone(sig, "关掉做空后不应再出做空信号")
+
+
+class TestFillAmountAndRiskReview(unittest.TestCase):
+    """确认页：按成交金额换算张数 + 成交后风险体检（2026-10-13 首单暴露的缺口）。
+
+    背景：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额，
+    用户晚入场时成交价漂了，同一批张数的止损距离与实际风险都会变。
+    这里锁住两件事：
+      1. 成交金额 → 张数 的换算（必须用实际成交金额，不是下单时的预览张数）；
+      2. review_fill 必须把「止损距离超出验证区间」「风险偏离目标」讲出来。
+    """
+
+    def _cfg(self):
+        from app.config import Config
+        c = Config()
+        c.equity, c.risk_pct, c.leverage = 1000.0, 0.02, 5.0
+        c.stop_min, c.stop_max = 0.015, 0.10
+        return c
+
+    def test_contracts_from_actual_fill_amount(self):
+        """实际成交金额 721.3U @ 82,909.3 → 87 张（首单真实数字）。"""
+        self.assertEqual(sizing.contracts_from_amount("BTC_USDT", 82909.3, 721.3), 87)
+
+    def test_contracts_from_input_amount_would_be_off_by_one(self):
+        """拿下单时填的输入框金额（728U）去算会多一张 —— 所以要用成交金额。"""
+        self.assertEqual(sizing.contracts_from_amount("BTC_USDT", 82909.3, 728.0), 88)
+
+    def test_eth_contract_size(self):
+        self.assertEqual(sizing.contracts_from_amount("ETH_USDT", 2500.0, 1000.0), 40)
+
+    def test_amount_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            sizing.contracts_from_amount("BTC_USDT", 82909.3, 0.0)
+        with self.assertRaises(ValueError):
+            sizing.contracts_from_amount("BTC_USDT", 0.0, 100.0)
+
+    def test_metrics_roundtrip(self):
+        m = sizing.metrics("BTC_USDT", 82909.3, 84060.0, 87, 5.0)
+        self.assertAlmostEqual(m["coin_qty"], 0.0087, places=9)
+        self.assertAlmostEqual(m["risk_u"], 10.01, places=1)
+        self.assertAlmostEqual(m["stop_dist"], 0.01388, places=4)
+
+    def test_review_flags_late_short_entry(self):
+        """首单实测：做空晚 3h 入场，止损距离掉到 1.39%、风险只剩 1%。"""
+        cfg = self._cfg()
+        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 82909.3, 84060.0, 87, "amount")
+        self.assertEqual(rev["level"], "warn")
+        self.assertAlmostEqual(rev["risk_u"], 10.01, places=1)
+        self.assertLess(rev["stop_dist"], cfg.stop_min)
+        self.assertAlmostEqual(rev["drift"], 0.01340, places=4)
+        self.assertTrue(any("超出" in n for n in rev["notes"]), "必须报止损距离出区间")
+        self.assertTrue(any("偏离目标" in n for n in rev["notes"]), "必须报风险偏离")
+        self.assertTrue(any("应开" in n for n in rev["notes"]), "必须给出补正张数")
+
+    def test_review_clean_when_fill_matches_signal(self):
+        cfg = self._cfg()
+        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 89, "contracts")
+        self.assertEqual(rev["level"], "ok")
+        self.assertEqual(rev["notes"], [])
+
+    def test_review_flags_chasing_a_long(self):
+        """做多追高：入场价离止损更远 → 实际风险放大（危险侧）。"""
+        cfg = self._cfg()
+        rev = engine.review_fill(cfg, "BTC_USDT", 100000.0, 50, 102000.0, 96000.0, 50, "contracts")
+        self.assertEqual(rev["level"], "warn")
+        self.assertGreater(rev["risk_u"], 20.0)
+        self.assertGreater(rev["drift"], 0)
+        self.assertTrue(any("偏离目标" in n for n in rev["notes"]))
+
+    def test_review_flags_margin_filled_as_amount(self):
+        """把保证金当成成交金额填 → 张数只有建议的 1/杠杆，必须提示核对。"""
+        cfg = self._cfg()
+        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 17, "amount")
+        self.assertTrue(any("保证金" in n for n in rev["notes"]))
+
+    def test_review_skips_margin_hint_when_contracts_typed(self):
+        cfg = self._cfg()
+        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 17, "contracts")
+        self.assertFalse(any("保证金" in n for n in rev["notes"]))
 
 
 if __name__ == "__main__":

@@ -77,3 +77,41 @@ def size_order(symbol: str, entry_price: float, stop_price: float, equity: float
         margin=notional / leverage, risk_u=coin_qty * risk_unit,
         max_safe_leverage=max_safe_leverage(stop_dist), below_minimum=below_min,
     )
+
+
+def metrics(symbol: str, entry: float, stop: float, contracts: int,
+            leverage: float = 5.0) -> dict:
+    """按**真实成交**价/张数回算仓位指标（名义、币量、保证金、止损距离、风险U）。
+
+    用于确认开仓后的风险体检：提醒文案里的名义金额是按信号价算的，
+    实际成交价漂了之后同一批张数的风险就变了，必须用这个回算。
+    """
+    contract_size = SPECS[symbol][0]
+    coin_qty = contracts * contract_size
+    notional = coin_qty * entry
+    risk_unit = abs(entry - stop)
+    return {"coin_qty": coin_qty, "notional": notional, "margin": notional / leverage,
+            "risk_unit": risk_unit, "risk_u": coin_qty * risk_unit,
+            "stop_dist": (risk_unit / entry) if entry else 0.0}
+
+
+def contracts_from_amount(symbol: str, price: float, amount_usdt: float) -> int:
+    """把 MEXC 成交记录里的「成交金额(USDT)」+ 成交均价 反算成张数。
+
+    MEXC 合约「单位=USDT」下成交金额就是**仓位价值(名义)** = 张数 × 面值 × 价格，
+    所以 `张数 = round(成交金额 ÷ (价格 × 面值))`。
+
+    为什么用 round 而不是 floor：MEXC 下单时自己会对张数向下取整，
+    所以你看到的成交金额通常**略小于**下单时填的输入框金额；
+    除法回算会落在略小于整数的位置，四舍五入才回得到真实张数
+    （拿输入框金额去算是 87.8 → 88 张，拿实际成交金额算是 87.0 → 87 张）。
+    """
+    contract_size, step, min_vol, _ = SPECS[symbol]
+    if price <= 0:
+        raise ValueError("成交均价必须为正")
+    if amount_usdt <= 0:
+        raise ValueError("成交金额必须为正")
+    n = int(math.floor(amount_usdt / (price * contract_size) / step + 0.5)) * step
+    if n < min_vol:
+        raise ValueError(f"按成交金额换算出的张数 {n} 小于最小可下单张数 {min_vol}")
+    return n
