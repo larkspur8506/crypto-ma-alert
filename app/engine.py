@@ -195,6 +195,27 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
             "target_risk_u": target, "equity": cfg.equity, **m}
 
 
+def regime_note(side: int, price: float, ma200: float) -> dict:
+    """确认页的 MA200 提示（短文案）。
+
+    做空有趋势过滤（信号 bar 收盘 < MA200）：若成交前价格已回到 MA200 上方，
+    过滤条件事实上已失效 —— 历史统计这类做空均R −0.26（n=44）、胜率 25%。
+    做多没有这条过滤，只在价格跌破 MA200 时提示「质量偏弱」（历史仍为正期望）。
+    """
+    if ma200 <= 0:
+        return {"level": "muted", "text": ""}
+    dev = (price / ma200 - 1) * 100
+    if side == -1:
+        if price > ma200:
+            return {"level": "warn",
+                    "text": f"⚠️ 当前价 {price:,.0f} 在 MA200 上方 {dev:+.2f}% —— 做空趋势过滤已失效"}
+        return {"level": "ok", "text": f"当前价 {price:,.0f} 在 MA200 下方 {dev:+.2f}%（过滤成立）"}
+    if price < ma200:
+        return {"level": "warn",
+                "text": f"⚠️ 当前价 {price:,.0f} 在 MA200 下方 {dev:+.2f}% —— 做多趋势质量偏弱"}
+    return {"level": "ok", "text": f"当前价 {price:,.0f} 在 MA200 上方 {dev:+.2f}%（趋势配合）"}
+
+
 def format_missed(cfg, sig: strategy.Signal) -> str:
     return "\n".join([
         f"{cfg.alert_prefix}⚠️ 错过的信号（补报）",

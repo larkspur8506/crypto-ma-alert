@@ -286,5 +286,35 @@ class TestFillAmountAndRiskReview(unittest.TestCase):
         self.assertFalse(any("保证金" in n for n in rev["notes"]))
 
 
+class TestRegimeNote(unittest.TestCase):
+    """确认页的 MA200 提示：做空在 MA200 上方要报警，做多只在跌破时提示质量偏弱。"""
+
+    def test_short_above_ma200_warns(self):
+        r = engine.regime_note(-1, 83281.1, 82055.0)
+        self.assertEqual(r["level"], "warn")
+        self.assertIn("做空趋势过滤已失效", r["text"])
+        self.assertIn("MA200 上方 +1.49%", r["text"])
+
+    def test_short_below_ma200_ok(self):
+        r = engine.regime_note(-1, 81000.0, 82055.0)
+        self.assertEqual(r["level"], "ok")
+        self.assertIn("过滤成立", r["text"])
+
+    def test_long_below_ma200_warns_softly(self):
+        r = engine.regime_note(1, 81000.0, 82055.0)
+        self.assertEqual(r["level"], "warn")
+        self.assertIn("做多趋势质量偏弱", r["text"])
+        self.assertNotIn("失效", r["text"])
+
+    def test_long_above_ma200_ok(self):
+        r = engine.regime_note(1, 83000.0, 82055.0)
+        self.assertEqual(r["level"], "ok")
+        self.assertIn("趋势配合", r["text"])
+
+    def test_missing_ma200_is_silent(self):
+        self.assertEqual(engine.regime_note(-1, 83000.0, 0.0)["text"], "")
+        self.assertEqual(engine.regime_note(1, 83000.0, 0.0)["text"], "")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

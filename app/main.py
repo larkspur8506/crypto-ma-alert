@@ -249,6 +249,16 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     side_txt = "做多" if (row["side"] or 1) == 1 else "做空"
     stop_hint = "（价格下方）" if (row["side"] or 1) == 1 else "（价格上方）"
     cfg = current_config()
+    note = ""
+    try:
+        feed = market.fetch(row["symbol"])
+        ma200 = strategy.compute_indicators(feed.closed)["sma200"][-1] or 0.0
+        rn = engine.regime_note(row["side"] or 1, feed.bars[-1].close, ma200)
+        cls = {"warn": "bad", "ok": "muted"}.get(rn["level"], "muted")
+        if rn["text"]:
+            note = f"<p class='{cls}'>{rn['text']}</p>"
+    except Exception as e:                                              # noqa: BLE001
+        note = f"<p class='muted'>MA200 检查失败：{e}</p>"
     body = f"""
     <h1>确认开仓 #{pid}</h1>
     <div class='card'>
@@ -258,6 +268,7 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
       建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜
       风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =
       {cfg.equity * cfg.risk_pct:.1f}U）
+      {note}
     </div>
     <form method='post'>
       <input type='hidden' name='a' value='open'><input type='hidden' name='t' value='{tok("open")}'>
