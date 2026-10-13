@@ -72,6 +72,12 @@ class TestAppAssembly(unittest.TestCase):
             self.assertIn("修改开仓数据", r.text)
             self.assertIn("修改平仓数据", r.text)
             self.assertNotIn("按以上数值确认开仓", r.text)
+            # a=edit_close → 必须是平仓表单（含当前记录提示与预填离场价），不能又回到摘要页
+            r = client.get(f"/c/{pid}", params={"a": "edit_close",
+                                                "t": mod.engine.sign_token(sec, pid, "edit_close")})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("当前记录", r.text)
+            self.assertIn("103000.00", r.text)
             # a=edit_close 表单 → 提交后更新离场价并重算 R
             r = client.post(f"/c/{pid}", data={"a": "close", "edit": "1",
                                                "t": mod.engine.sign_token(sec, pid, "close"),

@@ -243,7 +243,7 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     row = db.position_by_id(pid)
     if not row:
         raise HTTPException(404, "记录不存在")
-    if a == "close":
+    if a in ("close", "edit_close"):
         return _close_form(row)
     if a == "edit_open":
         return _entry_form(row, pid, editing=True)
