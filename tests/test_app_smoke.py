@@ -33,10 +33,18 @@ class TestAppAssembly(unittest.TestCase):
         h = mod.health()
         self.assertEqual(h["status"], "ok")
         self.assertIn("BTC_USDT", h["symbols"])
-        # 关键路由已注册
-        paths = {r.path for r in mod.app.routes}
+        # 关键路由已注册。用 OpenAPI schema 取路径：跨 FastAPI 版本最稳，
+        # 也顺带验证 include_router 进来的子路由确实生效（早期版本 app.routes 里是嵌套对象）。
+        paths = self._route_paths(mod.app)
         for p in ("/health", "/admin", "/admin/rules", "/admin/logs", "/c/{pid}"):
             self.assertIn(p, paths, f"路由 {p} 未注册")
+        # HL 监控面板（feat/hl-executor）也要在
+        for p in ("/hl", "/api/hl/status"):
+            self.assertIn(p, paths, f"HL 路由 {p} 未注册")
+
+    @staticmethod
+    def _route_paths(app) -> set:
+        return set(app.openapi().get("paths", {}).keys())
 
     def test_heartbeat_is_silent_beacon_by_default(self):
         """心跳默认只落库不推送（避免与每日巡检重复），但必须留下 kind='heartbeat_local' 供看守判断。"""

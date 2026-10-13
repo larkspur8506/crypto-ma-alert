@@ -78,15 +78,32 @@ uvicorn app.main:app --port 8000
 离场提醒同理带 `/c/<id>?a=close&t=...`，填实际平仓价 + 离场原因。
 未确认的仓位按假设值计入统计，周报会标注「未确认 N 笔」。
 
+## HL 自动执行（可选，默认关闭）
+
+把「提醒 → 人工下单」升级为「提醒 → 自动下单 + 挂止损」，**默认 `off`（行为与旧版完全一致）**。
+
+- **三模式**：`off` / `dry`（影子，只算单落库不下单）/ `live`（真实下单）。DB 里的 `hl_exec_mode` 优先于环境变量。
+- **监控面板**：`/hl?k=<ADMIN_TOKEN>`（价格、仓位、浮盈浮亏、权益曲线、执行器事件、kill switch），JSON 版 `/api/hl/status`。
+- **fail-closed**：缺 SDK/凭据、止损挂失败、对账不一致、当日亏损超阈值、连续失败 —— 任一情况都**拒绝下单或自动停手**并推送。
+- **可审计**：每一单先写 `hl_orders` 意图（幂等键 `symbol+bar_ms+purpose`，cloid 由它派生），成交落 `hl_fills`，决策落 `hl_events`。
+- **私钥**：只用 agent wallet（**不能提币**），只从 env 读，永不落库、永不进日志。
+- 设计文档 `docs/HL_EXECUTOR_PLAN.md`（含 GitHub 成熟系统调研与采纳/不采纳决定）、操作手册 `docs/HL_RUNBOOK.md`（上线顺序 / 应急 / 回滚）。
+
 ## 目录
 
 ```
 app/strategy.py   纯 stdlib 核心（指标 / 密集 / 信号 / 离场）—— 唯一口径来源
 app/market.py     MEXC K 线 + 降级链（MEXC合约 → MEXC现货 → Binance → OKX）+ 校验
 app/sizing.py     以损定仓 → MEXC 张数 / 名义 / 保证金 / 强平价
-app/engine.py     walk() 纯状态机 + 提醒文案 + tick + 心跳/周报
+app/engine.py     walk() 纯状态机 + 提醒文案 + tick + 心跳/周报（executor 钩子）
 app/notify.py     企业微信 + Telegram 双通道（重试 / 分段 / 成功后才去重）
-app/main.py       FastAPI + APScheduler + 状态页/确认页/参数页
+app/main.py       FastAPI + APScheduler + 状态页/确认页/参数页/HL 面板
+app/hl/info.py       只读客户端（纯 stdlib，不需 SDK/私钥）
+app/hl/exchange.py   唯一 import 官方 SDK 的写路径（下单/撤单/杠杆/死手开关）
+app/hl/executor.py   状态机：闸门 → 意图 → 下单 → 挂止损 → 对账 → 熔断
+app/hl/sizing.py     取整规则（5 位有效数字 / szDecimals）+ 强平价 + 安全杠杆
+app/hl/watchdog.py   看守（心跳 / 卡单 / 裸奔仓位 / 时钟偏差），供 cron 静默调用
+app/hl/views.py      /hl 监控面板 + /api/hl/status
 scripts/dry_run.py            离线回放（与线上同一份 walk）
 scripts/xvalidate.py          信号级交叉验证（实盘引擎 vs 回测引擎）
 scripts/xvalidate_roundtrips.py 回合级交叉验证（入场/离场 bar 逐笔一致）
@@ -95,7 +112,7 @@ scripts/xvalidate_roundtrips.py 回合级交叉验证（入场/离场 bar 逐笔
 ## 上线前的两道验证
 
 ```bash
-python -m unittest discover -s tests -t .     # 32 项单测
+python -m unittest discover -s tests -t .     # 272 项单测
 python3 scripts/xvalidate.py                  # 信号集合必须与回测引擎完全一致
 python3 scripts/xvalidate_roundtrips.py       # 完整回合必须逐笔一致
 python3 scripts/dry_run.py --days 90          # 看会推什么

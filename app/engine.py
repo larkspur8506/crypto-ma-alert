@@ -338,9 +338,18 @@ def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
     return None
 
 
-def tick(db, cfg, notifier, now_ms: Optional[int] = None) -> List[str]:
-    """一次检查：取数 → 校验 → 判离场/入场 → 推送 → 落库。返回已发送的文案。"""
+def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List[str]:
+    """一次检查：取数 → 校验 → 判离场/入场 → 推送 → 落库。返回已发送的文案。
+
+    `executor`（app.hl.executor.Executor 或 None）：给了就由它接管开仓/离场
+    （真实下单），引擎不再发人工操作卡；没给就是原来的纯提醒模式。
+    """
     sent: List[str] = []
+    if executor is not None:
+        try:
+            executor.run()
+        except Exception as e:                                   # noqa: BLE001
+            logger.exception("执行器 run() 异常: %s", e)
     for symbol in cfg.symbols:
         try:
             feed = market.fetch(symbol, now_ms)
@@ -373,6 +382,17 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None) -> List[str]:
 
         for ev in events:
             if ev.kind == "exit":
+                handled = False
+                if executor is not None and row is not None:
+                    try:
+                        handled = executor.on_exit(row["id"], ev.reason, ev.exit_price)
+                    except Exception as e:                       # noqa: BLE001
+                        logger.exception("执行器 on_exit 异常: %s", e)
+                if handled:
+                    # 执行器已经平仓并推送了成交回报 —— 不再发人工操作卡
+                    row = None
+                    position = None
+                    continue
                 if row is not None:
                     db.close_position(row["id"], ev.exit_price, ev.reason, auto=True)
                     text = format_exit(cfg, position or _row_to_state(row), ev.exit_price, ev.reason,
@@ -389,6 +409,15 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None) -> List[str]:
                                          stop_dist=ev.sig.stop_dist, contracts=ev.order.contracts,
                                          coin_qty=ev.order.coin_qty, notional=ev.order.notional,
                                          risk_u=ev.order.risk_u, equity_at_entry=cfg.equity)
+                handled = False
+                if executor is not None:
+                    try:
+                        handled = executor.on_entry(pid)
+                    except Exception as e:                       # noqa: BLE001
+                        logger.exception("执行器 on_entry 异常: %s", e)
+                if handled:
+                    position = new_pos
+                    continue
                 text = format_entry(cfg, ev.sig, ev.order, pid)
                 _emit(db, notifier, cfg, Alert("entry", symbol, ev.bar_ms, text), sent)
                 position = new_pos
