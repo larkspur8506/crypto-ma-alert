@@ -187,3 +187,30 @@ class TestPersistence(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestDisplayTime(unittest.TestCase):
+    """提醒里的时间必须是北京时间（用户在国内看），且 bar 报收盘时刻。"""
+
+    def test_bar_close_is_beijing_time(self):
+        # 10-12 20:00 UTC 的 bar（= 北京 10-13 04:00）→ 收盘 10-13 00:00 UTC = 北京 08:00
+        ms = 1791835200000
+        self.assertEqual(engine.fmt_ms(ms), "10-13 04:00")
+        self.assertEqual(engine.fmt_bar_close(ms), "10-13 08:00")
+        self.assertEqual(engine.TZ_LABEL, "北京时间")
+
+    def test_alert_texts_label_beijing(self):
+        c = cfg()
+        sig = S.Signal(symbol="BTC_USDT", bar_index=0, bar_open_ms=1791835200000,
+                       entry_price=81812.8, stop_price=84059.96, stop_dist=0.0275,
+                       ma_max=84059.96, ma_min=81812.8, band=0.02, side=-1)
+        order = type("O", (), {"notional": 728.0, "contracts": 89, "risk_u": 20.0,
+                               "margin": 146.0})()
+        first = engine.format_entry(c, sig, order, 1).splitlines()[0]
+        self.assertIn("10-13 08:00 北京时间", first)
+        pos = type("P", (), {"symbol": "BTC_USDT", "side": -1, "action_label": "空单",
+                             "close_side": "买入平仓", "eff_entry": 82909.3,
+                             "eff_stop": 84060.0})()
+        first = engine.format_exit(c, pos, 83829.3, "ma20", 1791864000000, 1).splitlines()[0]
+        self.assertIn("10-13 16:00 北京时间收盘", first)
+        self.assertNotIn("UTC", first)

@@ -96,7 +96,7 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(_job_heartbeat, CronTrigger(hour=config.heartbeat_hour, minute=0), id="heartbeat")
         scheduler.add_job(_job_weekly, CronTrigger(day_of_week="mon", hour=config.heartbeat_hour, minute=5), id="weekly")
         scheduler.start()
-        logger.info("调度器已启动：tick 每小时 :03/:33；心跳 %02d:00 UTC；周报周一", config.heartbeat_hour)
+        logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一", config.heartbeat_hour)
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
@@ -296,7 +296,7 @@ def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
     body = f"""
     <h1>{title}</h1>
     <div class='card'>
-      <b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC<br>
+      <b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}<br>
       建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>{stop_hint}
       （{row['stop_dist'] * 100:.2f}%）<br>
       建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜
@@ -338,7 +338,7 @@ def _summary(row, pid: int) -> HTMLResponse:
     stop = row["actual_stop"] or row["stop_price"]
     qty = row["actual_contracts"] or row["contracts"]
     lines = [
-        f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} UTC",
+        f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}",
         f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty} 张",
     ]
     if row["status"] == "closed":
