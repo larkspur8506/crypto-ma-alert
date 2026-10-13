@@ -169,8 +169,8 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
 
     if not (cfg.stop_min - 1e-9 <= m["stop_dist"] <= cfg.stop_max + 1e-9):
         notes.append(
-            f"止损距离 {m['stop_dist'] * 100:.2f}% 已超出 {cfg.stop_min * 100:.0f}%~"
-            f"{cfg.stop_max * 100:.0f}% 的验证区间 —— 这笔的风险几何与回测口径不一致")
+            f"止损距离 {m['stop_dist'] * 100:.2f}% 已超出 {cfg.stop_min * 100:g}%~"
+            f"{cfg.stop_max * 100:g}% 的验证区间 —— 这笔的风险几何与回测口径不一致")
 
     dev = (m["risk_u"] - target) / target if target else 0.0
     if abs(dev) >= 0.2:
@@ -180,7 +180,7 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
         if m["risk_unit"] > 0:
             want = int(target / (m["risk_unit"] * contract_size))
             cap = int((target / cfg.stop_min) / entry / contract_size) if entry > 0 else 0
-            extra = (f"；止损距离低于 {cfg.stop_min * 100:.0f}% 下限，"
+            extra = (f"；止损距离低于 {cfg.stop_min * 100:g}% 下限，"
                      f"系统名义上限（风险U/下限）只能到 {cap} 张，超了就是隐性加杠杆"
                      if want > cap else "")
             notes.append(f"若要正好 {target:.0f}U 风险应开 {want} 张（本次 {contracts} 张）{extra}")
