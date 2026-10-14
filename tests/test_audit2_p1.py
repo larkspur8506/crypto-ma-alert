@@ -210,8 +210,10 @@ class TestPendingSlot(unittest.TestCase):
             all_rows = db.recent_positions(10)
             pend = [r for r in all_rows if r["status"] == "pending"]
             self.assertEqual(len(pend), 1, "pending 期间不得再建第二个 pending（占槽）")
-            # bar 进度照常推进（不堵死后续）
-            self.assertEqual(db.get_last_bar("BTC_USDT"), bars2[len(bars2) - 2].open_ms)
+            # 审计三轮 M12：pending 期间**不推进** bar 进度 —— 以前会推进到 bars2
+            # 的最新收盘根，晚确认的仓就跳过中间根的止损判定；现在停在第一次
+            # tick 的进度（bars1 最新收盘根），确认后从入场根起重扫。
+            self.assertEqual(db.get_last_bar("BTC_USDT"), bars1[len(bars1) - 2].open_ms)
         finally:
             engine.market.fetch = orig
 

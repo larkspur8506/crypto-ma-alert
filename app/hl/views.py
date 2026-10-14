@@ -463,9 +463,10 @@ def status_payload(deps: DashboardDeps) -> dict:
         })
 
     # ---------------- 成交 / 盈亏 ----------------
-    fills_rows = _db_call(deps.db, "hl_fills_since", 0.0)
-    if fills_rows is None:
-        fills_rows = _db_call(deps.db, "hl_recent_fills", 100000) or []
+    # 审计三轮 M8：hl_fills_since 是 ORDER BY id ASC（最旧在前），行数超过截断数后
+    # 「最近成交」会全是最老数据。改用 hl_recent_fills（id DESC）取最近 N 条；
+    # 今日/累计已实现与手续费仍按这批全量算（保留窗口内语义）。
+    fills_rows = _db_call(deps.db, "hl_recent_fills", 2000) or []
     fills_out: List[dict] = []
     today_realized = 0.0
     total_realized = 0.0
@@ -512,6 +513,9 @@ def status_payload(deps: DashboardDeps) -> dict:
             "entry": _opt_num(entry),
             "stop": _opt_num(stop),
             "contracts": d.get("contracts"),
+            # HL 执行器管的仓：数量按币量显示（审计三轮 M5 —— positions 行里的
+            # contracts 是 MEXC 人工口径「张数」，HL 仓显示 85 张与真实 0.00084 BTC 矛盾）
+            "hl_qty": _opt_num(d.get("hl_sz")) if (d.get("hl_status") or "") else None,
             "bar_ms": _opt_num(d.get("signal_bar_ms")),
         })
 
@@ -913,17 +917,21 @@ def _render_body(p: dict) -> str:
     # ---------------- 最近成交 ----------------
     o.append("<h2>最近成交</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>时间</th><th>币种</th><th>方向</th><th class='num'>数量</th>"
+             "<th>时间</th><th>币种</th><th class='num'>数量</th>"
              "<th class='num'>价格</th><th class='num'>手续费</th><th>方向</th>"
              "<th class='num'>平仓盈亏</th><th>减仓</th></tr></thead><tbody>")
     # 只渲染最近 50 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
     for f in list(_as_dict(x) for x in fills)[:50]:
         cp_txt, cp_cls = _sign(f.get("closed_pnl"))
         d = str(f.get("dir") or "")
+        # 买卖方向由 dir 推导（审计三轮 M9）：side 是多空方向，Close Long 实为卖出、
+        # Close Short 实为买入 —— 以前拿 side 反推会把平仓方向显示反。
+        _d = str(f.get("dir") or "")
+        _buy_sell = "买" if _d.startswith("Open") else ("卖" if _d.startswith("Close") else "—")
         o.append("<tr>"
                  + _td(_fmt_dt(f.get("ts")), "num")
                  + _td(_esc(f.get("coin") or "—"))
-                 + _td("—" if f.get("side") is None else ("买" if _num(f.get("side"), 0) >= 0 else "卖"))
+                 + _td(_buy_sell)
                  + _td(_fmt_sz(f.get("sz")), "num")
                  + _td(_fmt(f.get("px")), "num")
                  + _td(_fmt(f.get("fee"), 4), "num")
@@ -939,7 +947,7 @@ def _render_body(p: dict) -> str:
     o.append("<h2>信号</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
-             "<th class='num'>止损</th><th class='num'>张数</th><th>信号 bar</th>"
+             "<th class='num'>止损</th><th class='num'>数量</th><th>信号 bar</th>"
              "</tr></thead><tbody>")
     for sg in (_as_dict(x) for x in signals):
         st = str(sg.get("status") or "—")
@@ -950,7 +958,8 @@ def _render_body(p: dict) -> str:
                  + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
                  + _td(_fmt(sg.get("entry")), "num")
                  + _td(_fmt(sg.get("stop")), "num")
-                 + _td(_fmt(sg.get("contracts"), 0), "num")
+                 + _td(_fmt_sz(sg.get("hl_qty") if sg.get("hl_qty") is not None
+                               else sg.get("contracts")), "num")
                  + _td(_fmt_dt(sg.get("bar_ms")), "num")
                  + "</tr>")
     if not signals:

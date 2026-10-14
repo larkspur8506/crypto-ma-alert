@@ -502,12 +502,17 @@ def _parse_params(form: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
         out[key] = v
         return v
 
-    eq = take_float("equity", "账户权益基数", 0.0, 10_000_000.0)
-    rp = take_float("risk_pct", "单笔风险", 0.0, 0.5)
-    lev = take_float("leverage", "杠杆", 0.999, 125.0, strict=False)
-    sm = take_float("stop_min", "止损下限", 0.0, 1.0)
-    sx = take_float("stop_max", "止损上限", 0.0, 1.0)
-    emin = take_float("equity_min", "资金下限", 0.0, 1_000_000.0, strict=False)
+    # 校验范围与 Config._RANGES 单一真源对齐（审计三轮 M6）：以前面板接受 0~1.0，
+    # Config 却只认 0.0001~0.5 —— 面板写 0.8 入库成功、apply_db 静默丢弃，
+    # 页面显示「保存成功」实际没生效。
+    from app.config import Config as _Cfg
+    _R = _Cfg._RANGES
+    eq = take_float("equity", "账户权益基数", *_R["equity"])
+    rp = take_float("risk_pct", "单笔风险", *_R["risk_pct"])
+    lev = take_float("leverage", "杠杆", _R["leverage"][0], _R["leverage"][1], strict=False)
+    sm = take_float("stop_min", "止损下限", *_R["stop_min"])
+    sx = take_float("stop_max", "止损上限", *_R["stop_max"])
+    emin = take_float("equity_min", "资金下限", *_R["equity_min"], strict=False)
 
     # 做空均线：必须是整数
     sraw = str(form.get("short_regime_ma") or "").strip()
@@ -518,11 +523,12 @@ def _parse_params(form: Dict[str, str]) -> Tuple[Dict[str, Any], List[str]]:
             n = int(float(sraw))
         except ValueError:
             errs.append("做空均线不是数字")
-            n = -1
-        if n < 0 or n > 2000:
-            errs.append("做空均线必须在 0~2000 之间（0=关闭过滤）")
-        else:
-            out["short_regime_ma"] = n
+            n = None
+        if n is not None:
+            if n < 0 or n > _R["short_regime_ma"][1]:
+                errs.append(f"做空均线必须在 0~{_R['short_regime_ma'][1]} 之间（0=关闭过滤）")
+            else:
+                out["short_regime_ma"] = n
 
     mode = str(form.get("equity_mode") or "").strip().lower()
     if mode not in ("follow", "fixed"):

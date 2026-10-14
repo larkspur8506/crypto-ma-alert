@@ -143,7 +143,10 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         f"      （核对持仓价值 ≈ {fmt_money(order.notional)}U，约 {order.contracts} 张）",
         f"止损单：计划委托，触发价 {fmt_money(sig.stop_price)}，{sig.close_side}，触发参考=最新成交价",
         f"止盈：不设",
-        f"风险：{order.risk_u:.1f}U（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%），"
+        f"风险：{order.risk_u:.1f}U"
+        + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}% = "
+           f"{cfg.equity * cfg.risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
+           else f"（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%）") + "，"
         f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U",
         f"离场：收到本系统提醒后 4 小时内市价平仓",
         f"确认开仓：{confirm_url(cfg, position_id)}",
@@ -416,10 +419,11 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 row = None
             else:
                 # pending 仍在确认窗口内 → 它占住该标的唯一的仓位槽：
-                # 不评估新入场（否则连续突破会叠出第二个 pending、旧行成幽灵），
-                # 只推进 bar 进度。离场判定等用户确认后由后续 tick 接管；
-                # 交易所侧的真实保护（止损单/对账）不依赖这里的离场判定。
-                db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
+                # 不评估新入场（否则连续突破会叠出第二个 pending、旧行成幽灵）。
+                # 审计三轮 M12：不再推进 bar 进度 —— 以前期间每次 tick 都 set_last_bar
+                # 往前走，用户晚确认后 from_i 已越过入场根与中间根，这些根的止损
+                # 判定被永久跳过。留在信号 bar，确认后从入场根起重扫（幂等键
+                # was_alerted 保证已推过的离场提醒不会重复推）。
                 return
         position = _row_to_state(row) if row is not None and row["status"] != "pending" else None
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
@@ -428,13 +432,24 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         for ev in events:
             if ev.kind == "exit":
                 handled = False
+                exec_exc = False
                 if executor is not None and row is not None:
                     try:
                         handled = executor.on_exit(row["id"], ev.reason, ev.exit_price)
                     except Exception as e:                       # noqa: BLE001
                         logger.exception("执行器 on_exit 异常: %s", e)
-                if handled:
-                    # 执行器已经平仓并推送了成交回报 —— 不再发人工操作卡
+                        # 审计三轮 M13：on_exit 可能已在交易所平掉仓位后才抛异常。
+                        # 此时再按参考价把本地关成 auto_closed + 推人工离场卡，会与
+                        # 真实状态冲突（用户可能照卡片再去平一次=反手开新仓）。
+                        # 异常路径只推告警，不动本地账，留给下一轮 tick/对账收敛。
+                        exec_exc = True
+                        _emit(db, notifier, cfg, Alert(
+                            "data_error", symbol, None,
+                            f"{cfg.alert_prefix}{symbol} 执行器离场时异常（{type(e).__name__}），"
+                            f"本轮未关账未发操作卡 —— 下一轮会重新评估，请留意后续提醒。"), sent)
+                if handled or exec_exc:
+                    # 执行器已经平仓并推送了成交回报 —— 不再发人工操作卡。
+                    # exec_exc 同样跳过本地关账（见上），避免重复关账/误导卡。
                     row = None
                     position = None
                     continue

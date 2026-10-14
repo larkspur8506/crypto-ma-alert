@@ -218,10 +218,17 @@ class TestApplyDbValidation(unittest.TestCase):
 
     def test_valid_values_pass(self):
         c = Config()
+        # 审计三轮 M4：stop_max 与杠杆联动（cap = 0.5/lev）—— lev=10 时 cap=0.05，
+        # 0.08 被拒收 = 保持当前值（Config 默认 stop_max=0.1）；注意 parsed 里 leverage
+        # 已是 10，联动校验用的是新杠杆。
         c.apply_db({"stop_min": "0.02", "stop_max": "0.08", "leverage": "10",
                     "risk_pct": "0.03", "equity": "100"})
         self.assertEqual((c.stop_min, c.stop_max, c.leverage, c.risk_pct, c.equity),
-                         (0.02, 0.08, 10.0, 0.03, 100.0))
+                         (0.02, 0.1, 10.0, 0.03, 100.0))    # stop_max 拒收 → 保持原值
+        c2 = Config()
+        c2.apply_db({"stop_min": "0.02", "stop_max": "0.08", "leverage": "5",
+                     "risk_pct": "0.03", "equity": "100"})
+        self.assertEqual((c2.stop_min, c2.stop_max), (0.02, 0.08))  # lev=5 时 0.08 合法
 
     def test_string_and_bool_unaffected(self):
         c = Config()
