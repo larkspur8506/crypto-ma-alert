@@ -86,12 +86,16 @@ for r in c.execute(\"select kind,message,datetime(created_at,\\\"unixepoch\\\") 
 ssh oracle1 'sudo -n docker exec crypto-ma-alert python -m app.hl.watchdog --dry-run'
 ```
 
-## 5. 看守 cron（建议装）
+## 5. 看守 cron（2026-10-14 已装）
 
 ```
-job: HL 执行器看守（Hermes cron，每 5 分钟，no_agent 静默）
-command: ssh oracle1 'sudo -n docker exec crypto-ma-alert python -m app.hl.watchdog'
-仅当输出以「⚠️」开头时推送（脚本设计如此：正常时无输出）
+job: 「HL 执行器看守」 id=b18f371574bd（Hermes cron，每 5 分钟，no_agent 静默，deliver=origin）
+wrapper: /opt/data/scripts/hl-watch/hl_watch.py
+  → ssh 重试 3 次（退避 5s/10s），链路抖动不再误报
+  → 远程执行容器内 `python -m app.hl.watchdog`
+仅当 watchdog 打出 ⚠️ 时才输出（正常完全静默，cron 收到空 stdout 不投递）。
+排障：`ssh oracle1 'sudo -n docker exec crypto-ma-alert python -m app.hl.watchdog --dry-run'`
+演练：`HLW_SSH_HOST=localhost python3 /opt/data/scripts/hl-watch/hl_watch.py`（应 ~16s 后报警）
 ```
 
 ## 6. 应急手册
