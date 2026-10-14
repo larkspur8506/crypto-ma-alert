@@ -377,6 +377,9 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
 
 def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[str]) -> None:
         feed = market.fetch(symbol, now_ms)
+        # 成功路径也写 feed_health：心跳/面板的「数据源健康」靠 last_ok_at 判断，
+        # 只记失败的话 last_ok_at 永远停在首次成功之前（P1 回归，已修）。
+        db.mark_feed(symbol, feed.source, True)
         bars = feed.bars
         ind = strategy.compute_indicators(bars)
         sq = strategy.squeeze_flags(ind["band"], cfg.band_window, cfg.band_quantile,
@@ -408,6 +411,13 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                      f"（{age_bars} 根）未确认，槽位已释放。若你实际开了仓，请自行管理离场。")),
                     sent)
                 row = None
+            else:
+                # pending 仍在确认窗口内 → 它占住该标的唯一的仓位槽：
+                # 不评估新入场（否则连续突破会叠出第二个 pending、旧行成幽灵），
+                # 只推进 bar 进度。离场判定等用户确认后由后续 tick 接管；
+                # 交易所侧的真实保护（止损单/对账）不依赖这里的离场判定。
+                db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
+                return
         position = _row_to_state(row) if row is not None and row["status"] != "pending" else None
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
                                latest_closed_i)
@@ -460,8 +470,13 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
 
 
 def _emit(db, notifier, cfg, alert: Alert, sent: List[str]) -> None:
-    """幂等 + 成功后标记；dry_run 只打印不发送。"""
-    if db.was_alerted(alert.symbol, alert.bar_ms, alert.kind):
+    """幂等 + 成功后标记；dry_run 只打印不发送。
+
+    bar_ms 为空的提醒（数据源故障等）用 2 小时时间窗去重 —— 没有时间窗的话
+    NULL 键会匹配任意历史成功行，同一故障第二次起永远静默。
+    """
+    within = 7200.0 if alert.bar_ms is None else None
+    if db.was_alerted(alert.symbol, alert.bar_ms, alert.kind, within_s=within):
         logger.info("[dedup] 已推送过，跳过 %s %s %s", alert.symbol, alert.bar_ms, alert.kind)
         return
     if getattr(cfg, "dry_run", False):
@@ -482,8 +497,13 @@ def _emit(db, notifier, cfg, alert: Alert, sent: List[str]) -> None:
 def heartbeat_text(db, cfg) -> str:
     lines = [f"{cfg.alert_prefix}心跳 {dt.datetime.now(DISPLAY_TZ).strftime('%m-%d %H:%M')} {TZ_LABEL}"]
     for r in db.feed_status():
-        ok = f"ok（{r['source']}）" if r["last_ok_at"] else "❌ 失败"
-        extra = f" 最近错误: {r['last_error']}" if r["last_error"] and not r["last_ok_at"] else ""
+        # 故障判定看「最近一次失败是否晚于最近一次成功」——只看 last_ok_at 的话，
+        # 出过一次错的源永远显示 ok（mark_feed 失败路径不清 last_ok_at）。
+        ok_at = float(r["last_ok_at"] or 0)
+        err_at = float(r["error_at"] or 0)
+        healthy = ok_at > 0 and ok_at >= err_at
+        ok = f"ok（{r['source']}）" if healthy else "❌ 失败"
+        extra = f" 最近错误: {r['last_error']}" if r["last_error"] and not healthy else ""
         lines.append(f"数据源 {r['symbol']}: {ok}{extra}")
     for symbol in cfg.symbols:
         row = db.open_position(symbol)

@@ -22,6 +22,7 @@ MODES = (MODE_OFF, MODE_DRY, MODE_LIVE)
 PURPOSE_ENTRY = "entry"
 PURPOSE_STOP = "stop"
 PURPOSE_EXIT = "exit"
+PURPOSE_EXIT_REHANG = "exit:rehang"   # 平仓未成交后重挂的止损（与开仓止损/补挂的 cloid 都不同源）
 
 # hl_orders.status 状态机
 ST_INTENT = "intent"      # 已落库，尚未发请求（崩溃后据此判断「可能已发出」）
