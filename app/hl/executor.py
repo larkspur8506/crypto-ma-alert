@@ -139,7 +139,8 @@ class Executor:
         bad: List[str] = []
         if self.db.hl_kill():
             bad.append("kill switch 已触发")
-        if not self.ex.available:
+        if self.p.live and not self.ex.available:
+            # 只在 live 校验写通道：dry 期不下单、不需要私钥（否则「先跑影子不用给私钥」就不成立）
             bad.append(f"写通道不可用：{self.ex.init_error or '未配置凭据'}")
         if plan.below_min_notional:
             bad.append(f"名义 {plan.notional:.1f}U 低于交易所下限 {p.min_notional:g}U")

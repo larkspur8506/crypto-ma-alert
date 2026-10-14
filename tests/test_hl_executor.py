@@ -216,6 +216,14 @@ class TestDryMode(Base):
         self.assertIn("止损", shadow)
         self.assertIn("风险", shadow)
 
+    def test_dry_without_credentials_still_plans(self):
+        """影子期不该要求私钥：写通道不可用只在 live 才拦。"""
+        self.ex = FakeExchange(available=False)
+        pid = self.add_signal()
+        self.assertFalse(self.executor().on_entry(pid))
+        self.assertEqual(self.orders("entry")[0]["status"], "planned")
+        self.assertIn("HL影子", self.notifier.messages[-1])
+
     def test_dry_never_closes_a_real_position(self):
         """模式从 live 退回 dry 时，交易所还有真实仓位 → 不能替引擎关本地账。"""
         pid = self.add_signal()
