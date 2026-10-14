@@ -212,6 +212,7 @@ class Executor:
             self.db.log_alert(symbol, None, kind, text, ok)
         except Exception as e:                                       # noqa: BLE001
             logger.error("[hl-exec] 告警落库失败（补推将不可用）：%s", e)
+        return ok
 
     def _event(self, kind: str, message: str, symbol: Optional[str] = None,
                data: Any = None) -> None:
@@ -248,10 +249,13 @@ class Executor:
         missing_stop: List[dict] = []
         unconfirmed: List[str] = []
         local_open = [r for r in self.db.recent_positions(50)
-                      if r["status"] == "open"
+                      if r["status"] in ("open", "pending")
                       # hl_status 为 NULL 也算：on_entry 在「入场成交→落库」之间崩溃时
                       # 仓位行还没来得及写 hl_status='open'，这样的仓同样需要止损保护/对账，
                       # 否则只能走到 kill 分支当「人工单」处理。
+                      # 审计三轮 M4：status='pending' 也纳入 —— on_entry 在「交易所成交
+                      # → confirm_position」之间崩溃时行还是 pending，真实裸仓以前只会被
+                      # 打成「人工单」kill+告警，永不补挂止损。
                       and (r["hl_status"] or "") in ("open", "mismatch", "")]
         seen = set()
         for r in local_open:
@@ -638,11 +642,29 @@ class Executor:
                         f"交易所仍有真实仓位 —— 请人工平仓并撤掉止损单")
             return True
 
-        # 1) 先撤掉止损单（否则可能与新平仓单互相打架）
-        so = self.db.hl_order(symbol, bar_ms, PURPOSE_STOP)
-        if so is not None and so["oid"]:
-            self.ex.cancel(coin, int(so["oid"]))
-            self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status="cancelled")
+        # 1) 先撤掉止损单（否则可能与新平仓单互相打架）。
+        #    审计三轮 M1：首次平仓失败后重挂的止损记在 exit:rehang（当前离场 bar）、
+        #    对账补挂在 stop:fix —— 只撤 PURPOSE_STOP 会漏掉这两类，留下幽灵触发单。
+        #    撤单动作撤的是「交易所侧当前挂着的止损」，所以把 DB 里三种 purpose 的
+        #    未撤单记录全查一遍，按 oid 去重逐个撤。
+        cancelled_purposes = []
+        for purpose in (PURPOSE_STOP, PURPOSE_STOP + ":fix", PURPOSE_EXIT_REHANG):
+            so = self.db.hl_order(symbol, bar_ms, purpose)
+            if purpose == PURPOSE_EXIT_REHANG:
+                # exit:rehang 键在离场 bar 上，同一仓可能有多条（多次离场尝试），
+                # hl_order 只按三元键取一条 → 用 hl_recent_orders 扫全部
+                for r in self.db.hl_recent_orders(100):
+                    if (r["symbol"] == symbol and r["purpose"] == purpose
+                            and r["status"] in (ST_RESTING, ST_SENT) and r["oid"]):
+                        self.ex.cancel(coin, int(r["oid"]))
+                        self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose,
+                                                status="cancelled")
+                        cancelled_purposes.append(purpose)
+                continue
+            if so is not None and so["oid"] and so["status"] in (ST_RESTING, ST_SENT, ST_FILLED):
+                self.ex.cancel(coin, int(so["oid"]))
+                self.db.hl_update_order(symbol, bar_ms, purpose, status="cancelled")
+                cancelled_purposes.append(purpose)
         # 2) 平仓（reduce-only IOC）。限价必须按**平仓方向**算滑点
         #    （买入平空 = mid×(1+s)，卖出平多 = mid×(1−s)；用开仓方向的限价会让
         #     卖单拿到比 mid 高的最低可接受价 → 滑点保护完全失效）。
@@ -977,8 +999,12 @@ class Executor:
             last_alert = float(self.db.get_config_str(key) or 0)
             due = (time.time() - last_alert) >= 6 * 3600
             if due:
-                self.db.set_config(key, str(int(time.time())))
-                alerts.append("【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems))
+                # 审计三轮 M2：节流键必须在**推送成功后**再写 —— 以前先写后发，
+                # 中间任一步异常（补挂/死手/同步抛错）会把该轮告警吞掉且 6h 静默。
+                # 现在把文案先放进 alerts（末尾统一 _alert，成功才落库记账），
+                # 节流键改为在 _alert 成功后由 pending_throttle 回写。
+                alerts.append(("hl_recon_alert_at",
+                               "【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems)))
             # 确认「有仓但没止损」→ 不允许无保护持仓存在：先补挂，补不上就市价平掉
             for row in rec.get("missing_stop") or []:
                 self._repair_missing_stop(row, snap)
@@ -1055,5 +1081,14 @@ class Executor:
                     f"executor 心跳（equity {snap.get('equity_total', snap.get('equity'))}）",
                     data={"kill": self.db.hl_kill(), "mode": self.p.mode})
         for a in alerts:
-            self._alert(a)
-        return alerts
+            if isinstance(a, tuple):
+                key, text = a
+                if self._alert(text):
+                    # 推送成功才写节流键（失败则下轮再推，见 M2）
+                    try:
+                        self.db.set_config(key, str(int(time.time())))
+                    except Exception as ex:                           # noqa: BLE001
+                        logger.warning("[hl-exec] 节流键写入失败（忽略）：%s", ex)
+            else:
+                self._alert(a)
+        return [a[1] if isinstance(a, tuple) else a for a in alerts]

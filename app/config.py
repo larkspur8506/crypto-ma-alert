@@ -90,8 +90,11 @@ class Config:
     _RANGES = {
         "risk_pct": (0.0001, 0.5),
         "leverage": (0.5, 125.0),
-        "stop_min": (0.0001, 0.5),
-        "stop_max": (0.0001, 0.5),
+        # 止损距离上限必须保证「强平晚于止损」（逐仓 5x 强平约 -19.5%）：
+        # 静态上限 0.5 会让 stop_max=0.5 的配置合法入库 —— 止损单永远在强平价之外
+        # 不会被触发（审计三轮 M4）。收紧到 0.25 并在 apply_db 里与杠杆联动二次校验。
+        "stop_min": (0.0001, 0.25),
+        "stop_max": (0.0001, 0.25),
         "equity": (1.0, 100_000_000.0),
         "equity_min": (1.0, 100_000_000.0),
         "short_regime_ma": (0, 1000),
@@ -142,6 +145,17 @@ class Config:
             if smin is not None and smax is not None and float(smin) >= float(smax):
                 parsed.pop("stop_min", None)
                 parsed.pop("stop_max", None)
+        except (TypeError, ValueError):
+            pass
+        # 杠杆联动（审计三轮 M4）：逐仓强平约在 1/leverage，止损必须显著靠近内侧
+        # （留 50% 余量，与 sizing.max_safe_leverage 同口径），否则止损单永远等不到
+        # 触发就被强平 —— 拒收 stop_max。
+        lev = parsed.get("leverage", getattr(self, "leverage", None))
+        try:
+            if lev is not None and smax is not None:
+                cap = 0.5 / float(lev)
+                if float(smax) > cap:
+                    parsed.pop("stop_max", None)
         except (TypeError, ValueError):
             pass
         for k, v in parsed.items():

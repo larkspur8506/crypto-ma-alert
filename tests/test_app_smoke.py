@@ -104,7 +104,7 @@ class TestAppAssembly(unittest.TestCase):
             r = client.get(f"/c/{pid}", params={"a": "view", "t": mod.engine.sign_token(sec, pid, "view")})
             self.assertEqual(r.status_code, 200)
             self.assertIn("已平仓", r.text)
-            self.assertIn("修改开仓数据", r.text)
+            self.assertIn("修改开仓记录", r.text)
             self.assertIn("修改平仓数据", r.text)
             self.assertNotIn("按以上数值确认开仓", r.text)
             # a=edit_close → 必须是平仓表单（含当前记录提示与预填离场价），不能又回到摘要页

@@ -490,6 +490,12 @@ def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
     cur_qty = (row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]) if editing else row["contracts"]
     edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
     title = f"修改开仓数据 #{pid}" if editing else f"确认开仓 #{pid}"
+    # 审计三轮 M1/M5：positions 双口径 —— HL 执行器管的仓 actual_contracts 是币量，
+    # MEXC 人工仓是张数。HL 仓不做 MEXC 面值换算（contracts_from_amount 会把
+    # 成交金额换算成「张」写脏 HL 仓），标签也按口径显示。
+    _is_hl = bool(row.get("hl_status"))
+    qty_label = "数量（币量）" if _is_hl else "张数"
+    qty_hint = "" if not _is_hl else "（HL 仓按币量填写，忽略成交金额）"
     body = f"""
     <h1>{title}</h1>
     <div class='card'>
@@ -504,10 +510,10 @@ def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
     <form method='post'>
       <input type='hidden' name='a' value='open'><input type='hidden' name='t' value='{tok("open")}'>{edit_flag}
       <p>实际成交均价 <input name='actual_entry' value='{cur_entry:.2f}'></p>
-      <p>成交金额 USDT <input name='fill_amount' value='' placeholder='成交记录里的金额'>
-        <span class='muted'>填了就按它换算张数（比下单时看到的预览张数准）</span></p>
-      <p>实际张数 <input name='actual_contracts' value='{cur_qty}'>
-        <span class='muted'>没填成交金额时用这个</span></p>
+      <p>成交金额 USDT <input name='fill_amount' value='' placeholder='成交记录里的金额'{' disabled' if _is_hl else ''}>
+        <span class='muted'>{'HL 仓不适用金额换算' if _is_hl else '填了就按它换算张数（比下单时看到的预览张数准）'}</span></p>
+      <p>实际{qty_label} <input name='actual_contracts' value='{cur_qty}'>
+        <span class='muted'>没填成交金额时用这个{qty_hint}</span></p>
       <p>实际止损触发价 <input name='actual_stop' value='{cur_stop:.2f}'></p>
       <p><label><input type='checkbox' name='stop_placed' value='1' {'checked' if row['stop_placed'] or not editing else ''} style='width:auto'> 已挂止损单</label></p>
       <button type='submit'>{'保存修改' if editing else '按以上数值确认开仓'}</button>
@@ -534,9 +540,11 @@ def _summary(row, pid: int) -> HTMLResponse:
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
     qty = row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]
+    is_hl = bool(row["hl_status"])
+    qty_unit = "币量" if is_hl else "张"
     lines = [
         f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}",
-        f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty} 张",
+        f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty:g} {qty_unit}",
     ]
     if row["status"] == "closed":
         lines.append(f"离场 <b>{row['exit_price'] or 0:,.2f}</b>（{row['exit_reason']}）"
@@ -546,11 +554,16 @@ def _summary(row, pid: int) -> HTMLResponse:
                          "若与 MEXC 实际成交不同，点下面的修改按钮改正。</span>")
     btns = []
     if row["status"] in ("open", "closed"):
-        btns.append(f"<a class='btn' href='/c/{pid}?a=edit_open&t={tok('edit_open')}'>修改开仓数据</a>")
+        btns.append(f"<a class='btn' href='/c/{pid}?a=edit_open&t={tok('edit_open')}'>修改开仓记录</a>")
     if row["status"] == "open":
-        btns.append(f"<a class='btn gray' href='/c/{pid}?a=close&t={tok('close')}'>手动平仓</a>")
+        btns.append(f"<a class='btn gray' href='/c/{pid}?a=close&t={tok('close')}'>记录平仓成交价</a>")
     if row["status"] == "closed":
-        btns.append(f"<a class='btn' href='/c/{pid}?a=edit_close&t={tok('edit_close')}'>修改平仓数据</a>")
+        btns.append(f"<a class='btn gray' href='/c/{pid}?a=edit_close&t={tok('edit_close')}'>修改平仓数据</a>")
+    # 审计三轮 M10：这些入口只改本地记账，不会在交易所平仓/改止损 —— HL 仓上
+    # 「手动平仓」旧文案会让用户以为点了就真平了。明示语义。
+    if is_hl:
+        btns.append("<br><span class='muted'>注：本页操作只修改记录，不会在交易所下单；"
+                    "交易所平仓请到 HL 面板/交易所操作。</span>")
     body = (f"<h1>{_status_label(row)} #{pid}</h1>"
             f"<div class='card'>{'<br>'.join(lines)}</div>"
             f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")
@@ -640,6 +653,9 @@ async def confirm_post(pid: int, request: Request):
         if err:
             raise HTTPException(400, err)
         raw_amount = str(form.get("fill_amount") or "").strip()
+        if raw_amount and row["hl_status"]:
+            # HL 仓的成交金额换算不适用（面值/单位都是 MEXC 口径，会写脏 HL 仓）
+            raise HTTPException(400, "HL 执行器管理的仓位不支持成交金额换算，请直接填写币量数量")
         source = "contracts"
         if raw_amount:
             try:

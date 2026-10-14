@@ -288,12 +288,17 @@ class TestParamsTab(BaseCase):
         # 跳转回来的页面要显示「已保存」
         self.assertIn("已保存", self.body("/admin", tab="params", msg="已保存"))
 
+    def test_params_equity_min_zero_now_rejected(self):
+        """审计三轮 M6：面板校验与 Config._RANGES 对齐 —— equity_min=0 直接 400，
+        不再「入库成功 + apply_db 静默忽略 + 页面显示已保存」。"""
+        r = self.post("/admin/params", **self.params_form(equity_min="0"))
+        self.assertEqual(r.status_code, 400)
+        self.assertNotIn("equity_min", self._db_vals() if hasattr(self, "_db_vals") else {} or {})
+
     def test_params_saves_modes_and_booleans(self):
         self.post("/admin/params", **self.params_form(
-            equity_mode="fixed", equity_min="0", enable_long="", enable_shorts="on"))
+            equity_mode="fixed", equity_min="20", enable_long="", enable_shorts="on"))
         self.assertEqual(self._cfg().equity_mode, "fixed")
-        # equity_min=0 低于下限 1 → 被范围校验拒收，保留默认 20（防呆：0 会让
-        # follow 模式在极小权益下也按 20U 起步，原值更安全）
         self.assertEqual(self._cfg().equity_min, 20.0)
         self.assertFalse(self._cfg().enable_long)
         self.assertTrue(self._cfg().enable_shorts)
