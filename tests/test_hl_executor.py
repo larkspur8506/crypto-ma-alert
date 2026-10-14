@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -18,8 +19,11 @@ from app.hl.info import HlInfoError
 DAY_MS = 4 * 3600 * 1000
 
 
-def _snap(equity=1000.0, positions=(), orders=(), notional=0.0):
-    return {"ts": 1791913000.0, "address": "0xabc", "equity": equity, "withdrawable": equity,
+def _snap(equity=1000.0, positions=(), orders=(), notional=0.0, ts=None):
+    # ts 默认取「现在」：当日亏损熔断按 UTC 当日第一张快照做基线，
+    # 快照时间戳写死会让测试只在某一天有效（CI 上就栽过一次）。
+    return {"ts": time.time() if ts is None else ts, "address": "0xabc", "equity": equity,
+            "withdrawable": equity,
             "margin_used": 100.0, "notional": notional,
             "positions": list(positions), "open_orders": list(orders)}
 
@@ -445,12 +449,12 @@ class TestReconcileAndRun(Base):
         self.assertTrue(any("读取账户失败" in e["message"] for e in self.events()))
 
     def test_run_daily_loss_kills(self):
-        # 基线快照的 ts 必须固定且早于假 snapshot 的 ts（1791913000），否则会随真实时间漂移
+        # 基线快照必须落在「今日窗口内」且早于当前快照。两个 ts 都相对当日 00:00 UTC 固定，
+        # 不依赖测试运行时刻（写死绝对时间戳会让它只在某一天通过）。
         from app.hl.executor import _today_start_ts
-        base_ts = _today_start_ts() + 14400          # 当日 04:00 UTC
-        self.assertTrue(base_ts < 1791913000, "基线必须早于假快照")
-        self.db.hl_add_snapshot({"ts": base_ts, "equity": 1000.0, "positions": []})
-        self.info._snap = _snap(equity=930.0)          # -7% < -5%
+        day0 = _today_start_ts()
+        self.db.hl_add_snapshot({"ts": day0 + 1, "equity": 1000.0, "positions": []})
+        self.info = FakeInfo(snap=_snap(equity=930.0, ts=day0 + 2))   # -7% < -5%
         alerts = self.executor().run(force_snapshot=True)
         self.assertTrue(self.db.hl_kill())
         self.assertIn("当日亏损", alerts[-1])
