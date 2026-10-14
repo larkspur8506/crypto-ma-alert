@@ -692,15 +692,24 @@ class TestEffectiveEquity(Base):
         ex.effective_equity({"equity_total": 1010.0})          # +1% → 不记
         self.assertEqual(len(self.events()), n)
 
-    def test_gate_notional_cap_scales_with_live_equity(self):
-        """名义上限也必须按生效基数缩放，否则 1000U 资金会被 150U 的老上限卡死。"""
+    def test_notional_caps_default_off(self):
+        """名义上限默认 0 = 不设限（用户拍板）：1000U 账户紧止损 + 已有持仓，也不能被卡。"""
         self.info = FakeInfo(snap=_snap(equity=1000.0))
         pid = self.add_signal(entry=83000.0, stop=80600.0)
-        ex = self.executor(equity=100.0, equity_mode="follow")
-        gates = ex._entry_gates("BTC_USDT",
-                                hl_sizing.size_order_hl("BTC", 5, 83000.0, 80600.0, 1000.0, 0.02, 5.0, side=1),
-                                self.info.snapshot("0xabc"), equity=1000.0)
+        ex = self.executor(equity=1000.0, max_notional_mult=0.0, max_total_notional_mult=0.0)
+        plan = hl_sizing.size_order_hl("BTC", 5, 83000.0, 80600.0, 1000.0, 0.02, 5.0, side=1)
+        snap = self.info.snapshot("0xabc")
+        snap["notional"] = 5000.0                     # 已有 5 倍权益的持仓也不拦
+        gates = ex._entry_gates("BTC_USDT", plan, snap, equity=1000.0)
         self.assertEqual([g for g in gates if "上限" in g], [])
+
+    def test_notional_caps_still_work_when_explicitly_set(self):
+        """留成可选（>0 生效）：将来要给暴露度加护栏，改配置即可。"""
+        self.info = FakeInfo(snap=_snap(equity=1000.0))
+        ex = self.executor(equity=1000.0, max_notional_mult=0.5, max_total_notional_mult=0.5)
+        plan = hl_sizing.size_order_hl("BTC", 5, 83000.0, 80600.0, 1000.0, 0.02, 5.0, side=1)
+        gates = ex._entry_gates("BTC_USDT", plan, self.info.snapshot("0xabc"), equity=1000.0)
+        self.assertTrue([g for g in gates if "上限" in g])
 
 
 class TestFillPushSwitch(Base):

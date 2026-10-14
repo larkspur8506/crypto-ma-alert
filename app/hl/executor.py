@@ -116,8 +116,12 @@ class ExecParams:
     equity_min: float = 20.0
     notify_fills: bool = True            # 成交回报推送（面板开关 fill_push）；异常提醒不受此开关影响
     max_slippage_pct: float = 0.003
-    max_notional_mult: float = 1.5        # 单标的名义 / 权益
-    max_total_notional_mult: float = 2.5  # 总名义 / 权益
+    # 名义上限（单标的 / 合计，单位=权益倍数）。**默认 0 = 不设限**（用户拍板 2026-10-14）：
+    # 仓位已由「风险 ÷ 止损距离」定死（单笔风险恒 risk_pct），上限只会误伤合法信号
+    # —— 实测 1000U 账户下两个标的都用紧止损（1.5%）时合计 2.67x > 2.5x，第二个仓会被卡掉。
+    # 留成可选（>0 生效）而不是删掉：万一将来想加暴露度护栏，改配置即可。
+    max_notional_mult: float = 0.0
+    max_total_notional_mult: float = 0.0
     max_orders_per_day: int = 4
     max_fail_streak: int = 3
     max_daily_loss_pct: float = 0.05
@@ -236,13 +240,15 @@ class Executor:
         if plan.below_min_notional:
             bad.append(f"名义 {plan.notional:.1f}U 低于交易所下限 {p.min_notional:g}U")
         eq = float(equity if equity is not None else p.equity)
-        cap = eq * p.max_notional_mult
-        if plan.notional > cap:
-            bad.append(f"名义 {plan.notional:.0f}U 超过单标的上限 {cap:.0f}U")
         total = float((snap or {}).get("notional") or 0.0)
-        if total + plan.notional > eq * p.max_total_notional_mult:
-            bad.append(f"总名义将达 {total + plan.notional:.0f}U，超过上限 "
-                       f"{eq * p.max_total_notional_mult:.0f}U")
+        if p.max_notional_mult and p.max_notional_mult > 0:          # 0 = 不设限（默认）
+            cap = eq * p.max_notional_mult
+            if plan.notional > cap:
+                bad.append(f"名义 {plan.notional:.0f}U 超过单标的上限 {cap:.0f}U")
+        if p.max_total_notional_mult and p.max_total_notional_mult > 0:
+            if total + plan.notional > eq * p.max_total_notional_mult:
+                bad.append(f"总名义将达 {total + plan.notional:.0f}U，超过上限 "
+                           f"{eq * p.max_total_notional_mult:.0f}U")
         if plan.stop_dist > p.stop_max_hard:
             bad.append(f"执行时止损距离 {plan.stop_dist * 100:.2f}% 超过硬上限 {p.stop_max_hard * 100:g}%")
         if plan.leverage > plan.max_safe_leverage:

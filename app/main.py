@@ -109,8 +109,9 @@ def hl_params():
             "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
         ).strip().lower() in ("1", "true", "yes", "on"),
         max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
-        max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 1.5),
-        max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 2.5),
+        # 名义上限默认 0 = 不设限（用户拍板）；要给暴露度加护栏就把 env 设回正数
+        max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 0.0),
+        max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 0.0),
         max_orders_per_day=int(f("HL_MAX_ORDERS_PER_DAY", 4)),
         max_fail_streak=int(f("HL_MAX_FAIL_STREAK", 3)),
         max_daily_loss_pct=f("HL_MAX_DAILY_LOSS_PCT", 0.05),
