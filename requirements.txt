@@ -3,3 +3,9 @@ uvicorn>=0.27,<1.0
 apscheduler>=3.10,<4.0
 python-multipart>=0.0.9,<1.0
 httpx>=0.27,<1.0        # fastapi.testclient 依赖（tests/test_app_smoke.py 的路由层回归测试用）
+
+# HL 执行器写路径（feat/hl-executor）。只被 app/hl/exchange.py 懒加载：
+# 缺它时系统退化成「只读面板 + 提醒」，所有下单动作 fail-closed。
+# 版本锚点：官方 SDK（MIT，hyperliquid-dex/hyperliquid-python-sdk），
+# 签名/行动哈希/phantom agent 全交给它，避免自研出错。
+hyperliquid-python-sdk==0.24.0

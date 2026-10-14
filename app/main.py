@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import Depends, FastAPI, Form, HTTPException, Request
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from app import engine, market, sizing, strategy
 from app.config import Config
@@ -53,15 +54,106 @@ def current_config() -> Config:
     return config.apply_db(db.get_config())
 
 
+# ---------------------------------------------------------------- HL 执行器装配
+
+def _env(key: str, default: str = "") -> str:
+    return (os.environ.get(key) or default).strip()
+
+
+def hl_mode() -> str:
+    """off / dry / live。DB 值（面板/脚本可写）优先于 env。默认 off。"""
+    raw = str(db.get_config().get("hl_exec_mode", "") or _env("HL_EXEC_MODE", "off")).strip().strip('"')
+    return raw if raw in ("off", "dry", "live") else "off"
+
+
+def hl_params():
+    """从 env + DB 组装 ExecParams。私钥只从 env 读，绝不落库。"""
+    from app.hl.executor import DEFAULT_COIN_MAP, ExecParams
+    try:
+        coin_map = json.loads(_env("HL_COIN_MAP", "")) or dict(DEFAULT_COIN_MAP)
+    except ValueError:
+        coin_map = dict(DEFAULT_COIN_MAP)
+
+    def f(key: str, default: float) -> float:
+        try:
+            return float(_env(key, str(default)))
+        except ValueError:
+            return default
+
+    cfg = current_config()
+    base = "https://api.hyperliquid-testnet.xyz" if _env("HL_TESTNET", "0") in ("1", "true") \
+        else _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+    return ExecParams(
+        mode=hl_mode(),
+        account_address=_env("HL_ACCOUNT_ADDRESS"),
+        private_key=_env("HL_PRIVATE_KEY"),
+        base_url=base,
+        coin_map=coin_map,
+        leverage=cfg.leverage,
+        risk_pct=cfg.risk_pct,
+        equity=cfg.equity,
+        max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
+        max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 1.5),
+        max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 2.5),
+        max_orders_per_day=int(f("HL_MAX_ORDERS_PER_DAY", 4)),
+        max_fail_streak=int(f("HL_MAX_FAIL_STREAK", 3)),
+        max_daily_loss_pct=f("HL_MAX_DAILY_LOSS_PCT", 0.05),
+        deadman_minutes=int(f("HL_DEADMAN_MINUTES", 30)),
+        min_notional=f("HL_MIN_NOTIONAL", 10.0),
+        code_rev=_env("HL_CODE_REV", os.environ.get("CODE_REV", "")),
+    )
+
+
+_hl_info = None
+
+
+def get_hl_info():
+    """只读客户端（面板/看护/执行器共用；无凭据也能用）。"""
+    global _hl_info
+    if _hl_info is None:
+        from app.hl.info import HlInfo
+        _hl_info = HlInfo(base_url=hl_params().base_url)
+    return _hl_info
+
+
+def build_executor():
+    """mode=off 时返回 None（纯提醒模式）。任何装配失败都退回 None 并记日志。"""
+    p = hl_params()
+    if p.mode == "off":
+        return None
+    try:
+        from app.hl.exchange import HlExchange
+        from app.hl.executor import Executor
+        info = get_hl_info()
+        ex = HlExchange(account_address=p.account_address, private_key=p.private_key,
+                        base_url=p.base_url, dry_run=(p.mode == "dry"),
+                        max_slippage_pct=p.max_slippage_pct, info=info)
+        return Executor(db, p, info, ex, notifier=notifier)
+    except Exception as e:                                           # noqa: BLE001
+        logger.exception("装配 HL 执行器失败，退回纯提醒模式: %s", e)
+        return None
+
+
 # ---------------------------------------------------------------- 调度
 
 def _job_tick() -> None:
     try:
-        sent = engine.tick(db, current_config(), notifier)
+        sent = engine.tick(db, current_config(), notifier, executor=build_executor())
         if sent:
             logger.info("tick 发送 %d 条提醒", len(sent))
     except Exception as e:                                    # noqa: BLE001
         logger.exception("tick 异常: %s", e)
+
+
+def _job_hl_monitor() -> None:
+    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。"""
+    ex = build_executor()
+    if ex is None:
+        return
+    try:
+        ex.run(force_snapshot=True)
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("HL 执行器监控轮异常: %s", e)
 
 
 def _job_heartbeat() -> None:
@@ -95,8 +187,11 @@ async def lifespan(app: FastAPI):
                           max_instances=1, coalesce=True)
         scheduler.add_job(_job_heartbeat, CronTrigger(hour=config.heartbeat_hour, minute=0), id="heartbeat")
         scheduler.add_job(_job_weekly, CronTrigger(day_of_week="mon", hour=config.heartbeat_hour, minute=5), id="weekly")
+        scheduler.add_job(_job_hl_monitor, CronTrigger(minute="*/5"), id="hl_monitor",
+                          max_instances=1, coalesce=True)
         scheduler.start()
-        logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一", config.heartbeat_hour)
+        logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一；"
+                    "HL 监控每 5 分钟（模式=%s）", config.heartbeat_hour, hl_mode())
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
@@ -121,7 +216,8 @@ def _require_admin(request: Request, k: Optional[str] = None) -> None:
 @app.get("/health")
 def health():
     return {"status": "ok", "symbols": config.symbols,
-            "scheduler": bool(scheduler), "dry_run": config.dry_run}
+            "scheduler": bool(scheduler), "dry_run": config.dry_run,
+            "hl_mode": hl_mode(), "hl_kill": db.hl_kill()}
 
 
 @app.get("/")
@@ -486,5 +582,70 @@ async def confirm_post(pid: int, request: Request):
 @app.post("/admin/tick")
 def admin_tick(request: Request, k: Optional[str] = None):
     _require_admin(request, k)
-    sent = engine.tick(db, current_config(), notifier)
+    sent = engine.tick(db, current_config(), notifier, executor=build_executor())
     return {"sent": len(sent), "messages": sent}
+
+
+# ---------------------------------------------------------------- HL 面板与控制
+
+def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> None:
+    """面板与 JSON API 的鉴权：?k=<ADMIN_TOKEN> 或 cma_admin Cookie；带 k 时写 Cookie。"""
+    token = config.admin_token
+    if not token:
+        raise HTTPException(500, "ADMIN_TOKEN 未配置")
+    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
+    if supplied != token:
+        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+    if k:
+        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400)
+
+
+def _hl_deps():
+    from app.hl.views import DashboardDeps
+    return DashboardDeps(
+        db=db,
+        config_fn=current_config,
+        info=get_hl_info(),
+        address_fn=lambda: hl_params().account_address,
+        mode_fn=hl_mode,
+        base_url_fn=lambda: hl_params().base_url,
+    )
+
+
+def _mount_hl_views() -> None:
+    try:
+        from app.hl.views import build_router
+        app.include_router(build_router(_hl_deps()), dependencies=[Depends(hl_guard)])
+        logger.info("已挂载 /hl 监控面板（模式=%s）", hl_mode())
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载 /hl 面板失败（不影响提醒与执行器）：%s", e)
+
+
+_mount_hl_views()
+
+
+@app.post("/admin/hl/mode")
+def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
+    """切换执行器模式（off/dry/live）。live 要求已配置地址与私钥。"""
+    _require_admin(request, k or None)
+    if mode not in ("off", "dry", "live"):
+        raise HTTPException(400, "mode 只能是 off/dry/live")
+    if mode == "live":
+        p = hl_params()
+        if not p.account_address or not p.private_key:
+            raise HTTPException(400, "未配置 HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY，不能进 live")
+    db.set_config("hl_exec_mode", mode)
+    db.hl_log_event("decision", f"人工切换执行器模式 → {mode}")
+    if mode != "live":
+        db.hl_set_kill(False, "")
+    return RedirectResponse(f"/admin?k={k}", status_code=303)
+
+
+@app.post("/admin/hl/kill")
+def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
+    """kill switch：off=恢复正常，on=暂停自动交易（仍允许人工平仓/撤单）。"""
+    _require_admin(request, k or None)
+    want = on in ("1", "true", "on")
+    db.hl_set_kill(want, "人工" if want else "")
+    db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
+    return RedirectResponse(f"/admin?k={k}", status_code=303)
