@@ -445,10 +445,10 @@ def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
         note = ("<p class='muted'>这是修改页：数值保存后会覆盖原来的记录"
                 f"（当前入场 {row['actual_entry'] or row['entry_price']:,.2f} / "
                 f"止损 {row['actual_stop'] or row['stop_price']:,.2f} / "
-                f"张数 {row['actual_contracts'] or row['contracts']}）。</p>")
+                f"张数 {(row['actual_contracts'] if row['actual_contracts'] is not None else row['contracts']):g}）。</p>")
     cur_entry = (row["actual_entry"] or row["entry_price"]) if editing else row["entry_price"]
     cur_stop = (row["actual_stop"] or row["stop_price"]) if editing else row["stop_price"]
-    cur_qty = (row["actual_contracts"] or row["contracts"]) if editing else row["contracts"]
+    cur_qty = (row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]) if editing else row["contracts"]
     edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
     title = f"修改开仓数据 #{pid}" if editing else f"确认开仓 #{pid}"
     body = f"""
@@ -494,7 +494,7 @@ def _summary(row, pid: int) -> HTMLResponse:
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
-    qty = row["actual_contracts"] or row["contracts"]
+    qty = row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]
     lines = [
         f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}",
         f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty} 张",
@@ -614,7 +614,7 @@ async def confirm_post(pid: int, request: Request):
             source = "amount"
         else:
             try:
-                qty = int(float(str(form.get("actual_contracts") or row["contracts"])))
+                qty = float(str(form.get("actual_contracts") or row["contracts"]))
             except ValueError:
                 raise HTTPException(400, "张数不是数字")
         placed = bool(form.get("stop_placed"))

@@ -51,7 +51,7 @@ def fake_snapshot(address="0xTESTADDRESS123456", with_stop=True, upnl=50.0, equi
     orders.extend(extra_orders)
     return {"ts": FIXED_NOW, "address": address, "equity": equity, "withdrawable": 900.0,
             "margin_used": 260.0, "notional": 1_300.0,
-            "positions": positions, "open_orders": orders}
+            "positions": positions, "open_orders": orders, "orders_trusted": True}
 
 
 class FakeInfo:
@@ -352,11 +352,13 @@ class TestStatusPayload(BaseCase):
         self.assertAlmostEqual(o["trigger_px"], 97_000.0)
 
     def test_today_realized_only_counts_utc_day(self):
+        # 日界 = 北京时间 0 点（与展示层一致）。FIXED_NOW=15:33 UTC=北京 23:33；
+        # YESTERDAY=前一日 23:00 UTC=北京次日 07:00 → 仍在北京「今日」内。
         self.insert_fill("f_today", closed_pnl=40.0, ts=FIXED_NOW)
         self.insert_fill("f_yesterday", closed_pnl=-15.0, ts=YESTERDAY)
         self.insert_fill("f_older", closed_pnl=5.0, ts=TODAY_START - 9 * 86400)
         a = self.payload()["account"]
-        self.assertAlmostEqual(a["today_realized"], 40.0, places=6)
+        self.assertAlmostEqual(a["today_realized"], 25.0, places=6)
         self.assertAlmostEqual(a["total_realized"], 40.0 - 15.0 + 5.0, places=6)
         self.assertEqual(len(self.payload()["fills"]), 3)
 
@@ -519,6 +521,8 @@ class TestFailureModes(BaseCase):
         for k, v in p["account"].items():
             if k == "address":
                 self.assertEqual(v, "0xTESTADDRESS123456")
+            elif isinstance(v, bool):
+                continue          # spot_ok 等标志位不是金额
             else:
                 self.assertEqual(v, 0.0, f"account.{k} 应为 0")
         self.assertEqual(p["account"]["funding_total"], 0.0)

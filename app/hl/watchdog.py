@@ -97,7 +97,12 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         add(f"读不到 HL 账户：{e}")
         return notes
     ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
+    orders_trusted = bool(snap.get("orders_trusted", False))
     for p in ex_pos.values():
+        if not orders_trusted:
+            # 挂单接口回落（读不到 isTrigger）：与执行器同口径 —— 只提示、不判裸奔
+            add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损状态无法确认（挂单接口不可信）")
+            continue
         has_stop = any(o.get("coin") == p["coin"] and o.get("reduce_only") and o.get("is_trigger")
                        for o in snap.get("open_orders") or [])
         if not has_stop:

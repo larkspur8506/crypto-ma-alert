@@ -275,6 +275,8 @@ class HlInfo:
         # 统一账户（HL 新账户默认）：余额在**现货**状态里，永续 accountValue 恒为 0。
         # 只看永续会误报「没资金」，而且日内熔断的基准会变成 0（永远不触发）。
         spot_usdc = 0.0
+        spot_hold = 0.0          # USDC 的仓位/挂单占用（可提 = total - hold）
+        spot_ok = True           # 现货状态是否读取成功（失败时 equity_total 不可信）
         spot_balances: List[dict] = []
         if self.unified:
             try:
@@ -286,7 +288,9 @@ class HlInfo:
                         spot_balances.append({"coin": coin, "total": total, "hold": hold})
                     if coin == "USDC":
                         spot_usdc += total
+                        spot_hold += hold
             except HlInfoError as e:                                     # noqa: BLE001
+                spot_ok = False
                 logger.warning("[hl-info] 现货状态读取失败（统一账户余额将显示为 0）：%s", e)
         perp_equity = self._num(ms.get("accountValue"))
         upnl = sum(p["unrealized_pnl"] for p in positions)
@@ -299,6 +303,8 @@ class HlInfo:
             "equity_total": equity_total,       # 账户总值：面板与熔断都用它
             "unified": self.unified,
             "spot_usdc": spot_usdc,
+            "spot_hold": spot_hold,           # USDC 占用（可提 = spot_usdc - spot_hold）
+            "spot_ok": spot_ok,               # False = 现货读取失败，equity_total 不可信
             "spot_balances": spot_balances,
             "withdrawable": self._num(st.get("withdrawable")),
             "margin_used": self._num(ms.get("totalMarginUsed")),

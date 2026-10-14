@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import os
 import math
 import time
 from dataclasses import dataclass, field
@@ -145,7 +146,11 @@ class ExecParams:
 
 
 def _today_start_ts(now: Optional[float] = None) -> float:
-    d = dt.datetime.now(dt.timezone.utc)
+    """当日 0 点（**北京时间**，与展示层一致；旧版 UTC 日界会让「今日下单数/
+    今日已实现」比用户直觉早/晚 8 小时）。"""
+    tz = dt.timezone(dt.timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
+    d = dt.datetime.fromtimestamp(now if now is not None else dt.datetime.now(
+        dt.timezone.utc).timestamp(), tz)
     return d.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
 
 
@@ -477,7 +482,7 @@ class Executor:
         # 4) 落仓位
         self.db.set_pos_hl(position_id, hl_status="open", hl_entry_oid=res.get("oid"),
                            hl_stop_oid=stop_res.get("oid"), hl_sz=filled_sz)
-        self.db.confirm_position(position_id, avg_px, int(round(filled_sz)), stop, True)
+        self.db.confirm_position(position_id, avg_px, float(filled_sz), stop, True)
         plan2 = hl_sizing.HlOrderPlan(**{**plan.__dict__, "entry_price": avg_px,
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
         self._alert_fill(fmt_entry_alert(
@@ -601,6 +606,11 @@ class Executor:
         self._close_local(position_id, px, reason, sz)
         r = self._r_multiple(row, px)
         gross = (px - float(row["actual_entry"] or row["entry_price"])) * sz * (1 if side == 1 else -1)
+        # 平仓手续费在下一轮 _sync_fills 才会进库 —— 先同步一次再算，否则净利少算平仓费
+        try:
+            self._sync_fills()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 平仓前同步成交失败（手续费可能少算）：%s", e)
         fees = self._fees_since(coin, row["opened_at"])
         self._alert_fill(fmt_exit_alert(
             coin=coin, side=side, entry_px=float(row["actual_entry"] or row["entry_price"]),
@@ -650,13 +660,19 @@ class Executor:
                     data={"prev": last, "now": now, "config_base": prev})
 
     def _fees_since(self, coin: str, since_ts) -> float:
-        """该仓位开仓以来累计手续费（读本地 hl_fills；读不到就返回 0，不影响主流程）。"""
+        """该仓位开仓以来累计手续费（读本地 hl_fills；读不到就返回 0，不影响主流程）。
+
+        下界用「opened_at − 120s」：入场成交发生在 opened_at 写库**之前**，
+        用 >= opened_at 会把入场那笔手续费排除掉（净利被高估）。
+        """
         try:
-            since = float(since_ts or 0)
+            since = float(since_ts or 0) - 120.0
         except (TypeError, ValueError):
             return 0.0
+        if since < 0:
+            since = 0.0
         total = 0.0
-        for r in self.db.hl_recent_fills(200):
+        for r in self.db.hl_recent_fills(500):
             try:
                 if str(r["coin"]) == coin and float(r["ts"] or 0) >= since:
                     total += float(r["fee"] or 0.0)

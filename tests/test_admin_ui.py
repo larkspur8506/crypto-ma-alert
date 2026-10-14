@@ -256,7 +256,7 @@ class TestParamsTab(BaseCase):
         self.assertIn("单笔风险 2.00U", html)
         self.assertIn("名义 133U", html)
         self.assertIn("保证金 27U", html)
-        self.assertIn("强平 80,500", html)
+        self.assertIn("强平 多80,500/空119,500", html)
 
     def test_params_degrades_when_price_unavailable(self):
         self.swap_info(FakeInfo(mids={}))                 # 没有 BTC 报价

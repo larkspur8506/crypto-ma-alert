@@ -516,9 +516,13 @@ def weekly_text(db, cfg) -> str:
     allrows = db.closed_positions(0.0)
     if allrows:
         rs = [r["r_multiple"] or 0.0 for r in allrows]
+        # 逐笔连乘（旧版用「均值的幂」高估：50笔+3R+50笔-1R 时 7244 vs 真实 6708）
+        compounded = 1.0
+        for r in rs:
+            compounded *= (1.0 + cfg.risk_pct * r)
         lines.append(f"累计 {len(rs)} 笔：均R {sum(rs) / len(rs):+.2f}，总R {sum(rs):+.1f}，"
-                     f"权益 {fmt_money(cfg.equity)}U × (1+{cfg.risk_pct:.2f}R 复利) ≈ "
-                     f"{fmt_money(cfg.equity * (1 + cfg.risk_pct * sum(rs) / max(len(rs), 1)) ** len(rs) if rs else cfg.equity)}U")
+                     f"按每笔 {cfg.risk_pct * 100:.0f}% 风险复利 ≈ "
+                     f"{fmt_money(cfg.equity * compounded)}U（本金 {fmt_money(cfg.equity)}U）")
     pending = [r for r in db.recent_positions(200) if r["status"] == "pending"]
     lines.append(f"未确认（按假设值统计）{len(pending)} 笔")
     return "\n".join(lines)

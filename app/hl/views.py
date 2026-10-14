@@ -103,8 +103,10 @@ def _fmt(v: Any, dp: int = 2, dash: str = "—") -> str:
 
 
 def _utc_day_start(ts: float) -> float:
-    d = dt.datetime.fromtimestamp(ts, dt.timezone.utc).date()
-    return dt.datetime(d.year, d.month, d.day, tzinfo=dt.timezone.utc).timestamp()
+    """当日 0 点（北京时间，与展示层「今日」一致；名字保留以免破坏调用方）。"""
+    tz = dt.timezone(dt.timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
+    d = dt.datetime.fromtimestamp(ts, tz).date()
+    return dt.datetime(d.year, d.month, d.day, tzinfo=tz).timestamp()
 
 
 def _to_seconds(v: Any) -> Optional[float]:
@@ -265,8 +267,14 @@ def _kill_state(deps: DashboardDeps) -> tuple:
 
 
 def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[dict],
-               open_by_coin: Dict[str, dict], stuck_orders: List[Any]) -> bool:
-    """对账（口径见模块 docstring）。"""
+               open_by_coin: Dict[str, dict], stuck_orders: List[Any],
+               orders_trusted: bool = True) -> bool:
+    """对账（口径见模块 docstring）。
+
+    `orders_trusted=False`（挂单接口回落/非 list）时**跳过止损判断**——
+    与执行器同一口径：读不到 isTrigger 时把「有止损」读成「没止损」，
+    据此判 mismatch 会吓用户去手动平仓。
+    """
     if stuck_orders:
         return True
     if not reachable:
@@ -275,7 +283,7 @@ def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[di
     for coin, row in open_by_coin.items():
         if coin not in snap_coins:
             return True
-        if row.get("hl_stop_oid"):
+        if row.get("hl_stop_oid") and orders_trusted:
             has_stop = any(str(o.get("coin") or "") == coin
                            and o.get("reduce_only") and o.get("is_trigger")
                            for o in snap_orders)
@@ -341,15 +349,17 @@ def status_payload(deps: DashboardDeps) -> dict:
 
         stop_px: Optional[float] = None
         has_stop = False
-        for o in snap_orders:
-            od = _rowd(o)
-            if str(od.get("coin") or "") != coin:
-                continue
-            if od.get("reduce_only") and od.get("is_trigger"):
-                tp = _opt_num(od.get("trigger_px"))
-                if tp and tp > 0:
-                    stop_px, has_stop = tp, True
-                    break
+        trusted = bool(snap.get("orders_trusted", False))
+        if trusted:
+            for o in snap_orders:
+                od = _rowd(o)
+                if str(od.get("coin") or "") != coin:
+                    continue
+                if od.get("reduce_only") and od.get("is_trigger"):
+                    tp = _opt_num(od.get("trigger_px"))
+                    if tp and tp > 0:
+                        stop_px, has_stop = tp, True
+                        break
 
         risk = abs(entry - stop_px) * size if (stop_px and entry and size) else 0.0
         r_unrealized = round(upnl / risk, 4) if risk > 0 else 0.0
@@ -379,6 +389,7 @@ def status_payload(deps: DashboardDeps) -> dict:
             "unrealized_pnl": upnl,
             "stop_px": stop_px,
             "has_stop": has_stop,
+            "stop_unknown": has_stop is False and not trusted,   # 挂单不可信：显示「无法确认」而非 ❌
             "stop_dist_pct": stop_dist_pct,
             "r_unrealized": r_unrealized,
             "signal_bar_ms": int(row.get("signal_bar_ms")) if row is not None else None,
@@ -538,6 +549,8 @@ def status_payload(deps: DashboardDeps) -> dict:
             "equity": _num(snap.get("equity_total", snap.get("equity"))),   # 总值（统一账户友好）
             "perp_equity": _num(snap.get("equity")),                        # 永续口径（原字段语义）
             "spot_usdc": _num(snap.get("spot_usdc")),
+            "spot_hold": _num(snap.get("spot_hold")),
+            "spot_ok": bool(snap.get("spot_ok", True)),
             "unified": bool(snap.get("unified", False)),
             "withdrawable": _num(snap.get("withdrawable")),
             "margin_used": _num(snap.get("margin_used")),
@@ -559,7 +572,9 @@ def status_payload(deps: DashboardDeps) -> dict:
             "executor_last_event_at": executor_last_event_at,
             "stuck_orders": len(stuck),
             "mismatch": _reconcile(reachable, snap_positions, snap_orders,
-                                   open_by_coin, stuck),
+                                   open_by_coin, stuck,
+                                   orders_trusted=bool(snap.get("orders_trusted", False))
+                                   if snap else False),
         },
         "equity_curve": {"7d": curve_7, "30d": curve_30},
         "events": events,
@@ -731,6 +746,9 @@ def _render_body(p: dict) -> str:
     fund_txt, fund_cls = _sign(acc.get("funding_total"))
     fees = _num(acc.get("fees_total"))
     o.append(_kv("账户总值", f"{_fmt(acc.get('equity'))} U"))
+    if acc.get("unified") and not acc.get("spot_ok", True):
+        # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
+        o.append(_kv("⚠️ 现货余额读取失败", "上方的总值/可提不可信（只剩浮盈），不是没钱", "neg"))
     if acc.get("unified"):
         # 统一账户：钱在现货状态里，永续口径恒为 0 —— 说清楚，免得以为「没资金」
         o.append(_kv("　现货 USDC（抵押品）", f"{_fmt(acc.get('spot_usdc'))} U", "muted"))
@@ -738,9 +756,9 @@ def _render_body(p: dict) -> str:
     wd = _num(acc.get("withdrawable"))
     if acc.get("unified") and wd <= 0:
         # 统一账户下永续口径的 withdrawable 恒为 0（钱在现货状态里）→ 直接显示 0 会误导成「没钱」。
-        # 真实可提 = 现货 USDC；HL 提现固定收 1 USDC 手续费（与金额无关）。
-        o.append(_kv("可提余额（现货口径，提现固定扣 1U）",
-                     f"{_fmt(_num(acc.get('spot_usdc')))} U"))
+        # 真实可提 = 现货 USDC − 占用（hold，仓位/挂单锁定的保证金）；HL 提现固定收 1 USDC。
+        avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
+        o.append(_kv("可提余额（现货口径，已扣占用，提现固定扣 1U）", f"{_fmt(avail)} U"))
     else:
         o.append(_kv("可提余额", f"{_fmt(wd)} U"))
     o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
@@ -784,6 +802,8 @@ def _render_body(p: dict) -> str:
         r_txt, r_cls = _sign(pos.get("r_unrealized"), "R")
         if pos.get("has_stop"):
             stop_cell = f"<span class='pos'>&#10004;&#65039; {_fmt(pos.get('stop_px'))}</span>"
+        elif pos.get("stop_unknown"):
+            stop_cell = "<span class='muted'>? 无法确认</span>"
         else:
             stop_cell = "<span class='neg'>&#10060; 无</span>"
         o.append("<tr>"
