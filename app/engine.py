@@ -405,10 +405,13 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
             age_bars = (ref_now - int(row["signal_bar_ms"])) // INTERVAL_MS
             if age_bars >= PENDING_BARS_MAX:
                 db.ignore_position(int(row["id"]))
+                # 注意 age_bars 从信号 bar 开盘起算：提醒发出时已是 1（bar 收盘后），
+                # 所以用户体感的确认窗口 ≈ (PENDING_BARS_MAX-1) 根 4h，文案如实写。
                 _emit(db, notifier, cfg, Alert(
                     "exit", symbol, int(row["signal_bar_ms"]),
-                    (f"{cfg.alert_prefix}{symbol} 待确认仓位已作废：信号超过 {PENDING_BARS_MAX} 根 4h"
-                     f"（{age_bars} 根）未确认，槽位已释放。若你实际开了仓，请自行管理离场。")),
+                    (f"{cfg.alert_prefix}{symbol} 待确认仓位已作废：信号发出约 "
+                     f"{(PENDING_BARS_MAX - 1) * 4} 小时未确认，槽位已释放。"
+                     f"若你实际开了仓，请自行管理离场。")),
                     sent)
                 row = None
             else:

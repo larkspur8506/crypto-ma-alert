@@ -84,7 +84,22 @@ class Config:
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
                    "equity_mode", "equity_min")
 
+    # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
+    # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
+    # 每轮 tick 抛 ZeroDivisionError，而面板数值看着完全「正常」。
+    _RANGES = {
+        "risk_pct": (0.0001, 0.5),
+        "leverage": (0.5, 125.0),
+        "stop_min": (0.0001, 0.5),
+        "stop_max": (0.0001, 0.5),
+        "equity": (1.0, 100_000_000.0),
+        "equity_min": (1.0, 100_000_000.0),
+        "short_regime_ma": (0, 1000),
+    }
+
     def apply_db(self, values: dict) -> "Config":
+        # 先解析成 dict，统一做范围/一致性校验后再 setattr
+        parsed: dict = {}
         for k in self.OVERRIDABLE:
             if k not in values or values[k] in (None, ""):
                 continue
@@ -96,19 +111,39 @@ class Config:
                 if isinstance(cur, bool):
                     # 严格解析：识别不了就保留原值，绝不静默关闭开关
                     if raw in ("1", "true", "yes", "on"):
-                        setattr(self, k, True)
+                        parsed[k] = True
                     elif raw in ("0", "false", "no", "off"):
-                        setattr(self, k, False)
+                        parsed[k] = False
                     continue
                 if isinstance(cur, str):
                     # 字符串型配置（如 equity_mode=follow/fixed）：原样取裸值，
                     # 绝不走 float()（否则标识符会被解析失败后静默忽略）
-                    setattr(self, k, raw if raw else cur)
+                    parsed[k] = raw if raw else cur
                     continue
                 if isinstance(cur, int):
-                    setattr(self, k, int(float(raw)))
+                    parsed[k] = int(float(raw))
                 else:
-                    setattr(self, k, float(raw))
+                    parsed[k] = float(raw)
             except (TypeError, ValueError):
                 continue
+        # 范围校验：出界的值拒收（保留原值）
+        for k, (lo, hi) in self._RANGES.items():
+            if k in parsed:
+                try:
+                    v = float(parsed[k])
+                    if not (lo <= v <= hi):
+                        parsed.pop(k, None)
+                except (TypeError, ValueError):
+                    parsed.pop(k, None)
+        # 一致性：stop_min 必须小于 stop_max（两者都存在且至少一方本次被改过才判）
+        smin, smax = parsed.get("stop_min", getattr(self, "stop_min", None)), \
+            parsed.get("stop_max", getattr(self, "stop_max", None))
+        try:
+            if smin is not None and smax is not None and float(smin) >= float(smax):
+                parsed.pop("stop_min", None)
+                parsed.pop("stop_max", None)
+        except (TypeError, ValueError):
+            pass
+        for k, v in parsed.items():
+            setattr(self, k, v)
         return self

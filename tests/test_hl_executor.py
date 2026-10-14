@@ -484,7 +484,10 @@ class TestReconcileAndRun(Base):
         self.info = FakeInfo(raise_on_snapshot="network down")
         alerts = self.executor().run(force_snapshot=True)
         self.assertFalse(self.db.hl_kill())
-        self.assertEqual(alerts, [])
+        # 快照读不到：降级心跳写入 + 一条提示（不再整轮静默 return，
+        # 看守据此能把「读不到账户」和「执行器死了」区分开）
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("读不到 HL 账户快照", alerts[0])
         self.assertTrue(any("读取账户失败" in e["message"] for e in self.events()))
 
     def test_run_daily_loss_kills(self):

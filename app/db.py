@@ -355,6 +355,21 @@ class DB:
                           (now(), aid))
         self.conn.commit()
 
+    @_locked
+    def prune_alert_logs(self, keep_days: float = 60.0, keep_rows: int = 5000) -> None:
+        """清 alert_logs：bar_ms=NULL 的超期行 + 超出 keep_rows 的旧行。
+
+        必须走 @_locked（曾经直接裸用共享连接，跨线程 commit 会打乱事务边界）。
+        """
+        import time as _time
+        cutoff = _time.time() - keep_days * 86400
+        self.conn.execute(
+            "DELETE FROM alert_logs WHERE bar_ms IS NULL AND created_at < ?", (cutoff,))
+        self.conn.execute(
+            "DELETE FROM alert_logs WHERE id < (SELECT MIN(id) FROM "
+            "(SELECT id FROM alert_logs ORDER BY id DESC LIMIT ?))", (keep_rows,))
+        self.conn.commit()
+
     # ---------------- feed health
     @_locked
     def mark_feed(self, symbol: str, source: str, ok: bool, error: str = "") -> None:
@@ -494,6 +509,30 @@ class DB:
     @_locked
     def hl_latest_snapshot(self) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+
+    @_locked
+    def prune_hl_telemetry(self, keep_days: float = 30.0, keep_events: int = 20000,
+                           keep_snapshots: int = 20000) -> None:
+        """清 hl_events / hl_snapshots（执行器心跳/对账每 5 分钟各写一行，
+        live 下 ~864 行/天不清理会无限膨胀）。保留：
+        - 心跳/对账类事件只留 keep_days 天（保留窗口内的告警/订单事件不删，
+          按数量截断兜底）；快照同理。
+        - 告警价值的事件（error/kill/decision/order）不按天删，只按总量截断。
+        """
+        import time as _time
+        cutoff = _time.time() - keep_days * 86400
+        self.conn.execute(
+            "DELETE FROM hl_events WHERE created_at < ? AND kind IN ('heartbeat', 'reconcile')",
+            (cutoff,))
+        self.conn.execute(
+            "DELETE FROM hl_events WHERE id < (SELECT MIN(id) FROM "
+            "(SELECT id FROM hl_events ORDER BY id DESC LIMIT ?))", (keep_events,))
+        self.conn.execute(
+            "DELETE FROM hl_snapshots WHERE ts < ?", (cutoff,))
+        self.conn.execute(
+            "DELETE FROM hl_snapshots WHERE id < (SELECT MIN(id) FROM "
+            "(SELECT id FROM hl_snapshots ORDER BY id DESC LIMIT ?))", (keep_snapshots,))
+        self.conn.commit()
 
     @_locked
     def set_pos_hl(self, pid: int, **kw) -> None:

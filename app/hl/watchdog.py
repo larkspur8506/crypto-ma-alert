@@ -152,13 +152,13 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         agents = ag.get("agents") or []
         until = ag.get("max_valid_until")
         if not agents:
-            add("⚠️ 账户没有任何 agent（API 钱包）授权 —— 下单会被拒，"
+            add("账户没有任何 agent（API 钱包）授权 —— 下单会被拒，"
                 "请到 HL 设置里生成 API 钱包并绑定主账户")
         elif until:
             days_left = (float(until) / 1000.0 - time.time()) / 86400.0
             names = "、".join(str(a.get("name") or str(a.get("address"))[:10]) for a in agents[:3])
             if days_left <= AGENT_WARN_DAYS:
-                add(f"⚠️ agent 授权只剩 {days_left:.1f} 天（{names}）"
+                add(f"agent 授权只剩 {days_left:.1f} 天（{names}）"
                     f"—— 到期后自动交易会全部失败，请到 HL 设置里重新生成/延长 API 钱包")
             else:
                 add(f"agent 授权 {len(agents)} 个（{names}），最长还有 {days_left:.0f} 天", ok=True)
@@ -172,7 +172,8 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
 def main(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="打印全部检查项")
-    ap.add_argument("--mode", default=_env("HL_EXEC_MODE", MODE_OFF))
+    ap.add_argument("--mode", default=None,
+                    help="执行模式（默认从 DB 读，与面板/执行器同一口径；env HL_EXEC_MODE 只是兜底）")
     ap.add_argument("--db", default=os.environ.get("DB_PATH", "/app/data/crypto_ma.db"))
     args = ap.parse_args(argv)
 
@@ -181,11 +182,20 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     base = TESTNET if _env("HL_TESTNET", "0") in ("1", "true") else MAINNET
     db = DB(args.db)
+    # 模式判定必须与 main.hl_mode() 同口径：DB > env > off。
+    # 只读 env 的话，面板切到 live 而 env 还是 dry/off 时，看守会在错误的模式下自检
+    # （off 直接跳过全部检查 = 实盘无看守）。
+    mode = args.mode
+    if mode is None:
+        raw = str(db.get_config().get("hl_exec_mode", "") or _env("HL_EXEC_MODE", MODE_OFF))
+        mode = raw.strip().strip('"')
+        if mode not in (MODE_OFF, "dry", "live"):
+            mode = MODE_OFF
     info = HlInfo(base_url=base)
-    problems = run_checks(db, info=info, mode=args.mode, force=args.dry_run)
+    problems = run_checks(db, info=info, mode=mode, force=args.dry_run)
     bad = [p for p in problems if p.startswith("⚠️")]
     if args.dry_run:
-        print(f"[dry-run] {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M UTC} 模式={args.mode}")
+        print(f"[dry-run] {dt.datetime.now(dt.timezone.utc):%Y-%m-%d %H:%M UTC} 模式={mode}")
         for p in problems:
             print(" ", p)
         return 0
