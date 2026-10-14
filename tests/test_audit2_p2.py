@@ -157,8 +157,8 @@ class TestEntryAlertEquity(unittest.TestCase):
         from app.hl import executor as E
         sig = inspect.signature(E.fmt_entry_alert)
         self.assertIn("leverage", sig.parameters)
-        # equity 传的是生效基数（调用点核对）
-        src = inspect.getsource(E.Executor.on_entry)
+        # equity 传的是生效基数（调用点核对）—— on_entry 现在是锁包装 + _on_entry_locked
+        src = inspect.getsource(E.Executor._on_entry_locked)
         self.assertIn("equity=eff_equity", src)
         self.assertNotIn("equity=self.p.equity", src)
 

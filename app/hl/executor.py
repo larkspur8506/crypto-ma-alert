@@ -16,6 +16,7 @@ import logging
 import os
 import math
 import time
+import threading
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -168,24 +169,49 @@ class Executor:
         self.info = info
         self.ex = exchange
         self.notifier = notifier
+        # 进程内互斥：run()/on_entry/on_exit 会做「撤单→下单→落库」多步序列，
+        # 两个线程并发跑同一段（_job_hl_monitor 与 tick 的 run、或两轮 tick）会
+        # 重放同一确定性 cloid → 被交易所拒单 → 误判失败 → 走「兜底平仓」误平仓。
+        # APScheduler 的 max_instances 只约束各自的 job，管不了跨 job 并发。
+        self._op_lock = threading.Lock()
 
     # ------------------------------------------------------------ 工具
     def coin(self, symbol: str) -> str:
         return self.p.coin_map.get(symbol, symbol.split("_")[0])
 
     def _alert_fill(self, text: str) -> None:
-        """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。"""
-        if not getattr(self.p, "notify_fills", True):
-            logger.info("[hl-exec] 成交回报推送已关闭，仅落库")
-            return
-        self._alert(text)
+        """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。
 
-    def _alert(self, text: str) -> None:
+        开关关闭时也落库（kind=exec_alert_fills，不进补推白名单——开关是用户意图），
+        这样 alert_logs 里有完整审计轨迹，且开关重新打开后可见历史。
+        """
+        if not getattr(self.p, "notify_fills", True):
+            try:
+                self.db.log_alert(None, None, "exec_alert_fills", text, True)
+            except Exception as e:                                   # noqa: BLE001
+                logger.error("[hl-exec] 成交回报落库失败：%s", e)
+            return
+        self._alert(text, kind="exec_alert_fills")
+
+    def _alert(self, text: str, symbol: Optional[str] = None,
+               kind: str = "exec_alert") -> None:
+        """执行器告警：直发 + 落 alert_logs。
+
+        「平仓失败（止损已撤）」「止损单丢失」这类告警一推失败就是永久丢
+        （引擎侧走 _emit 有 24h 补推，执行器侧以前完全没有）—— 现在也写进
+        alert_logs（bar_ms=NULL + 时间窗去重，同 data_error 的约定），
+        main._retry_failed_alerts 会照常补推。
+        """
+        ok = False
         try:
-            if self.notifier is not None:
-                self.notifier.send_message(text)
+            ok = bool(self.notifier is not None and self.notifier.send_message(text))
         except Exception as e:                                       # noqa: BLE001
             logger.error("[hl-exec] 推送失败：%s", e)
+            ok = False
+        try:
+            self.db.log_alert(symbol, None, kind, text, ok)
+        except Exception as e:                                       # noqa: BLE001
+            logger.error("[hl-exec] 告警落库失败（补推将不可用）：%s", e)
 
     def _event(self, kind: str, message: str, symbol: Optional[str] = None,
                data: Any = None) -> None:
@@ -386,6 +412,10 @@ class Executor:
 
     def on_entry(self, position_id: int) -> bool:
         """接管一次开仓。返回 True = 已接管（调用方不要再走人工确认流）。"""
+        with self._op_lock:
+            return self._on_entry_locked(position_id)
+
+    def _on_entry_locked(self, position_id: int) -> bool:
         row = self.db.position_by_id(position_id)
         if row is None or self.p.mode == MODE_OFF:
             return False
@@ -405,6 +435,13 @@ class Executor:
             self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_ENTRY, side, 0.0,
                                      status=ST_SKIPPED)
             self._event(EV_ERROR, "读不到账户，放弃本次开仓", symbol=symbol)
+            if self.p.live:
+                # live 下不能回落人工卡：人工卡按配置 equity（1000U）算金额，与
+                # 真实账户差一个数量级，照着下单就是风险放大（审计三轮 P1-H5）。
+                # 已接管 → 引擎只补推这条告警（有 alert_logs 补推兜底）。
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到账户快照，本轮未下单。"
+                            f"下一轮 tick 会重试。")
+                return True
             return False
 
         try:
@@ -412,6 +449,9 @@ class Executor:
             sz_decimals = int(specs.get("sz_decimals", 0))
         except HlInfoError as e:
             self._event(EV_ERROR, f"读不到合约规格，放弃开仓：{e}", symbol=symbol)
+            if self.p.live:
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到合约规格，本轮未下单。")
+                return True
             return False
 
         mid = 0.0
@@ -419,9 +459,15 @@ class Executor:
             mid = self.ex.mid(coin)
         except Exception as e:                                       # noqa: BLE001
             self._event(EV_ERROR, f"取不到 {coin} mid，放弃开仓：{e}", symbol=symbol)
+            if self.p.live:
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但取不到行情，本轮未下单。")
+                return True
             return False
         if mid <= 0:
             self._event(EV_ERROR, f"{coin} mid 非法（{mid}），放弃开仓", symbol=symbol)
+            if self.p.live:
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但行情非法，本轮未下单。")
+                return True
             return False
 
         # 用**当前 mid** 当入场价重算数量（风险归一），止损仍用信号给的止损价
@@ -546,6 +592,10 @@ class Executor:
     # ------------------------------------------------------------ 离场
     def on_exit(self, position_id: int, reason: str, ref_price: float) -> bool:
         """接管一次离场。返回 True = 已接管（调用方不要再动 DB 状态）。"""
+        with self._op_lock:
+            return self._on_exit_locked(position_id, reason, ref_price)
+
+    def _on_exit_locked(self, position_id: int, reason: str, ref_price: float) -> bool:
         row = self.db.position_by_id(position_id)
         if row is None or self.p.mode == MODE_OFF:
             return False
@@ -674,9 +724,63 @@ class Executor:
                             f"请立即人工处理！")
             return True
         if res.get("filled_sz") is not None and float(res["filled_sz"] or 0) + 1e-12 < sz:
-            # 部分成交：按实际成交量关账；剩余仓位仍受原止损保护（撤单未发生或已被补挂）
-            self._event(EV_ORDER, f"{symbol} 平仓部分成交 {res.get('filled_sz')}/{sz}", symbol=symbol)
-            sz = float(res["filled_sz"])
+            # 部分成交（审计三轮 P1-H3）：这轮的第一步已把原止损撤掉了，
+            # 剩余量没有保护 —— 必须按剩余量把止损挂回去（exit:rehang 口径，
+            # cloid 用当前离场 bar，与全量重挂同一来源），且本地**不**关账，
+            # 留 open 让下一轮 on_exit / 对账继续跟进。
+            filled = float(res["filled_sz"] or 0)
+            remain = sz - filled
+            self._event(EV_ORDER, f"{symbol} 平仓部分成交 {filled}/{sz}，剩余 {remain} 重挂止损",
+                        symbol=symbol, data={"filled": filled, "remain": remain})
+            try:
+                sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
+            except HlInfoError:
+                sz_dec = 5
+            re_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
+            try:
+                re_stop = self.ex.place_order(
+                    coin, side != 1, remain, re_px, reduce_only=True, trigger_px=re_px,
+                    cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG))
+            except Exception as ex:                                   # noqa: BLE001
+                re_stop = {"ok": False, "error": f"{type(ex).__name__}: {ex}", "status": "error"}
+            re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
+            try:
+                self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side,
+                                         remain, px=re_px, reduce_only=True,
+                                         status=(re_stop.get("status") if re_ok else ST_FAILED),
+                                         cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG),
+                                         error=None if re_ok else str(re_stop.get("error"))[:300])
+            except Exception as ex:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 部分成交重挂记录失败（忽略）：%s", ex)
+            if re_ok:
+                self._event(EV_ERROR, f"{symbol} 部分成交后止损已按剩余量 {remain} 重挂",
+                            symbol=symbol)
+                self._alert(f"【HL执行】⚠️ {coin} 平仓部分成交（{filled}/{sz}），剩余 {remain} "
+                            f"{coin} 已重挂止损 @ {re_px:,.2f}，本地保持持仓，下一轮继续离场。")
+            else:
+                self._event(EV_ERROR, f"{symbol} 部分成交后止损重挂失败（{re_stop.get('error')}）"
+                                      f" → 尝试市价平掉剩余量", symbol=symbol)
+                try:
+                    close_px2 = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+                except Exception:                                    # noqa: BLE001
+                    close_px2 = limit_px
+                try:
+                    close2 = self.ex.place_order(coin, side != 1, remain, close_px2,
+                                                 reduce_only=True)
+                except Exception as ex:                              # noqa: BLE001
+                    close2 = {"ok": False, "status": "error",
+                              "error": f"{type(ex).__name__}: {ex}"}
+                c2_ok = bool(close2.get("ok")) and close2.get("status") == STATUS_FILLED
+                self._alert(f"【HL执行】🛑 {coin} 平仓部分成交且剩余量止损重挂失败，"
+                            f"已尝试市价平剩余 {remain}（{'成功' if c2_ok else '结果异常，请立即人工核对'}）。")
+                if c2_ok and float(close2.get("filled_sz") or 0) + 1e-12 >= remain:
+                    px2 = float(close2.get("avg_px") or close_px2)
+                    self._close_local(position_id, px2, reason, sz)
+                    r = self._r_multiple(row, px2)
+                    self._event(EV_ORDER, f"{symbol} 剩余量已平 @ {px2:,.2f}（{reason}）",
+                                symbol=symbol, data={"r": r})
+                    return True
+            return True    # 本地不关账（或已按剩余平完关账），本轮结束
         px = float(res["avg_px"] or limit_px)
         self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FILLED,
                                 oid=res.get("oid"), filled_sz=res.get("filled_sz"), avg_px=px,
@@ -715,10 +819,20 @@ class Executor:
         base = float(self.p.equity or 0.0)
         if not self.p.follow or not snap:
             return base
+        # 统一账户现货读取失败 → equity_total = 0 + 浮盈，不可信（P1-H1，审计三轮）。
+        # 熔断分支早就显式检查 spot_ok（run 里「数据不可信，宁可跳过」），定仓路径
+        # 却没用它 → 无仓时 equity_total≤0 回落到配置 equity=1000U，真钱 100U 的账户
+        # 会按 20U 风险定仓（10 倍）。这里必须同样 fail-closed：回落 equity_min，
+        # 绝不放大风险。
+        if not bool(snap.get("spot_ok", True)):
+            logger.warning("[hl-exec] 现货读取失败（spot_ok=False），权益不可信，"
+                           "回落 equity_min=%s", self.p.equity_min)
+            return float(self.p.equity_min or 20.0)
         live = float(snap.get("equity_total", snap.get("equity")) or 0.0)
         if live <= 0:
-            logger.warning("[hl-exec] 实时权益读到 %.4f，回落配置基数 %.2f", live, base)
-            return base
+            logger.warning("[hl-exec] 实时权益读到 %.4f，回落 equity_min=%.2f（不再用配置基数，"
+                           "防风险放大）", live, self.p.equity_min)
+            return float(self.p.equity_min or 20.0)
         eff = math.floor(live / 10.0) * 10.0
         if self.p.equity_min and eff < self.p.equity_min:
             eff = float(self.p.equity_min)
@@ -831,6 +945,10 @@ class Executor:
     # ------------------------------------------------------------ 每轮
     def run(self, force_snapshot: bool = False) -> List[str]:
         """每轮 tick 调用：快照 → 对账 → 熔断 → 死手开关 → 心跳。返回告警文案。"""
+        with self._op_lock:
+            return self._run_locked(force_snapshot)
+
+    def _run_locked(self, force_snapshot: bool = False) -> List[str]:
         alerts: List[str] = []
         if self.p.mode == MODE_OFF:
             return alerts

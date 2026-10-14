@@ -205,7 +205,8 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
         import time as _time
         rows = db.failed_alerts_since(_time.time() - max_age_h * 3600)
         retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
-                                                              "weekly", "weekly_local")]
+                                                              "weekly", "weekly_local",
+                                                              "exec_alert_fills")]
         for r in retry[:limit]:
             text = r["message"] or ""
             if not text:
