@@ -637,11 +637,21 @@ class Executor:
                 alerts.append(f"【HL执行】⚠️ 当日亏损 {(now_eq - start_eq) / start_eq * 100:.1f}%"
                               f"（阈值 -{self.p.max_daily_loss_pct * 100:g}%）→ 已停止自动交易")
 
-        # 3) 死手开关
+        # 3) 死手开关（HL 原生 scheduleCancel）
+        #    失败要去重：这个接口要求账户有足够成交量，低成交量账户每轮都会失败 ——
+        #    不去重的话 live 下每 5 分钟刷一条错误事件（288 条/天），能把面板记录页冲垮。
         if self.p.live and not self.db.hl_kill():
             r = self.ex.schedule_cancel(minutes=self.p.deadman_minutes)
-            if not r["ok"]:
-                self._event(EV_ERROR, f"死手开关设置失败：{r['error']}")
+            flagged = str(self.db.get_config_str("hl_deadman_err") or "") == "1"
+            if r["ok"]:
+                if flagged:
+                    self.db.set_config("hl_deadman_err", "0")
+                    self._event(EV_ERROR, "死手开关恢复可用")
+            elif not flagged:
+                self.db.set_config("hl_deadman_err", "1")
+                self._event(EV_ERROR,
+                            f"死手开关设置失败（仅记一次，恢复时再报）：{r['error']}",
+                            data={"error": str(r["error"])[:300]})
 
         # 4) 同步成交到本地（面板的「最近成交/手续费累计/今日与累计已实现」全靠 hl_fills；
         #    在此之前**没有任何生产代码写过这张表** → 真交易后面板这三项会一直是 0）

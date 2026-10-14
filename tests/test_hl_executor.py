@@ -729,3 +729,30 @@ class TestFillPushSwitch(Base):
         self.notifier.messages.clear()
         ex.on_exit(pid, "ma20", 86000.0)
         self.assertEqual(self.notifier.messages, [])
+
+
+class TestDeadmanLogDedupe(Base):
+    """死手开关失败必须去重：低成交量账户每轮都失败，否则 live 下刷爆事件表。"""
+
+    def _ex(self):
+        self.ex.schedule_cancel = lambda minutes=60: {"ok": False, "error": "Cannot set scheduled cancel"}
+        return self.executor()
+
+    def test_failure_logged_once(self):
+        ex = self._ex()
+        for _ in range(4):
+            ex.run()
+        n = len([e for e in self.events() if "死手开关设置失败" in e["message"]])
+        self.assertEqual(n, 1, f"应只记一条，实际 {n}")
+
+    def test_recovery_is_reported(self):
+        ex = self._ex()
+        ex.run()
+        self.ex.schedule_cancel = lambda minutes=60: {"ok": True, "error": ""}
+        ex.run()
+        self.assertTrue(any("死手开关恢复可用" in e["message"] for e in self.events()))
+        # 恢复后再失败，应再记一条（因为状态变了）
+        self.ex.schedule_cancel = lambda minutes=60: {"ok": False, "error": "又失败"}
+        ex.run()
+        n = len([e for e in self.events() if "死手开关设置失败" in e["message"]])
+        self.assertEqual(n, 2)
