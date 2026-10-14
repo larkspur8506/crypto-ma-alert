@@ -396,6 +396,40 @@ class Executor:
                     data={"r": r})
         return True
 
+    @staticmethod
+    def _num(v: Any, default: float = 0.0) -> float:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    def _sync_fills(self, limit: int = 100) -> int:
+        """把交易所的成交同步进 hl_fills（按 tid 去重，幂等）。返回新增条数。"""
+        if not self.p.account_address:
+            return 0
+        fills = self.info.user_fills(self.p.account_address) or []
+        known = {str(r["tid"]) for r in self.db.hl_recent_fills(500)}
+        added = 0
+        reverse = {v: k for k, v in (self.p.coin_map or {}).items()}
+        for f in fills[:limit]:
+            tid = str(f.get("tid") or f.get("hash") or "")
+            if not tid or tid in known:
+                continue
+            coin = str(f.get("coin") or "")
+            direction = str(f.get("dir") or "")
+            self.db.hl_upsert_fill(
+                tid=tid, symbol=reverse.get(coin, f"{coin}_USDT"), coin=coin,
+                side=1 if "Long" in direction else -1, sz=self._num(f.get("sz")),
+                px=self._num(f.get("px")), fee=self._num(f.get("fee")),
+                fee_token=f.get("feeToken"), dir=direction,
+                closed_pnl=self._num(f.get("closedPnl")), hash=f.get("hash"),
+                reduce_only=("Close" in direction),
+                ts=int(f["time"]) // 1000 if f.get("time") else None)
+            added += 1
+        if added:
+            self._event(EV_ORDER, f"同步 {added} 笔交易所成交到本地", data={"added": added})
+        return added
+
     def _r_multiple(self, row, exit_px: float) -> float:
         entry = float(row["actual_entry"] or row["entry_price"])
         stop = float(row["actual_stop"] or row["stop_price"])
@@ -470,7 +504,14 @@ class Executor:
             if not r["ok"]:
                 self._event(EV_ERROR, f"死手开关设置失败：{r['error']}")
 
-        # 4) 心跳（看守据此判断执行器存活）
+        # 4) 同步成交到本地（面板的「最近成交/手续费累计/今日与累计已实现」全靠 hl_fills；
+        #    在此之前**没有任何生产代码写过这张表** → 真交易后面板这三项会一直是 0）
+        try:
+            self._sync_fills()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 同步成交失败（不影响交易）：%s", e)
+
+        # 5) 心跳（看守据此判断执行器存活）
         self._event(EV_HEARTBEAT,
                     f"executor 心跳（equity {snap.get('equity_total', snap.get('equity'))}）",
                     data={"kill": self.db.hl_kill(), "mode": self.p.mode})

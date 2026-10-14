@@ -533,3 +533,43 @@ class TestAlertWording(Base):
         pid = self.add_signal()
         self.executor().on_entry(pid)
         self.assertIn("BTC 止损单挂失败", self.notifier.messages[-1])
+
+
+class TestFillSync(Base):
+    """成交必须同步进 hl_fills —— 否则面板的「最近成交/手续费/今日与累计已实现」永远是 0。"""
+
+    def test_open_fill_synced_and_deduped(self):
+        self.info._fills = [{"tid": 11, "coin": "BTC", "dir": "Open Long", "sz": "0.00014",
+                             "px": "83500.0", "fee": "0.00526", "feeToken": "USDC",
+                             "closedPnl": "0.0", "hash": "0xh1", "time": 1791955000000}]
+        self.executor().run(force_snapshot=True)
+        rows = self.db.hl_recent_fills(10)
+        self.assertEqual(len(rows), 1)
+        r = rows[0]
+        self.assertEqual(r["coin"], "BTC")
+        self.assertEqual(r["symbol"], "BTC_USDT")       # 反向映射回信号层符号
+        self.assertEqual(r["side"], 1)
+        self.assertAlmostEqual(r["fee"], 0.00526)
+        self.assertAlmostEqual(r["ts"], 1791955000)     # 毫秒 → 秒
+        self.executor().run(force_snapshot=True)         # 再跑一轮：不重复
+        self.assertEqual(len(self.db.hl_recent_fills(10)), 1)
+
+    def test_close_fill_marks_reduce_only_and_pnl(self):
+        self.info._fills = [{"tid": 12, "coin": "BTC", "dir": "Close Long", "sz": "0.00014",
+                             "px": "83542.0", "fee": "0.0052", "feeToken": "USDC",
+                             "closedPnl": "0.0011", "hash": "0xh2", "time": 1791956000000}]
+        self.executor().run(force_snapshot=True)
+        r = self.db.hl_recent_fills(10)[0]
+        self.assertEqual(r["reduce_only"], 1)
+        self.assertAlmostEqual(r["closed_pnl"], 0.0011)
+        self.assertEqual(r["side"], 1)
+
+    def test_short_fill_side_is_minus_one(self):
+        self.info._fills = [{"tid": 13, "coin": "ETH", "dir": "Open Short", "sz": "0.01",
+                             "px": "2500.0", "fee": "0.001", "closedPnl": "0", "time": 1791957000000}]
+        self.executor().run(force_snapshot=True)
+        self.assertEqual(self.db.hl_recent_fills(10)[0]["side"], -1)
+
+    def test_no_fills_is_noop(self):
+        self.executor().run(force_snapshot=True)
+        self.assertEqual(self.db.hl_recent_fills(10), [])
