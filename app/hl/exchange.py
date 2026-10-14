@@ -109,7 +109,6 @@ class HlExchange:
         self._exchange = sdk
         self._wallet = wallet
         self._init_error = ""
-        self._cloid_cls = None
 
     # ------------------------------------------------------------ 初始化
     @property
@@ -127,7 +126,6 @@ class HlExchange:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
             from hyperliquid.utils.types import Cloid
-            self._cloid_cls = Cloid
             self._wallet = self._wallet or Account.from_key(self.private_key)
             self._exchange = Exchange(self._wallet, self.base_url,
                                       account_address=self.account_address, timeout=self.timeout)
@@ -185,6 +183,13 @@ class HlExchange:
                     reduce_only: bool = False, tif: str = "Ioc",
                     trigger_px: Optional[float] = None, cloid=None) -> dict:
         """下单（IOC 限价 / 或触发单）。trigger_px 给了就走 {"trigger":{...}}。"""
+        # 审计三轮 L：sz/限价非法直接拒（0 或负数发到交易所只会得到难解析的错）
+        try:
+            _sz, _px = float(sz), float(limit_px)
+        except (TypeError, ValueError):
+            return _err(f"sz/limit_px 非数字：{sz!r}/{limit_px!r}")
+        if _sz <= 0 or _px <= 0:
+            return _err(f"sz/limit_px 必须为正：sz={sz} limit_px={limit_px}")
         order_type: Dict[str, Any] = ({"trigger": {"triggerPx": trigger_px, "isMarket": True, "tpsl": "sl"}}
                                       if trigger_px is not None else {"limit": {"tif": tif}})
         if self.dry_run:

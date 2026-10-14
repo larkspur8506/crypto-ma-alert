@@ -621,6 +621,11 @@ def status_payload(deps: DashboardDeps) -> dict:
 # ---------------------------------------------------------------- SVG 权益曲线
 def _equity_svg(points: List[List[float]], width: int = 760, height: int = 160) -> str:
     """手写内联 SVG 折线（不引任何图表库）。"""
+    # 审计三轮 L：按像素列降采样 —— 30 天 5 分钟一张快照 ≈ 8600 点，
+    # 保留窗口内可能上万点，全量内联 polyline 会让页面体积和渲染开销线性膨胀。
+    if len(points) > (width * 2):
+        step = len(points) / (width * 2)
+        points = [points[min(len(points) - 1, int(i * step))] for i in range(width * 2)]
     pad_l, pad_r, pad_t, pad_b = 6, 6, 12, 16
     if len(points) < 2:
         return (f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' "
@@ -1055,10 +1060,12 @@ def render_dashboard(payload: dict) -> str:
 
 
 # ---------------------------------------------------------------- 路由
-def _admin_required(deps: DashboardDeps, k: str) -> bool:
+def _admin_required(deps: DashboardDeps, k: str, request: "Request" = None) -> bool:
     """可选鉴权：仅 HL_DASH_REQUIRE_ADMIN=1 时生效（默认关闭，便于内网直连）。
 
     返回 True = 应拒绝（401）。未开启或未配 ADMIN_TOKEN 一律放行。
+    与 main.hl_guard 同口径：?k= 命中或 cma_admin cookie 命中任一即放行
+    （审计三轮 L：以前只认 k，开 REQUIRE_ADMIN 后带 cookie 的浏览器会话也被 401）。
     """
     if os.environ.get("HL_DASH_REQUIRE_ADMIN", "").strip().lower() not in ("1", "true", "yes", "on"):
         return False
@@ -1070,7 +1077,15 @@ def _admin_required(deps: DashboardDeps, k: str) -> bool:
         return False
     if not token:
         return False
-    return str(k or "") != token
+    if str(k or "") == token:
+        return False
+    if request is not None:
+        try:
+            if str(request.cookies.get("cma_admin") or "") == token:
+                return False
+        except Exception:                                        # noqa: BLE001
+            pass
+    return True
 
 
 def build_router(deps: DashboardDeps) -> Any:
@@ -1079,7 +1094,7 @@ def build_router(deps: DashboardDeps) -> Any:
 
     @router.get("/hl", response_class=HTMLResponse)
     def hl_page(request: Request, refresh: int = 0, k: str = ""):
-        if _admin_required(deps, k):
+        if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         payload = dict(status_payload(deps))
         payload["refresh"] = refresh if refresh in (10, 30, 60) else 0
@@ -1087,13 +1102,13 @@ def build_router(deps: DashboardDeps) -> Any:
 
     @router.get("/api/hl/status")
     def hl_status(request: Request, k: str = ""):
-        if _admin_required(deps, k):
+        if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         return status_payload(deps)
 
     @router.get("/api/hl/equity")
     def hl_equity(request: Request, k: str = ""):
-        if _admin_required(deps, k):
+        if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         p = status_payload(deps)
         a = p.get("account") or {}
@@ -1114,7 +1129,7 @@ def build_router(deps: DashboardDeps) -> Any:
 
     @router.get("/api/hl/snapshot")
     def hl_snapshot(request: Request, k: str = ""):
-        if _admin_required(deps, k):
+        if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         p = status_payload(deps)
         return {
