@@ -13,6 +13,7 @@ from pathlib import Path
 from app.db import DB
 from app.hl import MODE_DRY, MODE_LIVE, MODE_OFF
 from app.hl.executor import Executor, ExecParams
+from app.hl import sizing as hl_sizing
 from app.hl.exchange import STATUS_DRY, STATUS_ERROR, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.hl.info import HlInfoError
 
@@ -301,6 +302,7 @@ class TestEntryLive(Base):
     def test_below_min_notional_blocks(self):
         pid = self.add_signal(entry=83000.0, stop=60000.0)   # 距离大 → 名义小
         self.p.equity, self.p.risk_pct = 10.0, 0.005         # 风险 0.05U → 名义 ~0.1U
+        self.p.equity_mode = "fixed"                         # 本用例测闸门，不走跟随
         self.assertTrue(self.executor().on_entry(pid))
         self.assertEqual(self.orders("entry")[0]["status"], "skipped")
         self.assertIn("下限", self.newest_event()["message"])
@@ -632,3 +634,65 @@ class TestAlertFormat(Base):
                              reason="ma20", r_multiple=0.5, gross_pnl=0.5, fees=0.02,
                              opened_at=now.timestamp(), when=now, tz_label="北京时间")
         self.assertIn("收盘站上 SMA20", txt)              # 空单是站上
+
+
+class TestEffectiveEquity(Base):
+    """下单基数跟随实时权益（用户拍板：只在低位设下限，不设上限）。"""
+
+    def _ex(self, **kw):
+        return self.executor(**kw)
+
+    def test_follow_uses_live_equity_rounded_to_10(self):
+        ex = self._ex(equity_mode="follow", equity=100.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 100.68}), 100.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 108.9}), 100.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 111.0}), 110.0)
+        # 入金到 1000U：无需改配置，直接按 1000 算（用户明确「上限没必要」）
+        self.assertEqual(ex.effective_equity({"equity_total": 1000.0}), 1000.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 2500.0}), 2500.0)
+
+    def test_follow_respects_lower_bound_only(self):
+        ex = self._ex(equity_mode="follow", equity_min=20.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 5.0}), 20.0)     # 低于下限 → 抬到下限
+        self.assertEqual(ex.effective_equity({"equity_total": 0.0}), ex.p.equity)  # 读到 0 → 回落配置
+
+    def test_fixed_mode_ignores_live(self):
+        ex = self._ex(equity_mode="fixed", equity=100.0)
+        self.assertEqual(ex.effective_equity({"equity_total": 9999.0}), 100.0)
+
+    def test_no_snapshot_falls_back_to_config(self):
+        ex = self._ex(equity_mode="follow", equity=100.0)
+        self.assertEqual(ex.effective_equity(None), 100.0)
+
+    def test_sizing_follows_live_equity(self):
+        """权益 1000 → 单笔风险 20U；止损距离 ~2.89% → 名义 ≈ 692U。"""
+        self.info = FakeInfo(snap=_snap(equity=1000.0))
+        pid = self.add_signal(entry=83000.0, stop=80600.0)
+        ex = self.executor(equity=100.0, equity_mode="follow", equity_min=20.0)
+        ex.on_entry(pid)                                       # 走真路径（假交易所）
+        row = self.orders("entry")[0]
+        self.assertGreater(row["sz"], 0.008)                   # 比按 100U 算(0.00083)大一个数量级
+        self.assertAlmostEqual(row["sz"], 0.00833, places=5)   # 按 1000U 权益算出来的量
+
+    def test_base_change_is_recorded(self):
+        ex = self._ex(equity_mode="follow", equity=100.0)
+        ex.effective_equity({"equity_total": 1000.0})          # 100 → 1000（+900）
+        self.assertTrue(any("下单基数" in e["message"] for e in self.events()))
+        self.assertAlmostEqual(float(self.db.get_config_str("hl_last_equity_base")), 1000.0)
+
+    def test_small_change_not_recorded(self):
+        ex = self._ex(equity_mode="follow", equity=100.0)
+        ex.effective_equity({"equity_total": 1000.0})
+        n = len(self.events())
+        ex.effective_equity({"equity_total": 1010.0})          # +1% → 不记
+        self.assertEqual(len(self.events()), n)
+
+    def test_gate_notional_cap_scales_with_live_equity(self):
+        """名义上限也必须按生效基数缩放，否则 1000U 资金会被 150U 的老上限卡死。"""
+        self.info = FakeInfo(snap=_snap(equity=1000.0))
+        pid = self.add_signal(entry=83000.0, stop=80600.0)
+        ex = self.executor(equity=100.0, equity_mode="follow")
+        gates = ex._entry_gates("BTC_USDT",
+                                hl_sizing.size_order_hl("BTC", 5, 83000.0, 80600.0, 1000.0, 0.02, 5.0, side=1),
+                                self.info.snapshot("0xabc"), equity=1000.0)
+        self.assertEqual([g for g in gates if "上限" in g], [])

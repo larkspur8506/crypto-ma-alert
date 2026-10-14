@@ -92,6 +92,8 @@ def hl_params():
         leverage=cfg.leverage,
         risk_pct=cfg.risk_pct,
         equity=cfg.equity,
+        equity_mode=_env("HL_EQUITY_MODE") or getattr(cfg, "equity_mode", "follow"),
+        equity_min=float(getattr(cfg, "equity_min", 20.0) or 0.0),
         max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
         max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 1.5),
         max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 2.5),

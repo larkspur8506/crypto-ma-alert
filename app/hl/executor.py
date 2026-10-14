@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime as dt
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
@@ -111,6 +112,8 @@ class ExecParams:
     leverage: float = 5.0
     risk_pct: float = 0.02
     equity: float = 1000.0
+    equity_mode: str = "follow"          # follow = 跟随实时权益（带下限）；fixed = 用上面的固定值
+    equity_min: float = 20.0
     max_slippage_pct: float = 0.003
     max_notional_mult: float = 1.5        # 单标的名义 / 权益
     max_total_notional_mult: float = 2.5  # 总名义 / 权益
@@ -122,6 +125,10 @@ class ExecParams:
     snapshot_min_interval_s: float = 240.0
     stop_max_hard: float = 0.10           # 执行时止损距离超此值直接放弃
     code_rev: str = ""
+
+    @property
+    def follow(self) -> bool:
+        return str(self.equity_mode or "follow").lower() != "fixed"
 
     @property
     def live(self) -> bool:
@@ -206,7 +213,7 @@ class Executor:
         return False
 
     # ------------------------------------------------------------ 闸门
-    def _entry_gates(self, symbol: str, plan, snap: dict) -> List[str]:
+    def _entry_gates(self, symbol: str, plan, snap: dict, equity: Optional[float] = None) -> List[str]:
         p = self.p
         bad: List[str] = []
         if self.db.hl_kill():
@@ -216,13 +223,14 @@ class Executor:
             bad.append(f"写通道不可用：{self.ex.init_error or '未配置凭据'}")
         if plan.below_min_notional:
             bad.append(f"名义 {plan.notional:.1f}U 低于交易所下限 {p.min_notional:g}U")
-        cap = p.equity * p.max_notional_mult
+        eq = float(equity if equity is not None else p.equity)
+        cap = eq * p.max_notional_mult
         if plan.notional > cap:
             bad.append(f"名义 {plan.notional:.0f}U 超过单标的上限 {cap:.0f}U")
         total = float((snap or {}).get("notional") or 0.0)
-        if total + plan.notional > p.equity * p.max_total_notional_mult:
+        if total + plan.notional > eq * p.max_total_notional_mult:
             bad.append(f"总名义将达 {total + plan.notional:.0f}U，超过上限 "
-                       f"{p.equity * p.max_total_notional_mult:.0f}U")
+                       f"{eq * p.max_total_notional_mult:.0f}U")
         if plan.stop_dist > p.stop_max_hard:
             bad.append(f"执行时止损距离 {plan.stop_dist * 100:.2f}% 超过硬上限 {p.stop_max_hard * 100:g}%")
         if plan.leverage > plan.max_safe_leverage:
@@ -285,10 +293,11 @@ class Executor:
 
         # 用**当前 mid** 当入场价重算数量（风险归一），止损仍用信号给的止损价
         stop = float(row["stop_price"])
-        plan = hl_sizing.size_order_hl(coin, sz_decimals, mid, stop, self.p.equity,
+        eff_equity = self.effective_equity(snap)          # 跟随实时权益（带下限）
+        plan = hl_sizing.size_order_hl(coin, sz_decimals, mid, stop, eff_equity,
                                       self.p.risk_pct, self.p.leverage, side=side,
                                       min_notional=self.p.min_notional)
-        gates = self._entry_gates(symbol, plan, snap)
+        gates = self._entry_gates(symbol, plan, snap, equity=eff_equity)
         if gates:
             self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_ENTRY, side, plan.sz,
                                      px=mid, status=ST_SKIPPED)
@@ -477,6 +486,38 @@ class Executor:
             return float(v)
         except (TypeError, ValueError):
             return default
+
+    def effective_equity(self, snap: Optional[dict]) -> float:
+        """下单基数。follow：按交易所实时权益（floor 到 10U、带下限）；读不到则回落到配置值。
+
+        为什么要跟随：写在配置里的基数不会随账户盈亏变化 —— 涨了不复利、跌了相对风险悄悄变大。
+        为什么要取整：几毛钱的浮亏浮盈不该让仓位跳来跳去（也避免每次下单都换一个数）。
+        只设下限（用户拍板）：入金到 1000U 就按 1000 算，不加上限。
+        """
+        base = float(self.p.equity or 0.0)
+        if not self.p.follow or not snap:
+            return base
+        live = float(snap.get("equity_total", snap.get("equity")) or 0.0)
+        if live <= 0:
+            logger.warning("[hl-exec] 实时权益读到 %.4f，回落配置基数 %.2f", live, base)
+            return base
+        eff = math.floor(live / 10.0) * 10.0
+        if self.p.equity_min and eff < self.p.equity_min:
+            eff = float(self.p.equity_min)
+        self._note_equity_change(base, eff)
+        return eff
+
+    def _note_equity_change(self, prev: float, now: float) -> None:
+        """基数发生显著变化（>20%）时留一条可追溯的事件 —— 入金/提现/大额浮亏都看得见。"""
+        try:
+            last = float(self.db.get_config_str("hl_last_equity_base") or 0.0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if last and abs(now - last) / max(last, 1e-9) < 0.2:
+            return
+        self.db.set_config("hl_last_equity_base", now)
+        self._event(EV_DECISION, f"下单基数 {last:g} → {now:g} U（跟随实时权益）",
+                    data={"prev": last, "now": now, "config_base": prev})
 
     def _fees_since(self, coin: str, since_ts) -> float:
         """该仓位开仓以来累计手续费（读本地 hl_fills；读不到就返回 0，不影响主流程）。"""

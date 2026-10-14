@@ -76,7 +76,8 @@ class Config:
 
     # ---- DB 可覆盖项 ----
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
-                   "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push")
+                   "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
+                   "equity_mode", "equity_min")
 
     def apply_db(self, values: dict) -> "Config":
         for k in self.OVERRIDABLE:
@@ -93,6 +94,11 @@ class Config:
                         setattr(self, k, True)
                     elif raw in ("0", "false", "no", "off"):
                         setattr(self, k, False)
+                    continue
+                if isinstance(cur, str):
+                    # 字符串型配置（如 equity_mode=follow/fixed）：原样取裸值，
+                    # 绝不走 float()（否则标识符会被解析失败后静默忽略）
+                    setattr(self, k, raw if raw else cur)
                     continue
                 if isinstance(cur, int):
                     setattr(self, k, int(float(raw)))
