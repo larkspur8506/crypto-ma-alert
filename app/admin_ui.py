@@ -416,7 +416,8 @@ def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str 
     st = f" step='{step}'" if step else ""
     return (f"<div class='field'><div class='lbl'>{_esc(label)}"
             f"<span class='src'>&nbsp;来源 {src} · 当前 {_esc(value)}</span></div>"
-            f"<input type='text' inputmode='decimal' name='{_esc(key)}' value='{_esc(value)}'{st}>"
+            f"<input type='text' inputmode='decimal' required name='{_esc(key)}' "
+            f"value='{_esc(value)}'{st}>"
             f"<div class='hint'>{hint}</div></div>")
 
 
@@ -435,6 +436,9 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
 
     o: List[str] = []
     o.append("<h2>参数</h2>")
+    # 表单必须包住所有输入控件：控件在 form 外的话浏览器只提交 form 内的
+    # 元素 → POST 空 body → 必 400（自面板合并起就坏，用户从没在面板改过参数）。
+    o.append("<form method='post' action='/admin/params'>")
     o.append("<div class='card'><div class='sec'>改动影响预览</div>"
              f"<div class='hint big'>{_impact_line(imp)}</div>"
              f"<div class='hint'>下单基数：<b>{base:,.0f} U</b>（{_esc(base_txt)}；"
@@ -465,7 +469,6 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                                     hint, src, step="1" if kind == "int" else ""))
         o.append("</div>")
 
-    o.append("<form method='post' action='/admin/params'>")
     o.append("<button type='submit'>保存全部参数</button></form>")
     return "".join(o)
 
@@ -924,7 +927,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         want = str(on or "") in ("1", "true", "on")
         if deps.hl_set_kill is not None:
             deps.hl_set_kill(want, "人工" if want else "")
-        deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
+            deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
+        else:
+            # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
+            deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
+                                   "但执行器未接线（无动作）")
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 旧地址兼容（302 到新位置，保持 ?k= 透传） ----------------
