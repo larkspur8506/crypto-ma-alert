@@ -639,10 +639,10 @@ def render_records(deps: AdminDeps) -> str:
                  f"<td class='num'>{_fmt(r.get('px'))}</td>"
                  f"<td class='num'>{_fmt(r.get('fee'), 4)}</td>"
                  f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
-                 f"<td>{'减仓' if r.get('reduce_only') else '—'}</td></tr>")
+                 f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
     o.append(_table("<th>时间</th><th>币种</th><th>方向</th><th class='num'>数量</th>"
                     "<th class='num'>价格</th><th class='num'>手续费</th>"
-                    "<th class='num'>平仓盈亏</th><th>减仓</th>",
+                    "<th class='num'>平仓盈亏</th><th>减仓</th>",   # 列名「减仓」= 这笔是不是平仓性质
                     rows, "暂无成交记录", 8))
     o.append("</div>")
 
