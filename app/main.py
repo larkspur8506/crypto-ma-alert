@@ -173,12 +173,24 @@ def push_on(key: str, default: str = "1") -> bool:
 
 def _job_tick() -> None:
     try:
-        sent = engine.tick(db, current_config(), notifier, executor=build_executor())
+        sent = _tick_locked()
         if sent:
             logger.info("tick 发送 %d 条提醒", len(sent))
         _retry_failed_alerts()
     except Exception as e:                                    # noqa: BLE001
         logger.exception("tick 异常: %s", e)
+
+
+# 进程内 tick 互斥：/admin/tick 与调度器并发跑同一轮会重复推送/竞争 set_last_bar
+# （APScheduler 的 max_instances 只约束它自己起的 job，管不了 HTTP 线程）。
+import threading as _threading
+
+_tick_lock = _threading.Lock()
+
+
+def _tick_locked() -> list:
+    with _tick_lock:
+        return engine.tick(db, current_config(), notifier, executor=build_executor())
 
 
 def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
@@ -232,15 +244,14 @@ def _job_heartbeat() -> None:
 
 def _prune_alert_logs(keep_days: float = 60.0, keep_rows: int = 5000) -> None:
     """alert_logs 里 bar_ms=NULL 的行（心跳/周报/数据错误）不受 UNIQUE 幂等约束，
-    会无限增长 —— 每天清一次超期的，保留最近 keep_rows 行兜底。失败只记日志。"""
+    会无限增长 —— 每天清一次超期的，保留最近 keep_rows 行兜底。失败只记日志。
+
+    走 DB 的 @_locked 方法（不裸用共享连接）：这里是全仓唯一一处绕过 RLock 的
+    DB 访问，跨线程 commit 会打乱其它线程的事务边界。
+    """
     try:
-        cutoff = time.time() - keep_days * 86400
-        with db.conn:
-            db.conn.execute(
-                "DELETE FROM alert_logs WHERE bar_ms IS NULL AND created_at < ?", (cutoff,))
-            db.conn.execute(
-                "DELETE FROM alert_logs WHERE id < (SELECT MIN(id) FROM "
-                "(SELECT id FROM alert_logs ORDER BY id DESC LIMIT ?))", (keep_rows,))
+        db.prune_alert_logs(keep_days=keep_days, keep_rows=keep_rows)
+        db.prune_hl_telemetry()
     except Exception as e:                                        # noqa: BLE001
         logger.warning("alert_logs 清理失败（忽略）：%s", e)
 
@@ -670,7 +681,7 @@ async def confirm_post(pid: int, request: Request):
 @app.post("/admin/tick")
 def admin_tick(request: Request, k: Optional[str] = None):
     _require_admin(request, k)
-    sent = engine.tick(db, current_config(), notifier, executor=build_executor())
+    sent = _tick_locked()
     return {"sent": len(sent), "messages": sent}
 
 

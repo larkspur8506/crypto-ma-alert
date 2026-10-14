@@ -46,19 +46,25 @@ def _side_word(side: int) -> str:
 def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: float,
                     stop_dist: float, notional: float, margin: float, liq: float,
                     risk_u: float, equity: float, signal_px: float, oid, stop_oid,
-                    when: "dt.datetime", tz_label: str) -> str:
-    """开仓回报：价格 / 数量 / 保证金 / 强平 / 风险 分行排，别糊成一坨。"""
+                    when: "dt.datetime", tz_label: str,
+                    leverage: float = 5.0) -> str:
+    """开仓回报：价格 / 数量 / 保证金 / 强平 / 风险 分行排，别糊成一坨。
+
+    equity 传**生效基数**（effective_equity），不是配置 equity —— follow 模式下
+    两者默认不同，传错会让「权益的 X%」差一个数量级。
+    """
     drift = ((entry_px - signal_px) / signal_px * 100) if signal_px else 0.0
     stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
+    pct = (risk_u / equity * 100) if equity else 0.0
     return "\n".join([
-        f"【HL执行】✅ 已开仓 · {coin} {_side_word(side)} 5x 逐仓",
+        f"【HL执行】✅ 已开仓 · {coin} {_side_word(side)} {leverage:g}x 逐仓",
         "",
         f"成交价    {_fmt_u(entry_px)}",
         f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} U）",
         f"止损价    {_fmt_u(stop)}（{stop_pct:+.2f}%）",
         f"保证金    ≈{_fmt_u(margin, 1)} U",
         f"强平价    {_fmt_u(liq)}",
-        f"风险      {_fmt_u(risk_u)} U（权益的 {risk_u / equity * 100:.1f}%）",
+        f"风险      {_fmt_u(risk_u)} U（权益的 {pct:.1f}%）",
         f"滑点      {drift:+.2f}%（信号价 {_fmt_u(signal_px)}）",
         f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}",
         f"单号      开仓 {oid} · 止损 {stop_oid}",
@@ -216,7 +222,11 @@ class Executor:
         missing_stop: List[dict] = []
         unconfirmed: List[str] = []
         local_open = [r for r in self.db.recent_positions(50)
-                      if r["status"] == "open" and (r["hl_status"] or "") in ("open", "mismatch")]
+                      if r["status"] == "open"
+                      # hl_status 为 NULL 也算：on_entry 在「入场成交→落库」之间崩溃时
+                      # 仓位行还没来得及写 hl_status='open'，这样的仓同样需要止损保护/对账，
+                      # 否则只能走到 kill 分支当「人工单」处理。
+                      and (r["hl_status"] or "") in ("open", "mismatch", "")]
         seen = set()
         for r in local_open:
             coin = self.coin(r["symbol"])
@@ -248,6 +258,15 @@ class Executor:
         coin = self.coin(symbol)
         bar_ms = int(row.get("signal_bar_ms") or 0)
         side = int(row.get("side") or 1)
+        # 非 live 模式绝不动交易所：dry 的 place_order 返回 STATUS_DRY（非
+        # RESTING/FILLED），按失败处理会误走「补挂失败→市价平仓」分支，
+        # 推出吓人且失实的告警（实际什么都没发）。dry 下只提示人工。
+        if not self.p.live:
+            self._event(EV_ERROR, f"dry 模式：{symbol} 止损缺失，不动交易所，仅提示",
+                        symbol=symbol)
+            self._alert(f"【HL执行】⚠️ {coin} 交易所仓位缺止损单，但执行器不是 live 模式，"
+                        f"未自动处理 —— 请人工查看并处理。")
+            return
         stop = float(row.get("stop_price") or 0.0)
         sz = float(row.get("hl_sz") or 0.0)
         if sz <= 0:                                   # 本地没记数量 → 以交易所为准
@@ -507,9 +526,10 @@ class Executor:
         self._alert_fill(fmt_entry_alert(
             coin=coin, side=side, sz=filled_sz, entry_px=avg_px, stop=stop,
             stop_dist=plan2.stop_dist, notional=plan2.notional, margin=plan2.margin,
-            liq=plan2.liq_price, risk_u=plan2.risk_u, equity=self.p.equity,
+            liq=plan2.liq_price, risk_u=plan2.risk_u, equity=eff_equity,
             signal_px=float(row["entry_price"] or avg_px), oid=res.get("oid"),
-            stop_oid=stop_res.get("oid"), when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL))
+            stop_oid=stop_res.get("oid"), when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL,
+            leverage=float(self.p.leverage or 5.0)))
         self._event(EV_ORDER, f"{symbol} 开仓完成：{filled_sz} @ {avg_px:,.2f}，止损单已挂",
                     symbol=symbol, data={"risk_u": plan2.risk_u, "notional": plan2.notional})
         return True
@@ -816,6 +836,13 @@ class Executor:
             return alerts
         snap = self._snapshot(force=force_snapshot)
         if snap is None:
+            # 读不到快照也要写心跳（带 degraded 标记）：
+            # 看守判活只看 heartbeat 事件的时间 —— 整轮 return 的话，
+            # 「活着但读不到账户」会被误报成「执行器死了」。
+            self._event(EV_HEARTBEAT, "executor 心跳（读不到账户快照，已降级）",
+                        data={"kill": self.db.hl_kill(), "mode": self.p.mode, "degraded": True})
+            alerts.append("【HL执行】⚠️ 读不到 HL 账户快照（已连续重试），本轮跳过对账/熔断/成交同步。"
+                          "若持续出现请检查网络或 HL 状态。")
             return alerts
 
         # 1) 对账
@@ -826,7 +853,14 @@ class Executor:
             if not rec.get("unknown"):
                 self.db.hl_set_kill(True, "对账异常")
                 self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
-            alerts.append("【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems))
+            # 告警去重：kill 态下每轮 run() 都会走到这里（5 分钟一轮），
+            # 同一状态只推送一次 + 每 6 小时提醒一次仍在等人工；恢复由下方 else 分支报告。
+            key = "hl_recon_alert_at"
+            last_alert = float(self.db.get_config_str(key) or 0)
+            due = (time.time() - last_alert) >= 6 * 3600
+            if due:
+                self.db.set_config(key, str(int(time.time())))
+                alerts.append("【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems))
             # 确认「有仓但没止损」→ 不允许无保护持仓存在：先补挂，补不上就市价平掉
             for row in rec.get("missing_stop") or []:
                 self._repair_missing_stop(row, snap)
@@ -844,6 +878,11 @@ class Executor:
             if str(self.db.get_config_str("hl_stop_unconfirmed") or "") == "1":
                 self.db.set_config("hl_stop_unconfirmed", "0")
                 alerts.append("【HL执行】✅ 挂单接口已恢复，止损状态可正常确认")
+            # 对账恢复正常：清掉告警节流标记（下次异常立即推送），并告知一次
+            if float(self.db.get_config_str("hl_recon_alert_at") or 0) > 0:
+                self.db.set_config("hl_recon_alert_at", "0")
+                if not rec.get("unconfirmed"):
+                    alerts.append("【HL执行】✅ 对账已恢复正常")
             self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
 
         # 2) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
