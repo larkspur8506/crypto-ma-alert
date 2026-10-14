@@ -98,6 +98,20 @@ wrapper: /opt/data/scripts/hl-watch/hl_watch.py
 演练：`HLW_SSH_HOST=localhost python3 /opt/data/scripts/hl-watch/hl_watch.py`（应 ~16s 后报警）
 ```
 
+## 5.5 写路径真单冒烟（切 live 前 / 改过写路径后）
+
+```bash
+# 1) 先把模式切 off（避免看守把这张冒烟仓判成「本地无记录的人工单」→ 拉 kill）
+curl -s -X POST -d "mode=off&k=$ADMIN_TOKEN" "$BASE/admin/hl/mode"
+# 2) 跑冒烟：约 12 USDC 名义，开仓 → 挂止损 → 核对 → 撤止损 → 平仓，≈5 秒、成本 ≈0.01 USDC
+cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-alert python -'
+# 3) 看 ⑧ has_stop=True、⑫ 仓位/挂单归零，再切回 dry 或 live
+```
+
+**不跑这一步就会踩的坑（2026-10-14 实测）**：cloid 类型错误（下单直接失败）、
+`openOrders` 缺 isTrigger/triggerPx（止损单被误判成裸奔 → 对账拉 kill switch）。
+单元测试用假 SDK 全绿也发现不了这两类问题 —— 真单冒烟是唯一能验证写路径的手段。
+
 ## 6. 应急手册
 
 ### A. 面板 `has_stop` = ❌（有仓无止损）
