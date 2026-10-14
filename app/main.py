@@ -622,7 +622,22 @@ def _mount_hl_views() -> None:
         logger.warning("挂载 /hl 面板失败（不影响提醒与执行器）：%s", e)
 
 
+def _mount_hl_keyform() -> None:
+    """一次性私钥录入页：给「手机连不上 oracle1:22」时用的 HTTPS 通道。
+
+    注意鉴权方式不同：它用自己的一次性令牌（15 分钟、用过即废），**不是** ADMIN_TOKEN，
+    所以**不能**挂 hl_guard（否则还得带上 admin token）。
+    """
+    try:
+        from app.hl.keyform import KeyFormDeps, build_router as build_key_router
+        app.include_router(build_key_router(KeyFormDeps.from_env(db)))
+        logger.info("已挂载 /admin/hl/key 私钥录入页（一次性令牌）")
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载私钥录入页失败（不影响其他功能）：%s", e)
+
+
 _mount_hl_views()
+_mount_hl_keyform()
 
 
 @app.post("/admin/hl/mode")
