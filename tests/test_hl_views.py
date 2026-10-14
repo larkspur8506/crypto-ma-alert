@@ -744,8 +744,11 @@ class TestWithdrawableDisplay(BaseCase):
                      "equity_total": 100.471124})
         self.info._snap = snap
         html = self._html()
-        self.assertIn("可提余额（现货口径", html)
-        self.assertIn("100.47", html)
+        # 精简后的口径：标签短、手续费后缀、口径细节在 title 悬停
+        self.assertIn("可提余额", html)
+        self.assertIn("100.47 U（提现收 1U 手续费）", html)
+        self.assertIn("统一账户下的实际可提", html)
+        self.assertIn("资金都在现货（统一账户）", html)
 
     def test_non_unified_keeps_perp_withdrawable(self):
         snap = dict(self.info._snap)

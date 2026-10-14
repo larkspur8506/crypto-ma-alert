@@ -222,8 +222,11 @@ def build_router(deps: KeyFormDeps) -> APIRouter:
         good, info = write_key(key, deps.env_path)
         if good:
             consume_token(deps.db)
-            return render_form(deps, token="",
-                               message=f"✅ 已写入（{info}）。令牌已作废；请让 Hermes 重启容器并切模式。")
+            # 成功页不走 render_form：此时 has_key() 已为 True，会把「已存在/拒绝覆盖」
+            # 的矛盾文案拼在成功提示下面。
+            return _page("录入私钥",
+                         f"<div class='card'><span class='ok'>✅ 已写入（{info}）。</span>"
+                         "<div class='muted'>令牌已作废；请让 Hermes 重启容器并核对后切换模式。</div></div>")
         return render_form(deps, token=t.strip(), message=f"❌ {info}", ok=False)
 
     return r

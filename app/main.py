@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import time
+from urllib.parse import quote as _urlquote
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -425,7 +426,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
     except ValueError:
         raise HTTPException(400, "short_regime_ma 不是数字")
     db.set_config("short_regime_ma", int(float(short_regime_ma)))
-    return RedirectResponse(f"/admin?tab=params&k={k}", status_code=303)
+    return RedirectResponse(f"/admin?tab=params&k={_urlquote(str(k))}", status_code=303)
 
 
 # ---------------------------------------------------------------- 确认页
@@ -689,7 +690,7 @@ def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
     db.hl_log_event("decision", f"人工切换执行器模式 → {mode}")
     if mode != "live":
         db.hl_set_kill(False, "")
-    return RedirectResponse(f"/admin?tab=switch&k={k}", status_code=303)
+    return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)
 
 
 @app.post("/admin/hl/kill")
@@ -699,4 +700,4 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
     want = on in ("1", "true", "on")
     db.hl_set_kill(want, "人工" if want else "")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
-    return RedirectResponse(f"/admin?tab=switch&k={k}", status_code=303)
+    return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)

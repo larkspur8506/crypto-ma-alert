@@ -104,7 +104,7 @@ def _fmt(v: Any, dp: int = 2, dash: str = "—") -> str:
 
 def _utc_day_start(ts: float) -> float:
     """当日 0 点（北京时间，与展示层「今日」一致；名字保留以免破坏调用方）。"""
-    tz = dt.timezone(dt.timedelta(hours=int(os.environ.get("DISPLAY_TZ_OFFSET", "8"))))
+    tz = _display_tz()
     d = dt.datetime.fromtimestamp(ts, tz).date()
     return dt.datetime(d.year, d.month, d.day, tzinfo=tz).timestamp()
 
@@ -117,12 +117,25 @@ def _to_seconds(v: Any) -> Optional[float]:
     return f / 1000.0 if f > 1e12 else f
 
 
-def _fmt_dt(v: Any, pattern: str = "%Y-%m-%d %H:%M:%S") -> str:
+def _display_tz() -> dt.timezone:
+    """展示时区（与 engine.DISPLAY_TZ 同源，env DISPLAY_TZ_OFFSET，默认北京时间）。
+
+    用 float 解析（engine 侧也是 float）：int("8.0") 会抛 ValueError 打穿面板。
+    """
+    try:
+        off = float(os.environ.get("DISPLAY_TZ_OFFSET", "8") or 8)
+    except (TypeError, ValueError):
+        off = 8.0
+    return dt.timezone(dt.timedelta(hours=off))
+
+
+def _fmt_dt(v: Any, pattern: str = "%m-%d %H:%M:%S") -> str:
+    """时间展示：北京时间（原为 UTC，与 admin 面板/推送口径不一致，已统一）。"""
     f = _to_seconds(v)
     if f is None:
         return "—"
     try:
-        return dt.datetime.fromtimestamp(f, dt.timezone.utc).strftime(pattern) + " UTC"
+        return dt.datetime.fromtimestamp(f, _display_tz()).strftime(pattern)
     except (OverflowError, OSError, ValueError):
         return "—"
 
@@ -131,9 +144,28 @@ def _esc(v: Any) -> str:
     return html.escape(str(v if v is not None else ""))
 
 
-def _kv(label: str, value: str, cls: str = "") -> str:
+_DIR_TXT = {
+    "Open Long": "开多", "Close Long": "平多",
+    "Open Short": "开空", "Close Short": "平空",
+    "Short > Long": "翻多", "Long > Short": "翻空",
+}
+
+
+def _fmt_sz(v: Any) -> str:
+    """数量展示：BTC 这类小数量按精度显示（0.00095 不能显示成 0.00）。"""
+    f = _opt_num(v)
+    if f is None:
+        return "—"
+    for dp in (2, 3, 4, 5, 6):
+        if f == round(f, dp):
+            return f"{f:,.{dp}f}".rstrip("0").rstrip(".") if dp > 2 else f"{f:,.2f}"
+    return f"{f:,.6f}"
+
+
+def _kv(label: str, value: str, cls: str = "", title: str = "") -> str:
     c = f" {cls}" if cls else ""
-    return f"<div class='kv'><span class='k'>{label}</span><span class='v{c}'>{value}</span></div>"
+    t = f" title='{_esc(title)}'" if title else ""
+    return f"<div class='kv'{t}><span class='k'>{label}</span><span class='v{c}'>{value}</span></div>"
 
 
 def _badge(dot_cls: str, label: str, value_html: str) -> str:
@@ -565,7 +597,7 @@ def status_payload(deps: DashboardDeps) -> dict:
         "positions": positions_out,
         "orders_open": orders_open,
         "orders_recent": orders_recent,
-        "fills": fills_out,
+        "fills": fills_out[:100],   # JSON 也截断（看守/巡检只看头部；全量会让响应无限膨胀）
         "signals": signals,
         "system": {
             "feed": feed,
@@ -751,15 +783,17 @@ def _render_body(p: dict) -> str:
         # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
         o.append(_kv("⚠️ 现货余额读取失败", "上方的总值/可提不可信（只剩浮盈），不是没钱", "neg"))
     if acc.get("unified"):
-        # 统一账户：钱在现货状态里，永续口径恒为 0 —— 说清楚，免得以为「没资金」
-        o.append(_kv("　现货 USDC（抵押品）", f"{_fmt(acc.get('spot_usdc'))} U", "muted"))
-        o.append(_kv("　永续账户口径", f"{_fmt(acc.get('perp_equity'))} U", "muted"))
+        # 统一账户：钱在现货状态里，永续口径恒为 0 —— 精简为一行说明，不单列两行 0
+        o.append(_kv("资金都在现货（统一账户）",
+                     f"抵押品 {_fmt(acc.get('spot_usdc'))} U · 永续口径 {_fmt(acc.get('perp_equity'))} U",
+                     "muted"))
     wd = _num(acc.get("withdrawable"))
     if acc.get("unified") and wd <= 0:
-        # 统一账户下永续口径的 withdrawable 恒为 0（钱在现货状态里）→ 直接显示 0 会误导成「没钱」。
-        # 真实可提 = 现货 USDC − 占用（hold，仓位/挂单锁定的保证金）；HL 提现固定收 1 USDC。
+        # 统一账户：真实可提 = 现货 USDC − 占用（仓位/挂单锁定）；HL 提现固定收 1 USDC。
+        # 文案短说重点，口径细节放 title 悬停（手机长按也能看）。
         avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
-        o.append(_kv("可提余额（现货口径，已扣占用，提现固定扣 1U）", f"{_fmt(avail)} U"))
+        o.append(_kv("可提余额", f"{_fmt(avail)} U（提现收 1U 手续费）",
+                     title="统一账户下的实际可提：现货余额扣除仓位/挂单占用的保证金"))
     else:
         o.append(_kv("可提余额", f"{_fmt(wd)} U"))
     o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
@@ -810,7 +844,7 @@ def _render_body(p: dict) -> str:
         o.append("<tr>"
                  + _td(f"<b>{_esc(pos.get('coin') or '—')}</b>")
                  + _td(f"<b>{side_txt}</b>")
-                 + _td(_fmt(pos.get("size")), "num")
+                 + _td(_fmt_sz(pos.get("size")), "num")
                  + _td(_fmt(pos.get("entry_px")), "num")
                  + _td(_fmt(pos.get("mark_px")), "num")
                  + _td(upnl_txt, f"num {upnl_cls}".strip())
@@ -842,7 +876,7 @@ def _render_body(p: dict) -> str:
                  + _td(_esc(od.get("coin") or "—"))
                  + _td(kind)
                  + _td("买" if od.get("is_buy") else "卖")
-                 + _td(_fmt(od.get("sz")), "num")
+                 + _td(_fmt_sz(od.get("sz")), "num")
                  + _td(_fmt(od.get("limit_px")), "num")
                  + _td(_fmt(od.get("trigger_px")), "num")
                  + _td(_fmt_dt(od.get("timestamp")), "num")
@@ -863,10 +897,10 @@ def _render_body(p: dict) -> str:
         err = str(od.get("error") or "")
         o.append("<tr>"
                  + _td(_fmt_dt(od.get("updated_at")), "num")
-                 + _td(_esc(od.get("symbol") or "—"))
+                 + _td(_esc(_disp(od.get("symbol")) or "—"))
                  + _td(_esc(_PURPOSE_TXT.get(str(od.get("purpose")), od.get("purpose") or "—")))
                  + _td(f"<span class='{st_cls}'>{_esc(_ORDER_ST_TXT.get(st, st))}</span>")
-                 + _td(_fmt(od.get("sz")), "num")
+                 + _td(_fmt_sz(od.get("sz")), "num")
                  + _td(_fmt(od.get("px")), "num")
                  + _td(_fmt(od.get("filled_sz")), "num")
                  + _td(_fmt(od.get("avg_px")), "num")
@@ -880,19 +914,20 @@ def _render_body(p: dict) -> str:
     o.append("<h2>最近成交</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>时间</th><th>币种</th><th>方向</th><th class='num'>数量</th>"
-             "<th class='num'>价格</th><th class='num'>手续费</th><th>对手</th>"
+             "<th class='num'>价格</th><th class='num'>手续费</th><th>方向</th>"
              "<th class='num'>平仓盈亏</th><th>减仓</th></tr></thead><tbody>")
-    for f in (_as_dict(x) for x in fills):
+    # 只渲染最近 50 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
+    for f in list(_as_dict(x) for x in fills)[:50]:
         cp_txt, cp_cls = _sign(f.get("closed_pnl"))
         d = str(f.get("dir") or "")
         o.append("<tr>"
                  + _td(_fmt_dt(f.get("ts")), "num")
                  + _td(_esc(f.get("coin") or "—"))
                  + _td("—" if f.get("side") is None else ("买" if _num(f.get("side"), 0) >= 0 else "卖"))
-                 + _td(_fmt(f.get("sz")), "num")
+                 + _td(_fmt_sz(f.get("sz")), "num")
                  + _td(_fmt(f.get("px")), "num")
                  + _td(_fmt(f.get("fee"), 4), "num")
-                 + _td({"a": "对手盘卖", "b": "对手盘买"}.get(d, _esc(d or "—")))
+                 + _td(_esc(_DIR_TXT.get(d, d or "—")))
                  + _td(cp_txt, f"num {cp_cls}".strip())
                  + _td("是" if f.get("reduce_only") else "—")
                  + "</tr>")
