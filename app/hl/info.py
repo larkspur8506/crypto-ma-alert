@@ -17,7 +17,7 @@ import os
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -113,19 +113,27 @@ class HlInfo:
         return {"agents": agents, "max_valid_until": max(untils) if untils else None}
 
     def open_orders(self, address: str) -> List[dict]:
-        """挂单列表 —— **必须用 frontendOpenOrders**。
+        """挂单列表（旧接口，只要列表）。需要「是否可信」请用 open_orders_checked。"""
+        return self.open_orders_checked(address)[0]
+
+    def open_orders_checked(self, address: str) -> Tuple[List[dict], bool]:
+        """返回 (挂单列表, 是否可信)。
 
         实测（2026-10-14）：`openOrders` 对触发单**不返回** `isTrigger` / `triggerPx`
-        （触发价只藏在 limitPx 里），于是「有仓 + 止损单在场」会被判成**裸奔** →
-        面板显示 ❌、看守误报、对账直接把 kill switch 拉起来。
+        （触发价只藏在 limitPx 里），于是「有仓 + 止损单在场」会被判成**裸奔** → 面板 ❌、
+        看守误报、对账拉 kill；若据此自动补挂/平仓，就会**误平仓**。
         `frontendOpenOrders`（UI 同款）才带 isTrigger/triggerPx/orderType/isPositionTpsl。
+
+        所以：回落 openOrders 时把列表标成**不可信**，调用方（对账）只提示、不动作。
         """
         try:
             data = self.post({"type": "frontendOpenOrders", "user": address})
-        except HlInfoError as e:                                     # 老接口兜底
-            logger.warning("[hl-info] frontendOpenOrders 不可用，回落 openOrders：%s", e)
+            return (data if isinstance(data, list) else []), True
+        except HlInfoError as e:                                     # 老接口兜底（不可信）
+            logger.warning("[hl-info] frontendOpenOrders 不可用，回落 openOrders"
+                           "（挂单列表标记为不可信，不做止损判断）：%s", e)
             data = self.post({"type": "openOrders", "user": address})
-        return data if isinstance(data, list) else []
+            return (data if isinstance(data, list) else []), False
 
     def user_fills(self, address: str) -> List[dict]:
         data = self.post({"type": "userFills", "user": address})
@@ -242,7 +250,8 @@ class HlInfo:
                 "funding_since_open": self._num((p.get("cumFunding") or {}).get("sinceOpen")) if isinstance(p.get("cumFunding"), dict) else 0.0,
             })
         orders: List[dict] = []
-        for o in self.open_orders(address):
+        orders_list, orders_trusted = self.open_orders_checked(address)
+        for o in orders_list:
             trig = o.get("triggerPx")
             orders.append({
                 "coin": o.get("coin"),
@@ -290,4 +299,6 @@ class HlInfo:
             "notional": self._num(ms.get("totalNtlPos")),
             "positions": positions,
             "open_orders": orders,
+            # 挂单列表是否可信（False = 回落老接口，读不到 isTrigger → 不得据此判断止损有无）
+            "orders_trusted": orders_trusted,
         }

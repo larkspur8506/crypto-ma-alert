@@ -807,3 +807,77 @@ class TestDeadmanOff(Base):
                                                       {"ok": True, "error": ""})
         self.executor(use_schedule_cancel=True).run()
         self.assertEqual(len(self.calls), 1)
+
+
+class TestStopProtection(Base):
+    """止损保护（用户拍板的验收点）：
+
+    - 读不到触发单（挂单接口回落）→ **只提示、绝不动作**（否则会误平仓）
+    - **确认**有仓没止损 → 先自动补挂原价；补不上就市价平掉（不允许无保护持仓）
+    """
+
+    def _open_position(self, clear_calls=True):
+        pid = self.add_signal()
+        self.executor().on_entry(pid)
+        if clear_calls:
+            self.ex.calls.clear()            # 只数「对账/修复」这一轮下的单
+        return pid
+
+    def test_untrusted_orders_never_acts(self):
+        pid = self._open_position()
+        snap = _snap(positions=[_pos("BTC")], orders=[])          # 读不到触发单
+        snap["orders_trusted"] = False
+        self.info._snap = snap
+        before = len(self.ex.calls)
+        alerts = self.executor().run(force_snapshot=True)
+        self.assertFalse(self.db.hl_kill(), "不可信读数不得拉 kill")
+        self.assertEqual(len(self.ex.calls), before, "不可信读数不得下任何单")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "open")
+        self.assertTrue(any("无法确认止损" in a for a in alerts))
+        self.assertTrue(any("无法确认止损" in e["message"] for e in self.events()))
+
+    def test_untrusted_notice_deduped_then_recovery_reported(self):
+        self._open_position()
+        snap = _snap(positions=[_pos("BTC")], orders=[])
+        snap["orders_trusted"] = False
+        self.info._snap = snap
+        n1 = len([a for a in self.executor().run(force_snapshot=True) if "无法确认止损" in a])
+        n2 = len([a for a in self.executor().run(force_snapshot=True) if "无法确认止损" in a])
+        self.assertEqual((n1, n2), (1, 0), "同一状态只喊一次")
+        self.info._snap = _snap(positions=[_pos("BTC")], orders=[_stop_order()])
+        alerts = self.executor().run(force_snapshot=True)
+        self.assertTrue(any("已恢复" in a for a in alerts), "恢复要报一次")
+
+    def test_confirmed_missing_stop_is_auto_repaired(self):
+        pid = self._open_position()
+        self.info._snap = _snap(positions=[_pos("BTC")], orders=[])   # 可信 + 确实没止损
+        self.executor().run(force_snapshot=True)
+        triggers = [c for c in self.ex.calls if c[0] == "order" and c[6] is not None]
+        self.assertEqual(len(triggers), 1, "应当补挂一张触发单")
+        self.assertTrue(triggers[0][5], "补挂必须是 reduce_only")
+        self.assertAlmostEqual(triggers[0][6], 80600.0, places=2)      # 用原止损价
+        self.assertIn("已自动补挂", " ".join(self.notifier.messages))
+        self.assertIn("已自动补挂", " ".join(e["message"] for e in self.events()))
+        self.assertTrue(self.db.hl_kill(), "异常已发生 → 暂停自动交易等人工核对")
+        self.assertTrue(self.db.position_by_id(pid)["hl_stop_oid"], "新单号要落库")
+
+    def test_repair_failure_closes_position(self):
+        pid = self._open_position()
+        self.ex.stop = {"ok": False, "status": STATUS_ERROR, "error": "trigger rejected",
+                        "oid": None, "avg_px": None, "filled_sz": None, "raw": None}
+        self.info._snap = _snap(positions=[_pos("BTC")], orders=[])
+        alerts = self.executor().run(force_snapshot=True)
+        closes = [c for c in self.ex.calls if c[0] == "order" and c[5] and c[6] is None]
+        self.assertGreaterEqual(len(closes), 1, "补挂失败 → 必须市价平掉，不留裸仓")
+        self.assertIn("补挂失败", " ".join(self.notifier.messages))
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "closed")
+
+    def test_repair_without_params_shouts_without_acting(self):
+        pid = self._open_position()
+        self.db.conn.execute("UPDATE positions SET stop_price=0 WHERE id=?", (pid,))
+        self.db.conn.commit()
+        self.info._snap = _snap(positions=[_pos("BTC")], orders=[])
+        before = len(self.ex.calls)
+        alerts = self.executor().run(force_snapshot=True)
+        self.assertEqual(len(self.ex.calls), before, "参数不全时不要瞎下单")
+        self.assertTrue(any("未能自动处理" in msg for msg in self.notifier.messages))

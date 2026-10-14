@@ -203,7 +203,12 @@ class Executor:
         if snap is None:
             return {"ok": False, "problems": ["读不到账户状态（info 失败）"], "unknown": True}
         ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
+        # 挂单列表可信才允许判断「止损有无」：回落老接口时读不到 isTrigger，会把有止损读成没止损，
+        # 据此自动补挂/平仓 = 误平仓。缺字段按可信（唯一生产来源 info.snapshot 会显式设置）。
+        trusted = bool(snap.get("orders_trusted", True))
         problems: List[str] = []
+        missing_stop: List[dict] = []
+        unconfirmed: List[str] = []
         local_open = [r for r in self.db.recent_positions(50)
                       if r["status"] == "open" and (r["hl_status"] or "") in ("open", "mismatch")]
         seen = set()
@@ -215,11 +220,78 @@ class Executor:
                 self.db.set_pos_hl(r["id"], hl_status="mismatch")
                 continue
             if not self._has_stop(snap, coin):
-                problems.append(f"{r['symbol']} 有仓但**没有止损挂单**")
+                if trusted:
+                    problems.append(f"{r['symbol']} 有仓但**没有止损挂单**")
+                    missing_stop.append(dict(r))
+                else:
+                    unconfirmed.append(f"{r['symbol']} 有仓但无法确认止损"
+                                       f"（挂单接口回落，读不到触发单）")
         for coin in ex_pos:
             if coin not in seen:
                 problems.append(f"交易所有 {coin} 仓位但本地无记录（人工单？）")
-        return {"ok": not problems, "problems": problems, "unknown": False}
+        return {"ok": not problems, "problems": problems, "unknown": False,
+                "missing_stop": missing_stop, "unconfirmed": unconfirmed}
+
+    def _repair_missing_stop(self, row: dict, snap: dict) -> None:
+        """**确认**有仓却没有止损挂单 → 先自动补挂原止损价；补不上就市价平掉。
+
+        与开仓路径同一口径：不允许无保护持仓存在。用独立 cloid（stop:fix）避免与原单撞号。
+        补挂成功也不解锁 kill —— 异常已经发生，由人工核对后决定是否恢复自动交易。
+        """
+        symbol = str(row.get("symbol"))
+        coin = self.coin(symbol)
+        bar_ms = int(row.get("signal_bar_ms") or 0)
+        side = int(row.get("side") or 1)
+        stop = float(row.get("stop_price") or 0.0)
+        sz = float(row.get("hl_sz") or 0.0)
+        if sz <= 0:                                   # 本地没记数量 → 以交易所为准
+            ex_pos = {p["coin"]: p for p in (snap.get("positions") or [])}
+            sz = abs(float((ex_pos.get(coin) or {}).get("size") or 0.0))
+        if stop <= 0 or sz <= 0:
+            self._event(EV_ERROR, f"{symbol} 止损丢失且参数不全（stop={stop} sz={sz}），未动作",
+                        symbol=symbol)
+            self._alert(f"【HL执行】🛑 {coin} 止损单丢失，但本地缺少止损价/数量，**未能自动处理**，"
+                        f"请立刻人工查看交易所持仓！")
+            return
+        try:
+            sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
+        except HlInfoError:
+            sz_dec = 5
+        px = hl_sizing.round_price(stop, sz_dec)
+        try:
+            res = self.ex.place_order(coin, side != 1, sz, px, reduce_only=True,
+                                      trigger_px=px,
+                                      cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_STOP + ":fix"))
+        except Exception as ex:                                     # noqa: BLE001
+            res = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
+        if res.get("ok") and res.get("status") in (STATUS_RESTING, STATUS_FILLED):
+            self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=res["status"],
+                                    oid=res.get("oid"), error=None)
+            self.db.set_pos_hl(int(row["id"]), hl_stop_oid=res.get("oid"))
+            self._event(EV_ORDER, f"{symbol} 止损丢失 → 已自动补挂 @ {px:,.2f}", symbol=symbol)
+            self._alert(f"【HL执行】🔧 {coin} 止损单丢失，已自动补挂（原价 {px:,.2f}，"
+                        f"新单号 {res.get('oid')}，{sz} {coin}）。自动交易已暂停（kill），"
+                        f"核对后可恢复。")
+            return
+        # 补挂失败 → 无保护持仓不允许存在 → 市价平掉
+        self._event(EV_ERROR, f"{symbol} 止损补挂失败（{res.get('error')}）→ 立即平仓",
+                    symbol=symbol, data={"place": res})
+        try:
+            limit_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+        except Exception as ex:                                     # noqa: BLE001
+            limit_px = float((snap.get("positions") or [{}])[0].get("mark_px") or px)
+            logger.warning("[hl-exec] 平仓限价计算失败（用标价）：%s", ex)
+        try:
+            close = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True)
+        except Exception as ex:                                     # noqa: BLE001
+            close = {"ok": False, "status": "error", "error": f"{type(ex).__name__}: {ex}"}
+        ok_close = bool(close.get("ok")) and close.get("status") in (STATUS_FILLED, STATUS_RESTING)
+        if ok_close:
+            self._close_local(int(row["id"]), float(close.get("avg_px") or limit_px),
+                              "stop_missing", sz)
+        self._alert(f"【HL执行】🛑 {coin} 止损单丢失且补挂失败（{res.get('error')}），"
+                    f"已{'市价平仓' if ok_close else '尝试平仓但结果异常'}（{close.get('status')}）。"
+                    f"**请立刻人工核对交易所**！")
 
     @staticmethod
     def _has_stop(snap: dict, coin: str) -> bool:
@@ -630,7 +702,23 @@ class Executor:
                 self.db.hl_set_kill(True, "对账异常")
                 self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
             alerts.append("【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems))
+            # 确认「有仓但没止损」→ 不允许无保护持仓存在：先补挂，补不上就市价平掉
+            for row in rec.get("missing_stop") or []:
+                self._repair_missing_stop(row, snap)
+        elif rec.get("unconfirmed"):
+            # 读不到触发单：只提示、绝不动作（否则会误平仓）；同一状态只喊一次
+            items = rec["unconfirmed"]
+            self.db.hl_log_event(EV_RECONCILE, "无法确认止损（挂单接口回落）：" + "；".join(items),
+                                 code_rev=self.p.code_rev)
+            if str(self.db.get_config_str("hl_stop_unconfirmed") or "") != "1":
+                self.db.set_config("hl_stop_unconfirmed", "1")
+                alerts.append("【HL执行】⚠️ 无法确认止损（挂单接口临时回落）：\n- "
+                              + "\n- ".join(items)
+                              + "\n未做任何动作。请看一眼面板/交易所；恢复后我会再报一次。")
         else:
+            if str(self.db.get_config_str("hl_stop_unconfirmed") or "") == "1":
+                self.db.set_config("hl_stop_unconfirmed", "0")
+                alerts.append("【HL执行】✅ 挂单接口已恢复，止损状态可正常确认")
             self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
 
         # 2) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
