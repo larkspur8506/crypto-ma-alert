@@ -22,11 +22,83 @@ from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, 
                     EV_DECISION, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
+from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_COIN_MAP = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+
+
+# ---------------------------------------------------------------- 推送文案（人类可读）
+
+def _fmt_u(x, nd: int = 2) -> str:
+    return f"{x:,.{nd}f}"
+
+
+def _side_word(side: int) -> str:
+    return "做多" if int(side or 1) >= 0 else "做空"
+
+
+def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: float,
+                    stop_dist: float, notional: float, margin: float, liq: float,
+                    risk_u: float, equity: float, signal_px: float, oid, stop_oid,
+                    when: "dt.datetime", tz_label: str) -> str:
+    """开仓回报：价格 / 数量 / 保证金 / 强平 / 风险 分行排，别糊成一坨。"""
+    drift = ((entry_px - signal_px) / signal_px * 100) if signal_px else 0.0
+    stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
+    return "\n".join([
+        f"【HL执行】✅ 已开仓 · {coin} {_side_word(side)} 5x 逐仓",
+        "",
+        f"成交价    {_fmt_u(entry_px)}",
+        f"数量      {sz:g} {coin}（名义 {_fmt_u(notional, 1)} U）",
+        f"止损价    {_fmt_u(stop)}（{stop_pct:+.2f}%）",
+        f"保证金    ≈{_fmt_u(margin, 1)} U",
+        f"强平价    {_fmt_u(liq)}",
+        f"风险      {_fmt_u(risk_u)} U（权益的 {risk_u / equity * 100:.1f}%）",
+        f"滑点      {drift:+.2f}%（信号价 {_fmt_u(signal_px)}）",
+        f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}",
+        f"单号      开仓 {oid} · 止损 {stop_oid}",
+    ])
+
+
+def fmt_exit_alert(coin: str, side: int, entry_px: float, exit_px: float, sz: float,
+                   reason: str, r_multiple: float, gross_pnl: float, fees: float,
+                   opened_at, when: "dt.datetime", tz_label: str) -> str:
+    """平仓回报：说清**为什么平**（止损/策略离场）+ 价格 + 盈亏（含手续费）。"""
+    net = gross_pnl - fees
+    if reason == "stop":
+        head, why = "🛑 止损离场", "止损单被触发"
+    elif reason == "ma20":
+        head = "📈 策略止盈" if net > 0 else ("📉 策略离场" if net < 0 else "➖ 策略离场")
+        why = "收盘跌破 SMA20" if int(side or 1) >= 0 else "收盘站上 SMA20"
+    else:
+        head, why = "已平仓", str(reason)
+    hold = ""
+    try:
+        mins = max(0, int((when.timestamp() - float(opened_at)) // 60))
+        if mins >= 1440:
+            d, h = mins // 1440, mins % 1440 // 60
+            hold = f"{d} 天" + (f" {h} 小时" if h else "")
+        elif mins >= 60:
+            h, m = mins // 60, mins % 60
+            hold = f"{h} 小时" + (f" {m} 分钟" if m else "")
+        else:
+            hold = f"{mins} 分钟"
+    except (TypeError, ValueError):
+        pass
+    lines = [
+        f"【HL执行】{head} · {coin} {_side_word(side)}",
+        "",
+        f"离场原因  {why}",
+        f"平仓价    {_fmt_u(exit_px)}（开仓 {_fmt_u(entry_px)}）",
+        f"本次盈亏  {net:+,.2f} U（{r_multiple:+.2f}R）",
+        f"盈亏构成  价差 {gross_pnl:+,.2f} U · 手续费 {_fmt_u(fees)} U",
+    ]
+    if hold:
+        lines.append(f"持仓时长  {hold}")
+    lines.append(f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -301,14 +373,12 @@ class Executor:
         self.db.confirm_position(position_id, avg_px, int(round(filled_sz)), stop, True)
         plan2 = hl_sizing.HlOrderPlan(**{**plan.__dict__, "entry_price": avg_px,
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
-        drift = (avg_px - mid) / mid if mid else 0.0
-        self._alert("\n".join([
-            f"【HL执行】{coin} 已开仓 {filled_sz} {coin} @ {avg_px:,.2f}",
-            f"止损触发价 {stop:,.2f}（{plan2.stop_dist * 100:.2f}%）｜风险 {plan2.risk_u:.1f}U"
-            f"（权益 {self.p.equity:,.0f}U 的 {plan2.risk_u / self.p.equity * 100:.2f}%）",
-            f"名义 {plan2.notional:,.0f}U｜保证金 ≈{plan2.margin:,.0f}U｜强平价 {plan2.liq_price:,.0f}",
-            f"滑点 {drift * 100:+.2f}%（信号价 {row['entry_price']:,.2f} → 成交 {avg_px:,.2f}）｜cloid 已固化",
-        ]))
+        self._alert(fmt_entry_alert(
+            coin=coin, side=side, sz=filled_sz, entry_px=avg_px, stop=stop,
+            stop_dist=plan2.stop_dist, notional=plan2.notional, margin=plan2.margin,
+            liq=plan2.liq_price, risk_u=plan2.risk_u, equity=self.p.equity,
+            signal_px=float(row["entry_price"] or avg_px), oid=res.get("oid"),
+            stop_oid=stop_res.get("oid"), when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL))
         self._event(EV_ORDER, f"{symbol} 开仓完成：{filled_sz} @ {avg_px:,.2f}，止损单已挂",
                     symbol=symbol, data={"risk_u": plan2.risk_u, "notional": plan2.notional})
         return True
@@ -391,7 +461,12 @@ class Executor:
                                 raw=str(res.get("raw"))[:2000])
         self._close_local(position_id, px, reason, sz)
         r = self._r_multiple(row, px)
-        self._alert(f"【HL执行】{coin} 已平仓 @ {px:,.2f}（{reason}）｜本次 {r:+.2f}R")
+        gross = (px - float(row["actual_entry"] or row["entry_price"])) * sz * (1 if side == 1 else -1)
+        fees = self._fees_since(coin, row["opened_at"])
+        self._alert(fmt_exit_alert(
+            coin=coin, side=side, entry_px=float(row["actual_entry"] or row["entry_price"]),
+            exit_px=px, sz=sz, reason=reason, r_multiple=r, gross_pnl=gross, fees=fees,
+            opened_at=row["opened_at"], when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL))
         self._event(EV_ORDER, f"{symbol} 平仓完成 @ {px:,.2f}（{reason}）", symbol=symbol,
                     data={"r": r})
         return True
@@ -402,6 +477,21 @@ class Executor:
             return float(v)
         except (TypeError, ValueError):
             return default
+
+    def _fees_since(self, coin: str, since_ts) -> float:
+        """该仓位开仓以来累计手续费（读本地 hl_fills；读不到就返回 0，不影响主流程）。"""
+        try:
+            since = float(since_ts or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        total = 0.0
+        for r in self.db.hl_recent_fills(200):
+            try:
+                if str(r["coin"]) == coin and float(r["ts"] or 0) >= since:
+                    total += float(r["fee"] or 0.0)
+            except (TypeError, ValueError, KeyError):
+                continue
+        return total
 
     def _sync_fills(self, limit: int = 100) -> int:
         """把交易所的成交同步进 hl_fills（按 tid 去重，幂等）。返回新增条数。"""

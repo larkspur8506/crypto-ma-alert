@@ -517,14 +517,14 @@ class TestAlertWording(Base):
     def test_entry_and_exit_alerts_use_coin_names(self):
         pid = self.add_signal()
         self.executor().on_entry(pid)
-        self.assertIn("BTC 已开仓", self.notifier.messages[0])
+        self.assertIn("已开仓 · BTC 做多", self.notifier.messages[0])
         self.assertNotIn("BTC_USDT", self.notifier.messages[0])
         self.ex.calls.clear()
         self.ex.exit = {"ok": True, "status": STATUS_FILLED, "oid": 55, "avg_px": 84500.0,
                         "filled_sz": 0.00833, "error": None, "raw": {}}
         self.info = FakeInfo(snap=_snap(positions=[_pos("BTC")], orders=[_stop_order()]))
         self.executor().on_exit(pid, "ma20", 84400.0)
-        self.assertIn("BTC 已平仓", self.notifier.messages[-1])
+        self.assertIn("BTC 做多", self.notifier.messages[-1])
         self.assertNotIn("BTC_USDT", self.notifier.messages[-1])
 
     def test_stop_failure_alert_uses_coin(self):
@@ -573,3 +573,62 @@ class TestFillSync(Base):
     def test_no_fills_is_noop(self):
         self.executor().run(force_snapshot=True)
         self.assertEqual(self.db.hl_recent_fills(10), [])
+
+
+class TestAlertFormat(Base):
+    """推送文案是给人看的：开仓要有价格/仓位/保证金/强平价，平仓要说清原因与盈亏。"""
+
+    def test_entry_alert_layout(self):
+        from app.hl.executor import fmt_entry_alert
+        import datetime as dt
+        txt = fmt_entry_alert(coin="BTC", side=1, sz=0.00095, entry_px=83545.0, stop=81456.0,
+                              stop_dist=0.025, notional=79.4, margin=15.9, liq=67720.0,
+                              risk_u=2.0, equity=100.0, signal_px=83544.5, oid=111, stop_oid=222,
+                              when=dt.datetime(2026, 10, 14, 13, 35), tz_label="北京时间")
+        for want in ("已开仓", "BTC 做多", "5x 逐仓", "成交价", "83,545.00", "数量", "0.00095 BTC",
+                     "止损价", "81,456.00", "-2.50%", "保证金", "强平价", "67,720.00",
+                     "风险", "2.00 U", "滑点", "时间", "单号"):
+            self.assertIn(want, txt, f"开仓推送缺 {want}")
+        self.assertLess(txt.index("成交价"), txt.index("止损价"))   # 顺序：价格在前
+
+    def test_entry_alert_short_stop_is_positive(self):
+        from app.hl.executor import fmt_entry_alert
+        import datetime as dt
+        txt = fmt_entry_alert(coin="ETH", side=-1, sz=0.01, entry_px=2500.0, stop=2600.0,
+                              stop_dist=0.04, notional=25.0, margin=5.0, liq=2900.0,
+                              risk_u=2.0, equity=100.0, signal_px=2500.0, oid=1, stop_oid=2,
+                              when=dt.datetime(2026, 10, 14, 13, 35), tz_label="北京时间")
+        self.assertIn("ETH 做空", txt)
+        self.assertIn("+4.00%", txt)          # 空单止损在上方
+
+    def test_exit_alert_says_why_and_pnl(self):
+        from app.hl.executor import fmt_exit_alert
+        import datetime as dt
+        now = dt.datetime(2026, 10, 14, 13, 35)
+        txt = fmt_exit_alert(coin="BTC", side=1, entry_px=83545.0, exit_px=81456.0, sz=0.00095,
+                             reason="stop", r_multiple=-0.998, gross_pnl=-1.98, fees=0.07,
+                             opened_at=now.timestamp() - 3600, when=now, tz_label="北京时间")
+        for want in ("止损离场", "止损单被触发", "平仓价", "81,456.00", "开仓 83,545.00",
+                     "本次盈亏", "-2.05 U", "-1.00R", "手续费", "持仓时长", "1 小时"):
+            self.assertIn(want, txt, f"平仓推送缺 {want}")
+
+    def test_exit_alert_profit_is_marked_as_tp(self):
+        from app.hl.executor import fmt_exit_alert
+        import datetime as dt
+        now = dt.datetime(2026, 10, 14, 13, 35)
+        txt = fmt_exit_alert(coin="BTC", side=1, entry_px=83545.0, exit_px=86000.0, sz=0.00095,
+                             reason="ma20", r_multiple=1.0, gross_pnl=2.33, fees=0.07,
+                             opened_at=now.timestamp() - 90, when=now, tz_label="北京时间")
+        self.assertIn("策略止盈", txt)
+        self.assertIn("收盘跌破 SMA20", txt)
+        self.assertIn("+2.26 U", txt)                     # 净盈亏已扣手续费
+        self.assertIn("1 分钟", txt)
+
+    def test_exit_alert_short_reason_wording(self):
+        from app.hl.executor import fmt_exit_alert
+        import datetime as dt
+        now = dt.datetime(2026, 10, 14, 13, 35)
+        txt = fmt_exit_alert(coin="ETH", side=-1, entry_px=2500.0, exit_px=2450.0, sz=0.01,
+                             reason="ma20", r_multiple=0.5, gross_pnl=0.5, fees=0.02,
+                             opened_at=now.timestamp(), when=now, tz_label="北京时间")
+        self.assertIn("收盘站上 SMA20", txt)              # 空单是站上
