@@ -90,9 +90,27 @@ class HlInfo:
         return self.post({"type": "spotClearinghouseState", "user": address}) or {}
 
     def agent_status(self, address: str) -> dict:
-        """UI 同款聚合接口里的 agent 授权信息（agentAddress / agentValidUntil）。"""
-        w = self.post({"type": "webData2", "user": address}) or {}
-        return {"agent_address": w.get("agentAddress"), "agent_valid_until": w.get("agentValidUntil")}
+        """agent（API 钱包）授权信息。
+
+        **必须以 `extraAgents` 为准**：`webData2.agentAddress` 只反映「主」agent，
+        在只配置了额外 agent 的账户上返回 None —— 用它核对会误报「没有授权」
+        （2026-10-14 真踩过：用户的 agent 叫 Hermes、180 天，webData2 说 None，extraAgents 列得清清楚楚）。
+
+        返回 {"agents": [{name,address,valid_until(ms)}], "max_valid_until": ms|None}。
+        """
+        agents: List[dict] = []
+        data = self.post({"type": "extraAgents", "user": address})
+        for a in (data or []):
+            if isinstance(a, dict):
+                agents.append({"name": a.get("name"), "address": a.get("address"),
+                               "valid_until": a.get("validUntil")})
+        if not agents:                                   # 兼容老账户：回落到 webData2
+            w = self.post({"type": "webData2", "user": address}) or {}
+            if w.get("agentAddress"):
+                agents.append({"name": None, "address": w.get("agentAddress"),
+                               "valid_until": w.get("agentValidUntil")})
+        untils = [a["valid_until"] for a in agents if a.get("valid_until")]
+        return {"agents": agents, "max_valid_until": max(untils) if untils else None}
 
     def open_orders(self, address: str) -> List[dict]:
         data = self.post({"type": "openOrders", "user": address})

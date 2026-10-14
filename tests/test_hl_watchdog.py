@@ -191,18 +191,23 @@ class TestAgentExpiry(Base):
 
     def test_warns_when_expiring_soon(self):
         self.db.hl_log_event("heartbeat", "ok")
-        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": (time.time() + 3600) * 1000}
+        self.info.agent_status = lambda addr: {"agents": [{"name": "Hermes", "address": "0xc1ee", "valid_until": (time.time() + 3600) * 1000}], "max_valid_until": (time.time() + 3600) * 1000}
         joined = " ".join(self.bad(self.checks()))
         self.assertIn("agent 授权只剩", joined)
 
     def test_quiet_when_far_from_expiry(self):
         self._heartbeat()
-        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": (time.time() + 30 * 86400) * 1000}
+        self.info.agent_status = lambda addr: {"agents": [{"name": "Hermes", "address": "0xc1ee", "valid_until": (time.time() + 30 * 86400) * 1000}], "max_valid_until": (time.time() + 30 * 86400) * 1000}
         self.assertEqual(self.bad(self.checks()), [])
+
+    def test_warns_when_no_agent_at_all(self):
+        self.db.hl_log_event("heartbeat", "ok")
+        self.info.agent_status = lambda addr: {"agents": [], "max_valid_until": None}
+        self.assertIn("没有任何 agent", " ".join(self.bad(self.checks())))
 
     def test_no_expiry_is_fine(self):
         self._heartbeat()
-        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": None}
+        self.info.agent_status = lambda addr: {"agents": [{"name": "Hermes", "address": "0xc1ee", "valid_until": None}], "max_valid_until": None}
         self.assertEqual(self.bad(self.checks()), [])
 
 

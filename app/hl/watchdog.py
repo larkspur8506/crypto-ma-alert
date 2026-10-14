@@ -143,16 +143,21 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     # 8) agent（API 钱包）授权到期 —— 到期后所有下单会被拒，必须提前发现
     try:
         ag = info.agent_status(address)
-        until = ag.get("agent_valid_until")
-        if until:
+        agents = ag.get("agents") or []
+        until = ag.get("max_valid_until")
+        if not agents:
+            add("⚠️ 账户没有任何 agent（API 钱包）授权 —— 下单会被拒，"
+                "请到 HL 设置里生成 API 钱包并绑定主账户")
+        elif until:
             days_left = (float(until) / 1000.0 - time.time()) / 86400.0
+            names = "、".join(str(a.get("name") or str(a.get("address"))[:10]) for a in agents[:3])
             if days_left <= AGENT_WARN_DAYS:
-                add(f"⚠️ agent 授权只剩 {days_left:.1f} 天（{str(ag.get('agent_address'))[:10]}…）"
+                add(f"⚠️ agent 授权只剩 {days_left:.1f} 天（{names}）"
                     f"—— 到期后自动交易会全部失败，请到 HL 设置里重新生成/延长 API 钱包")
             else:
-                add(f"agent 授权还有 {days_left:.0f} 天", ok=True)
+                add(f"agent 授权 {len(agents)} 个（{names}），最长还有 {days_left:.0f} 天", ok=True)
         else:
-            add("agent 授权无到期时间", ok=True)
+            add(f"agent 授权 {len(agents)} 个，均无到期时间", ok=True)
     except Exception as e:                                           # noqa: BLE001
         add(f"读不到 agent 授权状态：{e}")
     return notes

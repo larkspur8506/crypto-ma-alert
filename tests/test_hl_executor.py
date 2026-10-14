@@ -70,8 +70,9 @@ class FakeInfo:
         return {"balances": [{"coin": "USDC", "total": "100.79", "hold": "0.0"}]}
 
     def agent_status(self, address):
-        return {"agent_address": "0x3f7aaf0334c7ab4baaf36d6f5860389ce742d1f3",
-                "agent_valid_until": 1793162156561}
+        return {"agents": [{"name": "Hermes", "address": "0xc1ee4519ce893070c83cf90b324c6c8e5484be22",
+                            "valid_until": 1807505841495}],
+                "max_valid_until": 1807505841495}
 
 
 class FakeExchange:
