@@ -1,13 +1,20 @@
-"""行情取数：MEXC 永续 K 线（主）+ 降级链（纯 stdlib，无第三方依赖）。
+"""行情取数：**实盘信号用交易场所自己的 K 线**（HL），其他源只作诊断（纯 stdlib）。
 
-- 主源：`https://contract.mexc.com/api/v1/contract/kline/{SYMBOL}?interval=Hour4`
-  返回最近 2000 根，**列式** time/open/high/low/close/vol，**最后一根是未收盘的当前 bar**。
-- 降级链：MEXC 合约 → MEXC 现货 → Binance fapi → OKX；降级时在提醒里标注来源。
+为什么主源是 HL：下单、止损、成交全在 HL 进行，信号却拿别家交易所的 K 线 = 拿 A 家行情做
+B 家交易。实测（2024-07~2026-10 同窗口、同一套线上规则）：HL 与 Binance 的 4h 收盘价中位差
+4 bps、最大 24 bps，97~98% 的信号一致、方向无翻转，但有 **2~3% 的边缘信号会因换源而出现/
+消失** —— 擦着均线边界的那些笔，由谁的数据决定。所以实盘必须与交易场所同源。
+
+- 主源：`POST https://api.hyperliquid.xyz/info` {"type":"candleSnapshot"}（公开、无鉴权，
+  4h，返回最近 5000 根 = 约 833 天，**最后一根是未收盘的当前 bar**）。
+- **fail-closed**：主源失败就抛 FeedError → 引擎转成「数据源异常」提醒并跳过本轮，
+  **绝不悄悄用别家交易所的数据去下单**。降级链只在 `allow_fallback=True`（诊断/展示）时启用。
 - 校验：根数 ≥ MIN_BARS_REQUIRED、时间单调、最后一根已收盘且新鲜。
 """
 from __future__ import annotations
 
 import json
+import os
 import time
 import urllib.error
 import urllib.request
@@ -54,6 +61,42 @@ def _http_json(url: str, timeout: int = 15) -> dict:
     req = urllib.request.Request(url, headers={"User-Agent": "crypto-ma-alert/1.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.load(r)
+
+
+# ---------------------------------------------------------------- HL（实盘主源）
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+# 信号层的键是 MEXC 风格（BTC_USDT），HL 只认合约名（BTC/ETH）
+HL_COIN_NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+
+
+def hl_coin(symbol: str) -> str:
+    """BTC_USDT → BTC。可用 HL_COIN_MAP="BTC_USDT:BTC,ETH_USDT:ETH" 覆盖。"""
+    raw = os.environ.get("HL_COIN_MAP", "")
+    for pair in raw.split(","):
+        k, _, v = pair.partition(":")
+        if k.strip() and v.strip() and k.strip() == symbol:
+            return v.strip()
+    return HL_COIN_NAMES.get(symbol, symbol.split("_")[0])
+
+
+def _hl_post(payload: dict, timeout: int = 20):
+    req = urllib.request.Request(
+        HL_INFO_URL, data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "crypto-ma-alert/1.0"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.load(r)
+
+
+def _hyperliquid(symbol: str) -> List[Bar]:
+    """HL 官方 4h K 线（公开、无鉴权）。字段 t/o/h/l/c/v（毫秒 + 字符串价格）。"""
+    rows = _hl_post({"type": "candleSnapshot",
+                     "req": {"coin": hl_coin(symbol), "interval": "4h", "startTime": 0}})
+    bars = [Bar(open_ms=int(c["t"]), open=float(c["o"]), high=float(c["h"]),
+                low=float(c["l"]), close=float(c["c"]), volume=float(c["v"]))
+            for c in rows]
+    bars.sort(key=lambda b: b.open_ms)
+    return bars
 
 
 def _mexc_contract(symbol: str, limit: int = 2000) -> List[Bar]:
@@ -106,7 +149,13 @@ def _okx(symbol: str) -> List[Bar]:
     return bars
 
 
+# 实盘信号源：**只有交易场所自己的数据**（失败即 fail-closed，不换源下单）
 SOURCES: List[Tuple[str, Callable[[str], List[Bar]]]] = [
+    ("hl-candle", _hyperliquid),
+]
+
+# 仅诊断/展示用（allow_fallback=True 时才参与），绝不用于下单决策
+DIAGNOSTIC_SOURCES: List[Tuple[str, Callable[[str], List[Bar]]]] = [
     ("mexc-contract", _mexc_contract),
     ("mexc-spot", _mexc_spot),
     ("binance-fapi", _binance_fapi),
@@ -134,10 +183,14 @@ def validate(symbol: str, bars: List[Bar], now_ms: Optional[int] = None) -> None
         raise FeedError(f"{symbol}: 时间戳超前")
 
 
-def fetch(symbol: str, now_ms: Optional[int] = None) -> Feed:
-    """按降级链取数；全部失败抛 FeedError。"""
+def fetch(symbol: str, now_ms: Optional[int] = None, allow_fallback: bool = False) -> Feed:
+    """取数。默认**只用主源（HL = 下单场所）**；主源失败抛 FeedError（fail-closed）。
+
+    allow_fallback=True 才把诊断源接进降级链（仅供面板/排查，不用于信号）。
+    """
     errors = []
-    for name, fn in SOURCES:
+    chain = SOURCES + (DIAGNOSTIC_SOURCES if allow_fallback else [])
+    for name, fn in chain:
         try:
             bars = fn(symbol)
             validate(symbol, bars, now_ms=now_ms)

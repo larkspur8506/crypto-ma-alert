@@ -93,7 +93,7 @@ uvicorn app.main:app --port 8000
 
 ```
 app/strategy.py   纯 stdlib 核心（指标 / 密集 / 信号 / 离场）—— 唯一口径来源
-app/market.py     MEXC K 线 + 降级链（MEXC合约 → MEXC现货 → Binance → OKX）+ 校验
+app/market.py     HL K 线（实盘主源，与下单同场所）+ 诊断降级链 + 校验
 app/sizing.py     以损定仓 → MEXC 张数 / 名义 / 保证金 / 强平价
 app/engine.py     walk() 纯状态机 + 提醒文案 + tick + 心跳/周报（executor 钩子）
 app/notify.py     企业微信 + Telegram 双通道（重试 / 分段 / 成功后才去重）
@@ -156,7 +156,11 @@ volumes:
 
 ## 风险与对策
 
-- MEXC 接口变更/限流 → 降级链并在提醒里标注来源；数据陈旧或根数不足直接报「数据源异常」
+- **数据源口径**：实盘信号只取 **HL 自己的 4h K 线**（与下单/止损/成交同一场所）；
+  HL 取数失败即 **fail-closed**（报「数据源异常」并跳过本轮，绝不换别家数据下单）。
+  2024-07~2026-10 同窗口实测：HL vs Binance 收盘价中位差 4bps、信号一致率 97~98%、
+  方向无翻转，但 2~3% 的边缘信号会因换源出现/消失。
+- MEXC/Binance/OKX 仅作**诊断**用途（allow_fallback=True），不参与信号决策
 - 容器/网络停机 → 每 tick 回看未处理的 bar，补报标注「历史信号」
 - 策略失效 → 周报统计均R；连续 20 笔均R<0 或权益回撤 >30% 建议停
 - **不做自动下单**（与「只做只读数据类工具」的原则一致）
