@@ -201,7 +201,8 @@ class TestDryMode(Base):
     def test_dry_records_plan_only(self):
         pid = self.add_signal()
         ex = self.executor()
-        self.assertTrue(ex.on_entry(pid))
+        # dry 必须返回 False：人工提醒要照常发出（否则信号被吞、槽位被 pending 占住）
+        self.assertFalse(ex.on_entry(pid))
         rows = self.orders("entry")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["status"], "planned")
@@ -209,6 +210,26 @@ class TestDryMode(Base):
         self.assertEqual([c for c in self.ex.calls if c[0] == "order"], [])   # 没发单
         self.assertEqual(self.db.position_by_id(pid)["status"], "pending")
         self.assertTrue(any("dry" in e["message"] for e in self.events()))
+        # 影子提醒里要有可核对的数字（数量/止损/风险/名义）
+        shadow = self.notifier.messages[-1]
+        self.assertIn("HL影子", shadow)
+        self.assertIn("止损", shadow)
+        self.assertIn("风险", shadow)
+
+    def test_dry_never_closes_a_real_position(self):
+        """模式从 live 退回 dry 时，交易所还有真实仓位 → 不能替引擎关本地账。"""
+        pid = self.add_signal()
+        self.executor().on_entry(pid)          # dry 下建的是 pending 行
+        with self.db.conn:                     # 手工造一个「执行器开过的仓」
+            self.db.conn.execute("UPDATE positions SET hl_status='open', hl_sz=0.01,"
+                                 " status='open' WHERE id=?", (pid,))
+        self.ex.calls.clear()
+        ex = self.executor()
+        self.assertTrue(ex.on_exit(pid, "ma20", 84500.0))     # 接管，但不动本地状态
+        self.assertEqual(self.ex.calls, [])                   # 没发任何单
+        self.assertEqual(self.db.position_by_id(pid)["status"], "open")
+        self.assertIn("不是 live 模式", self.notifier.messages[-1])
+        self.assertIn("人工平仓", self.notifier.messages[-1])
 
 
 class TestEntryLive(Base):

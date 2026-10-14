@@ -234,8 +234,17 @@ class Executor:
                              symbol=symbol, data={"plan": plan.__dict__, "live": self.p.live},
                              code_rev=self.p.code_rev)
         if not self.p.live:
-            self._event(EV_DECISION, "dry 模式：只记录计划不下单", symbol=symbol)
-            return True
+            self._event(EV_DECISION, "dry 模式：只记录计划不下单（人工提醒照常发出）", symbol=symbol,
+                        data={"plan": plan.__dict__})
+            # 关键：dry 必须返回 False，让引擎照常发人工操作卡 ——
+            # 否则信号被静默吞掉，仓位停在 pending 占住该标的的槽，影子期反而没有可比对的人工动作。
+            self._alert("\n".join([
+                f"【HL影子】{symbol} 若为实盘会开仓 {plan.sz} {coin} @~{mid:,.1f}",
+                f"止损 {stop:,.1f}（{plan.stop_dist * 100:.2f}%）｜风险 {plan.risk_u:.1f}U｜"
+                f"名义 {plan.notional:,.0f}U｜杠杆 {plan.leverage:g}x",
+                "（dry 模式：未下任何单，下面的人工提醒照常）",
+            ]))
+            return False
 
         # 1) 逐仓杠杆
         lev = self.ex.update_leverage(coin, int(round(self.p.leverage)), cross=False)
@@ -334,7 +343,11 @@ class Executor:
             return True
 
         if not self.p.live:
-            self._event(EV_DECISION, f"dry 模式：记录离场 {symbol} {reason}", symbol=symbol)
+            # 真实仓位在交易所、执行器却不是 live：绝不能替引擎把本地关账（会造成本地/交易所不一致），
+            # 交给人工，并且必须喊出来。
+            self._event(EV_DECISION, f"dry 模式：不代平真实仓位 {symbol}（{reason}）", symbol=symbol)
+            self._alert(f"【HL执行】⚠️ {symbol} 触发离场（{reason}）但执行器不是 live 模式，"
+                        f"交易所仍有真实仓位 —— 请人工平仓并撤掉止损单")
             return True
 
         # 1) 先撤掉止损单（否则可能与新平仓单互相打架）

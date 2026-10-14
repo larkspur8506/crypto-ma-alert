@@ -154,7 +154,7 @@ class TestEntryHook(Base):
         self.assertEqual(len(sent), 1)
         self.assertIn("确认开仓", sent[0])
 
-    def test_executor_exception_does_not_break_tick(self):
+    def test_exception_from_executor_does_not_break_tick(self):
         ex = FakeExecutor(boom=True)
         evs, _ = self._entry_event()
         stub = self.walk_stub({"BTC_USDT": evs})
@@ -163,6 +163,30 @@ class TestEntryHook(Base):
         self.assertEqual(len(sent), 1)                   # 异常被吞，提醒照发
         row = self.db.position_by_id(ex.entries[0])
         self.assertEqual(row["status"], "pending")
+
+    def test_dry_mode_sends_shadow_alert_AND_manual_card(self):
+        """影子期的核心契约：既要记录「若实盘会怎么下」，又必须保留人工操作卡。"""
+        from app.hl import MODE_DRY
+        from app.hl.executor import ExecParams, Executor
+        from tests.test_hl_executor import FakeExchange, FakeInfo
+
+        p = ExecParams(mode=MODE_DRY, account_address="0xabc", private_key="", equity=1000.0)
+        ex = Executor(self.db, p, FakeInfo(), FakeExchange(dry_run=True), notifier=self.notifier)
+        evs, _ = self._entry_event()
+        stub = self.walk_stub({"BTC_USDT": evs})
+        with mock.patch.object(engine, "walk", side_effect=stub):
+            sent = engine.tick(self.db, self.cfg, self.notifier, executor=ex)
+
+        self.assertEqual(len(sent), 1, "人工操作卡必须照发（dry 不许吞信号）")
+        self.assertIn("确认开仓", sent[0])
+        self.assertTrue(any("HL影子" in m for m in self.notifier.messages),
+                        "应推送一条影子提醒，供逐条比对")
+        # 影子期不发任何真实委托，仓位仍停在 pending 等人工确认
+        self.assertEqual([c for c in ex.ex.calls if c[0] == "order"], [])
+        pid = self.db.recent_positions(1)[0]["id"]
+        self.assertEqual(self.db.position_by_id(pid)["status"], "pending")
+        planned = [r for r in self.db.hl_recent_orders(10) if r["status"] == "planned"]
+        self.assertEqual(len(planned), 1)
 
 
 class TestExitHook(Base):
