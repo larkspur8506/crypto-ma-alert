@@ -722,3 +722,31 @@ class TestDisplayNames(BaseCase):
         html = render_dashboard(self.payload())
         self.assertIn("HL 延迟", html)          # 说清是服务器→HL 的延迟
         self.assertIn("与你的浏览器到本站的延迟无关", html)
+
+
+class TestWithdrawableDisplay(BaseCase):
+    """统一账户下面板的「可提余额」不能直接显示永续口径的 0 —— 会被读成「没钱」。
+
+    实测（2026-10-14）：统一账户的钱在现货状态里，clearinghouseState.withdrawable 恒为 0，
+    而现货 USDC 才是真实可提（HL 提现固定扣 1U 手续费）。
+    """
+
+    def _html(self):
+        return self.client.get("/hl").text
+
+    def test_unified_shows_spot_balance_not_zero(self):
+        snap = dict(self.info._snap)
+        snap.update({"unified": True, "withdrawable": 0.0, "spot_usdc": 100.471124,
+                     "equity_total": 100.471124})
+        self.info._snap = snap
+        html = self._html()
+        self.assertIn("可提余额（现货口径", html)
+        self.assertIn("100.47", html)
+
+    def test_non_unified_keeps_perp_withdrawable(self):
+        snap = dict(self.info._snap)
+        snap.update({"unified": False, "withdrawable": 88.5})
+        self.info._snap = snap
+        html = self._html()
+        self.assertIn("可提余额", html)
+        self.assertIn("88.50", html)

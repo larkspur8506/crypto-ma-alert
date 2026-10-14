@@ -735,7 +735,14 @@ def _render_body(p: dict) -> str:
         # 统一账户：钱在现货状态里，永续口径恒为 0 —— 说清楚，免得以为「没资金」
         o.append(_kv("　现货 USDC（抵押品）", f"{_fmt(acc.get('spot_usdc'))} U", "muted"))
         o.append(_kv("　永续账户口径", f"{_fmt(acc.get('perp_equity'))} U", "muted"))
-    o.append(_kv("可提余额", f"{_fmt(acc.get('withdrawable'))} U"))
+    wd = _num(acc.get("withdrawable"))
+    if acc.get("unified") and wd <= 0:
+        # 统一账户下永续口径的 withdrawable 恒为 0（钱在现货状态里）→ 直接显示 0 会误导成「没钱」。
+        # 真实可提 = 现货 USDC；HL 提现固定收 1 USDC 手续费（与金额无关）。
+        o.append(_kv("可提余额（现货口径，提现固定扣 1U）",
+                     f"{_fmt(_num(acc.get('spot_usdc')))} U"))
+    else:
+        o.append(_kv("可提余额", f"{_fmt(wd)} U"))
     o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
     o.append(_kv("持仓名义", f"{_fmt(acc.get('notional'))} U"))
     o.append(_kv("浮盈浮亏", unreal_txt, unreal_cls))
