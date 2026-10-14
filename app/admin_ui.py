@@ -100,13 +100,16 @@ class AdminDeps:
             self.hl_log_event = getattr(self.db, "hl_log_event", None)
 
     # ---- 便捷封装（缺方法 / 抛异常都不让面板炸掉） ----
-    def put(self, key: str, value: Any) -> None:
+    def put(self, key: str, value: Any) -> Optional[str]:
+        """写配置；失败返回错误文案（调用方带回页面显示），成功返回 None。"""
         if self.set_config is None:
-            return
+            return "DB 不可用（set_config 缺失）"
         try:
             self.set_config(key, value)
+            return None
         except Exception as e:                                    # noqa: BLE001
             logger.error("[admin] 写配置 %s 失败：%s", key, e)
+            return f"{key}: {type(e).__name__}: {e}"
 
     def get_all(self) -> Dict[str, Any]:
         if self.get_config is None:
@@ -833,7 +836,10 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # Cookie 必须设在返回的 response 上：Starlette 在函数返回新 Response 时会丢弃
         # 注入的 response 上写的头（所以这里不能用依赖注入的 response）。
         if k:
-            resp.set_cookie("cma_admin", token, httponly=True, max_age=30 * 86400)
+            https_ = request.url.scheme == "https" or \
+                str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+            resp.set_cookie("cma_admin", token, httponly=True, max_age=30 * 86400,
+                            secure=https_, samesite="lax")
         return resp
 
     # ---------------- 参数 ----------------
@@ -856,8 +862,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         })
         if errs:
             raise HTTPException(400, "参数校验失败：" + "；".join(errs))
-        for key, val in values.items():
-            deps.put(key, val)
+        put_errs = [err for err in (deps.put(key, val) for key, val in values.items()) if err]
+        if put_errs:
+            raise HTTPException(400, "保存失败（其余字段可能已写入）：" + "；".join(put_errs))
         deps.log_event("decision",
                        f"面板修改参数（{', '.join(f'{k}={v:g}' if isinstance(v, float) else f'{k}={v}'
                                                   for k, v in sorted(values.items()))}）")
@@ -881,7 +888,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 missing.append("HL_PRIVATE_KEY")
             if missing:
                 raise HTTPException(400, "未配置 " + " / ".join(missing) + "，不能进 live")
-        deps.put("hl_exec_mode", m)
+        err = deps.put("hl_exec_mode", m)
+        if err:
+            raise HTTPException(400, f"模式切换保存失败：{err}（面板显示的仍是旧模式）")
         deps.log_event("decision", f"面板切换执行器模式 → {m}")
         if m != "live":
             if deps.hl_set_kill is not None:
@@ -900,8 +909,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         raw_vals = {"heartbeat_push": heartbeat_push, "report_push": report_push,
                     "fill_push": fill_push}
         vals = {key: _flag(val) for key, val in raw_vals.items()}
-        for key, val in vals.items():
-            deps.put(key, val)
+        put_errs = [e for e in (deps.put(key, val) for key, val in vals.items()) if e]
+        if put_errs:
+            raise HTTPException(400, "开关保存失败：" + "；".join(put_errs))
         deps.log_event("decision",
                        "面板修改推送开关：" + "，".join(
                            f"{key}={'开' if val else '关'}" for key, val in vals.items()))

@@ -644,6 +644,12 @@ class Executor:
         eff = math.floor(live / 10.0) * 10.0
         if self.p.equity_min and eff < self.p.equity_min:
             eff = float(self.p.equity_min)
+            if eff > live:
+                # equity_min 配置超过真实权益 → 单笔风险被放大（live/eff 倍）。只记事件提醒，
+                # 不阻断（用户拍板过「不加上限」，但配错下限值得被看见）。
+                self._event(EV_DECISION,
+                            f"equity_min={eff:g}U 高于实时权益 {live:.2f}U —— 生效基数被抬高，"
+                            f"实际单笔风险约为目标的 {eff / live:.2f} 倍，请核对配置")
         self._note_equity_change(base, eff)
         return eff
 
@@ -785,11 +791,15 @@ class Executor:
         # 2) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
         day0 = _today_start_ts()
         base = self.db.hl_snapshots(since_ts=day0, limit=1)
+        spot_ok = bool(snap.get("spot_ok", True)) if snap else False
         if base and not self.db.hl_kill():
             # 统一账户下 snap["equity"]（永续口径）恒为 0 → 必须用账户总值，否则熔断永不触发
             start_eq = float(base[0]["equity"] or 0.0)
             now_eq = float(snap.get("equity_total", snap.get("equity")) or 0.0)
-            if start_eq > 0 and (now_eq - start_eq) / start_eq <= -self.p.max_daily_loss_pct:
+            # 现货读取失败时 equity_total 只剩浮盈 —— 数据不可信，宁可跳过也不误熔断
+            if not spot_ok:
+                logger.warning("[hl-exec] 现货余额读取失败，本轮跳过亏损熔断判断（数据不可信）")
+            elif start_eq > 0 and (now_eq - start_eq) / start_eq <= -self.p.max_daily_loss_pct:
                 self.db.hl_set_kill(True, "当日亏损熔断")
                 self._event(EV_KILL, f"当日亏损 {((now_eq - start_eq) / start_eq) * 100:.1f}% → kill",
                             data={"start_equity": start_eq, "equity": now_eq})

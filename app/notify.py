@@ -93,8 +93,10 @@ class WeChatNotifier:
                     if json.loads(body).get("errcode", 0) == 0:
                         return True
                     last = f"errcode: {body[:120]}"
-                except Exception:                                     # noqa: BLE001
-                    return True          # 非 JSON 响应按成功处理（兼容代理）
+                except Exception as e:                                  # noqa: BLE001
+                    last = f"非 JSON 响应: {str(e)[:80]} | {body[:120]}"
+                    # 旧版把非 JSON 一律当成功（代理错误页会被记 sent=1，重试机会丢失）；
+                    # 企业微信正常响应必是 JSON，非 JSON 视为失败进入重试。
             else:
                 last = body
             if attempt < SEND_ATTEMPTS:

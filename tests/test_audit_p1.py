@@ -173,8 +173,10 @@ class TestCreatePositionIdempotent(P1Base):
 
     def test_duplicate_insert_returns_real_id(self):
         pid1 = self.add_signal(bar_ms=1000)
-        # 同连接上先往别的表插一行（制造 lastrowid 残留）
-        self.db.log_alert("BTC_USDT", None, "data_error", "x", True)
+        # 同连接上先往别的表插行（制造 lastrowid 残留）。插 3 条确保残留 id ≠ pid1
+        # （旧测试只插 1 条、alert_logs 空表 id 恰好等于 pid1，bug 没被抓住）。
+        for i in range(3):
+            self.db.log_alert("BTC_USDT", None, f"data_error_{i}", "x", True)
         pid2 = self.add_signal(bar_ms=1000)          # 同 symbol+bar → IGNORE
         self.assertEqual(pid1, pid2, "重复插入必须返回真实行 id")
         self.assertIsNotNone(self.db.position_by_id(pid2))

@@ -676,12 +676,18 @@ class TestFullAppWiring(unittest.TestCase):
             self.assertNotIn("crypto-ma-alert 管理面板", r.text)
 
     def test_health_still_reports_hl_mode(self):
+        # 无 k 的 /health 不再暴露 hl_mode/hl_kill（公网站点）；带 k 才给
         mod = self._mod()
+        tok = mod.config.admin_token
         with TestClient(mod.app) as c:
             j = c.get("/health").json()
             self.assertEqual(j["status"], "ok")
-            self.assertIn("hl_mode", j)
-            self.assertIn("hl_kill", j)
+            self.assertNotIn("hl_mode", j)
+            self.assertNotIn("hl_kill", j)
+            j2 = c.get(f"/health?k={tok}").json()
+            self.assertEqual(j2["status"], "ok")
+            self.assertIn("hl_mode", j2)
+            self.assertIn("hl_kill", j2)
 
 
 if __name__ == "__main__":

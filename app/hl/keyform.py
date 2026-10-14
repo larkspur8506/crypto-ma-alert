@@ -19,6 +19,7 @@ import hashlib
 import hmac
 import logging
 import os
+from html import escape as _html_escape
 import re
 import secrets
 import shutil
@@ -191,7 +192,7 @@ def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool 
                 f"<div class='muted'>令牌有效：约 {mins} 分钟 · 提交一次即作废 · 私钥只写入服务器上的 env 文件，"
                 "不进数据库、不进日志</div>"
                 "<form method='post' autocomplete='off'>"
-                f"<input type='hidden' name='t' value='{token}'>"
+                f"<input type='hidden' name='t' value='{_html_escape(str(token), quote=True)}'>"
                 "<label>代理钱包（API wallet）私钥</label>"
                 "<input type='password' name='key' autocomplete='off' spellcheck='false' "
                 "placeholder='0x…（64 位 hex）' required>"
