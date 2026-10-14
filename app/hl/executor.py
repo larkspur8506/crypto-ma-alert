@@ -285,7 +285,7 @@ class Executor:
             close = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True)
         except Exception as ex:                                     # noqa: BLE001
             close = {"ok": False, "status": "error", "error": f"{type(ex).__name__}: {ex}"}
-        ok_close = bool(close.get("ok")) and close.get("status") in (STATUS_FILLED, STATUS_RESTING)
+        ok_close = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
         if ok_close:
             self._close_local(int(row["id"]), float(close.get("avg_px") or limit_px),
                               "stop_missing", sz)
@@ -454,10 +454,18 @@ class Executor:
         if not stop_res["ok"] or stop_res["status"] not in (STATUS_RESTING, STATUS_FILLED):
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=ST_FAILED,
                                     error=str(stop_res.get("error"))[:300])
-            # 没有保护的仓位不允许存在 → 立刻平掉
-            close = self.ex.place_order(coin, side != 1, filled_sz, limit_px, reduce_only=True)
-            msg = (f"【HL执行】⚠️ {coin} 止损单挂失败（{stop_res['error']}），已立即平仓"
-                   f"（平仓结果：{close['status']}）。本次未持仓，请人工核对。")
+            # 没有保护的仓位不允许存在 → 立刻平掉。
+            # 平仓限价必须按**平仓方向**算滑点（side != 1），不能用上面开仓方向的 limit_px
+            try:
+                close_px = hl_sizing.round_price(
+                    self.ex.slippage_limit(coin, side != 1, mid), sz_decimals)
+            except Exception:                                        # noqa: BLE001
+                close_px = limit_px
+            close = self.ex.place_order(coin, side != 1, filled_sz, close_px, reduce_only=True)
+            closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+            msg = (f"【HL执行】⚠️ {coin} 止损单挂失败（{stop_res['error']}），"
+                   + ("已立即平仓" if closed_ok else f"平仓未确认（{close.get('status')}）——仓位可能仍在交易所")
+                   + "。本次未持仓，请人工核对。")
             self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_res['error']}",
                         symbol=symbol, data={"close": close})
             self.db.set_pos_hl(position_id, hl_status="aborted")
@@ -507,10 +515,20 @@ class Executor:
         snap = self._snapshot(force=True)
         ex_pos = {p["coin"]: p for p in (snap or {}).get("positions") or []}
         # 止损已由交易所触发（stop 事件）→ 用真实成交价关账，不发平仓单
-        if reason == "stop" and coin not in ex_pos:
+        if reason == "stop" and snap is not None and coin not in ex_pos:
             px, fills = self._last_fill_px(coin)
             self._close_local(position_id, px or ref_price, "stop", sz)
-            self._alert(f"【HL执行】{coin} 止损已由交易所触发 @ {px or ref_price:,.2f}，本地已关账")
+            r = self._r_multiple(row, px or ref_price)
+            self._alert(f"【HL执行】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
+                        f"止损单已由交易所触发 @ {px or ref_price:,.2f}，本地已关账（R {r:+.2f}）")
+            return True
+        if reason == "stop" and snap is None:
+            # 快照读不到 ≠ 仓位没了。不能按参考价关账 —— 万一仓位还在（且止损单也丢了），
+            # 本地关账后就没人管它了。只提醒，留给下一轮/人工。
+            self._event(EV_ERROR, f"{symbol} 止损事件但快照不可读，未关账（下一轮再核对）",
+                        symbol=symbol)
+            self._alert(f"【HL执行】⚠️ {coin} 判定止损离场，但账户快照读取失败，"
+                        f"本地暂未关账 —— 请人工核对交易所。")
             return True
 
         if not self.p.live:
@@ -526,7 +544,9 @@ class Executor:
         if so is not None and so["oid"]:
             self.ex.cancel(coin, int(so["oid"]))
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status="cancelled")
-        # 2) 平仓（reduce-only IOC）
+        # 2) 平仓（reduce-only IOC）。限价必须按**平仓方向**算滑点
+        #    （买入平空 = mid×(1+s)，卖出平多 = mid×(1−s)；用开仓方向的限价会让
+        #     卖单拿到比 mid 高的最低可接受价 → 滑点保护完全失效）。
         if sz <= 0:
             sz = abs(float(ex_pos.get(coin, {}).get("size") or 0.0))
         if sz <= 0:
@@ -554,6 +574,26 @@ class Executor:
             self._alert(f"【HL执行】⚠️ {coin} 平仓失败：{res['error']}\n"
                         f"（止损单已撤！请立即人工平仓或手动挂回止损）")
             return True
+        if res["status"] != STATUS_FILLED:
+            # IOC 挂出未成（resting）≠ 已平仓。绝不能按限价关账 —— 交易所仓位还在，
+            # 而止损单已被撤掉。处理：撤掉这张挂单、**立即挂回原止损**（保护仓位）、
+            # 拉人工提醒；不关本地账，让下一轮 on_exit / 对账继续跟进。
+            self.ex.cancel(coin, int(res.get("oid") or 0))
+            self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FAILED,
+                                    error="平仓 IOC 未成交（已撤单并挂回止损）")
+            re_stop = self.ex.place_order(
+                coin, side != 1, sz, hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec),
+                reduce_only=True, trigger_px=hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec),
+                cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_STOP))
+            self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损（{re_stop.get('status')}）",
+                        symbol=symbol)
+            self._alert(f"【HL执行】⚠️ {coin} 平仓单未成交（已撤）。"
+                        f"止损单已重新挂回（结果 {re_stop.get('status')}）。请人工核对并处理。")
+            return True
+        if res.get("filled_sz") is not None and float(res["filled_sz"] or 0) + 1e-12 < sz:
+            # 部分成交：按实际成交量关账；剩余仓位仍受原止损保护（撤单未发生或已被补挂）
+            self._event(EV_ORDER, f"{symbol} 平仓部分成交 {res.get('filled_sz')}/{sz}", symbol=symbol)
+            sz = float(res["filled_sz"])
         px = float(res["avg_px"] or limit_px)
         self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FILLED,
                                 oid=res.get("oid"), filled_sz=res.get("filled_sz"), avg_px=px,
@@ -666,7 +706,10 @@ class Executor:
         self.db.set_pos_hl(position_id, hl_status="closed")
 
     def _last_fill_px(self, coin: str) -> Tuple[Optional[float], List[dict]]:
-        """从交易所成交里取最近一笔该 coin 的平仓价（用于止损已触发的关账）。"""
+        """从交易所成交里取最近一笔该 coin 的**平仓**成交价（用于止损已触发的关账）。
+
+        必须过滤 dir 含 "Close" —— 否则同标的重开后会取到开仓价当平仓价，R 值全错。
+        """
         try:
             fills = self.info.user_fills(self.p.account_address) or []
         except HlInfoError:
@@ -674,8 +717,10 @@ class Executor:
         mine = [f for f in fills if f.get("coin") == coin]
         if not mine:
             return None, []
+        closing = [f for f in mine if "Close" in str(f.get("dir") or "")]
+        source = closing or mine          # 没有平仓成交时退回全量（供调用方诊断）
         px = None
-        for f in mine[:8]:
+        for f in source[:8]:
             try:
                 px = float(f.get("px"))
             except (TypeError, ValueError):

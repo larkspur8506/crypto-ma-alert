@@ -175,8 +175,33 @@ def _job_tick() -> None:
         sent = engine.tick(db, current_config(), notifier, executor=build_executor())
         if sent:
             logger.info("tick 发送 %d 条提醒", len(sent))
+        _retry_failed_alerts()
     except Exception as e:                                    # noqa: BLE001
         logger.exception("tick 异常: %s", e)
+
+
+def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
+    """补推近 24h 内发送失败的提醒（最多 limit 条/轮）。
+
+    背景：_emit 失败不标记幂等，但 set_last_bar 已推进 —— 旧行为下那条 entry/exit
+    提醒永久丢失（离场提醒丢 = 闷亏）。这里按 alert_logs 里的失败记录补推，成功后
+    更新 sent_successfully（下次不再推）。
+    """
+    try:
+        import time as _time
+        rows = db.failed_alerts_since(_time.time() - max_age_h * 3600)
+        retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
+                                                              "weekly", "weekly_local")]
+        for r in retry[:limit]:
+            text = r["message"] or ""
+            if not text:
+                continue
+            ok = bool(notifier and notifier.send_message(text))
+            if ok:
+                db.mark_alert_sent(int(r["id"]))
+                logger.info("补推失败提醒成功：id=%s kind=%s", r["id"], r["kind"])
+    except Exception as e:                                    # noqa: BLE001
+        logger.exception("补推失败提醒异常: %s", e)
 
 
 def _job_hl_monitor() -> None:

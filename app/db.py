@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -128,11 +130,24 @@ def now() -> float:
     return time.time()
 
 
+def _locked(fn):
+    """DB 方法级锁：单连接被多线程共享，必须串行化（RLock 支持同线程嵌套调用）。"""
+    @wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return fn(self, *args, **kwargs)
+    return wrapper
+
+
 class DB:
     def __init__(self, path: str):
         self.path = path
         os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        self.conn = sqlite3.connect(path, check_same_thread=False)
+        # 单连接被 scheduler 线程 + FastAPI 线程池共享：无锁并发会静默丢数据
+        # （实测 600 次复合操作 83 次 InterfaceError/OperationalError、75 条丢失）。
+        # 用 RLock 把所有访问串行化；RLock 允许同线程嵌套（方法互调）。
+        self._lock = threading.RLock()
+        self.conn = sqlite3.connect(path, check_same_thread=False, timeout=30)
         self.conn.row_factory = sqlite3.Row
         self.conn.executescript(SCHEMA)
         self._migrate()
@@ -160,9 +175,11 @@ class DB:
                 logger.info("[db] 迁移：positions 新增 %s 列", name)
 
     # ---------------- configuration
+    @_locked
     def get_config(self) -> Dict[str, str]:
         return {r["key"]: r["value"] for r in self.conn.execute("SELECT key, value FROM configuration")}
 
+    @_locked
     def get_config_str(self, key: str, default: str = "") -> str:
         """读一个配置值并做 JSON 解码（set_config 用 json.dumps 存，中文会被转义）。"""
         raw = self.get_config().get(key)
@@ -174,6 +191,7 @@ class DB:
             return str(raw)
         return default if val is None else str(val)
 
+    @_locked
     def set_config(self, key: str, value: Any) -> None:
         self.conn.execute(
             "INSERT INTO configuration(key, value, updated_at) VALUES(?,?,?) "
@@ -182,10 +200,12 @@ class DB:
         self.conn.commit()
 
     # ---------------- bar state
+    @_locked
     def get_last_bar(self, symbol: str) -> Optional[int]:
         r = self.conn.execute("SELECT last_bar_ms FROM bar_state WHERE symbol=?", (symbol,)).fetchone()
         return int(r["last_bar_ms"]) if r else None
 
+    @_locked
     def set_last_bar(self, symbol: str, bar_ms: int) -> None:
         self.conn.execute(
             "INSERT INTO bar_state(symbol, last_bar_ms, updated_at) VALUES(?,?,?) "
@@ -194,11 +214,13 @@ class DB:
         self.conn.commit()
 
     # ---------------- positions
+    @_locked
     def open_position(self, symbol: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM positions WHERE symbol=? AND status IN ('pending','open') "
             "ORDER BY signal_bar_ms DESC LIMIT 1", (symbol,)).fetchone()
 
+    @_locked
     def create_position(self, **kw) -> int:
         cols = ("symbol, signal_bar_ms, status, side, entry_price, stop_price, stop_dist, contracts, "
                 "coin_qty, notional, risk_u, created_at, equity_at_entry")
@@ -210,9 +232,11 @@ class DB:
         self.conn.commit()
         return cur.lastrowid
 
+    @_locked
     def position_by_id(self, pid: int) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM positions WHERE id=?", (pid,)).fetchone()
 
+    @_locked
     def confirm_position(self, pid: int, actual_entry: float, actual_contracts: int,
                          actual_stop: float, stop_placed: bool) -> None:
         self.conn.execute(
@@ -221,6 +245,7 @@ class DB:
             (actual_entry, actual_contracts, actual_stop, 1 if stop_placed else 0, now(), pid))
         self.conn.commit()
 
+    @_locked
     def update_fill(self, pid: int, actual_entry: float, actual_contracts: int,
                     actual_stop: float, stop_placed: bool) -> None:
         """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。"""
@@ -239,10 +264,12 @@ class DB:
         self.conn.execute(f"UPDATE positions SET {sets} WHERE id=?", vals)
         self.conn.commit()
 
+    @_locked
     def ignore_position(self, pid: int) -> None:
         self.conn.execute("UPDATE positions SET status='ignored', closed_at=? WHERE id=?", (now(), pid))
         self.conn.commit()
 
+    @_locked
     def close_position(self, pid: int, exit_price: float, exit_reason: str, auto: bool = False) -> None:
         """关闭仓位。auto=True 表示引擎按参考价自动关（exit_price 只是参考，用户可覆盖）。"""
         p = self.position_by_id(pid)
@@ -260,21 +287,25 @@ class DB:
             (exit_price, exit_reason, r, 1 if auto else 0, now(), pid))
         self.conn.commit()
 
+    @_locked
     def recent_positions(self, limit: int = 20) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM positions ORDER BY id DESC LIMIT ?", (limit,)))
 
+    @_locked
     def closed_positions(self, since: float = 0.0) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM positions WHERE status='closed' AND closed_at>=? ORDER BY closed_at", (since,)))
 
     # ---------------- alert logs（幂等 + 成功后标记）
+    @_locked
     def was_alerted(self, symbol: Optional[str], bar_ms: Optional[int], kind: str) -> bool:
         r = self.conn.execute(
             "SELECT 1 FROM alert_logs WHERE symbol IS ? AND bar_ms IS ? AND kind=? AND sent_successfully=1",
             (symbol, bar_ms, kind)).fetchone()
         return bool(r)
 
+    @_locked
     def log_alert(self, symbol: Optional[str], bar_ms: Optional[int], kind: str, message: str,
                   success: bool) -> None:
         self.conn.execute(
@@ -285,15 +316,25 @@ class DB:
             (symbol, bar_ms, kind, message, 1 if success else 0, now(), now() if success else None))
         self.conn.commit()
 
+    @_locked
     def recent_alerts(self, limit: int = 20) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM alert_logs ORDER BY id DESC LIMIT ?", (limit,)))
 
+    @_locked
     def failed_alerts_since(self, since: float) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM alert_logs WHERE sent_successfully=0 AND created_at>=? ORDER BY id DESC", (since,)))
 
+    @_locked
+    def mark_alert_sent(self, aid: int) -> None:
+        """补推成功后标记（供 _retry_failed_alerts 用）。"""
+        self.conn.execute("UPDATE alert_logs SET sent_successfully=1, sent_at=? WHERE id=?",
+                          (now(), aid))
+        self.conn.commit()
+
     # ---------------- feed health
+    @_locked
     def mark_feed(self, symbol: str, source: str, ok: bool, error: str = "") -> None:
         if ok:
             self.conn.execute(
@@ -307,10 +348,12 @@ class DB:
                 (symbol, error, now()))
         self.conn.commit()
 
+    @_locked
     def feed_status(self) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM feed_health ORDER BY symbol"))
 
     # ---------------- HL 执行器（feat/hl-executor）
+    @_locked
     def hl_record_intent(self, symbol: str, coin: str, bar_ms: int, purpose: str, side: int,
                          sz: float, px: Optional[float] = None, reduce_only: bool = False,
                          cloid: Optional[str] = None, status: str = "intent") -> int:
@@ -326,11 +369,13 @@ class DB:
         row = self.hl_order(symbol, bar_ms, purpose)
         return int(row["id"]) if row else 0
 
+    @_locked
     def hl_order(self, symbol: str, bar_ms: int, purpose: str) -> Optional[sqlite3.Row]:
         return self.conn.execute(
             "SELECT * FROM hl_orders WHERE symbol=? AND bar_ms=? AND purpose=?",
             (symbol, bar_ms, purpose)).fetchone()
 
+    @_locked
     def hl_update_order(self, symbol: str, bar_ms: int, purpose: str, **kw) -> None:
         allowed = ("status", "oid", "filled_sz", "avg_px", "fee", "error", "raw", "px", "sz")
         sets, vals = [], []
@@ -347,15 +392,18 @@ class DB:
                           "WHERE symbol=? AND bar_ms=? AND purpose=?", vals)
         self.conn.commit()
 
+    @_locked
     def hl_recent_orders(self, limit: int = 30) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM hl_orders ORDER BY id DESC LIMIT ?", (limit,)))
 
+    @_locked
     def hl_stuck_orders(self, older_than_s: float = 180.0) -> List[sqlite3.Row]:
         """长时间停在 intent/sent 的单 = 可能已发出但结果未知（崩溃/超时），需人工或对账处理。"""
         return list(self.conn.execute(
             "SELECT * FROM hl_orders WHERE status IN ('intent','sent') AND created_at < ?"
             " ORDER BY id DESC", (now() - older_than_s,)))
 
+    @_locked
     def hl_upsert_fill(self, **kw) -> None:
         """落一笔成交（按交易所 tid 去重）。"""
         self.conn.execute(
@@ -367,13 +415,16 @@ class DB:
              kw.get("ts"), now()))
         self.conn.commit()
 
+    @_locked
     def hl_recent_fills(self, limit: int = 30) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM hl_fills ORDER BY id DESC LIMIT ?", (limit,)))
 
+    @_locked
     def hl_fills_since(self, since_ts: float) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM hl_fills WHERE created_at >= ? ORDER BY id", (since_ts,)))
 
+    @_locked
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "") -> None:
         self.conn.execute(
@@ -382,12 +433,14 @@ class DB:
              code_rev, now()))
         self.conn.commit()
 
+    @_locked
     def hl_recent_events(self, limit: int = 30, kind: Optional[str] = None) -> List[sqlite3.Row]:
         if kind:
             return list(self.conn.execute(
                 "SELECT * FROM hl_events WHERE kind=? ORDER BY id DESC LIMIT ?", (kind, limit)))
         return list(self.conn.execute("SELECT * FROM hl_events ORDER BY id DESC LIMIT ?", (limit,)))
 
+    @_locked
     def hl_last_event_at(self, kind: Optional[str] = None) -> Optional[float]:
         if kind:
             r = self.conn.execute("SELECT max(created_at) AS t FROM hl_events WHERE kind=?", (kind,)).fetchone()
@@ -395,6 +448,7 @@ class DB:
             r = self.conn.execute("SELECT max(created_at) AS t FROM hl_events").fetchone()
         return float(r["t"]) if r and r["t"] else None
 
+    @_locked
     def hl_add_snapshot(self, snap: Dict[str, Any]) -> None:
         positions = snap.get("positions") or []
         upnl = sum(float(p.get("unrealized_pnl") or 0.0) for p in positions)
@@ -409,13 +463,16 @@ class DB:
              json.dumps(positions, ensure_ascii=False), now()))
         self.conn.commit()
 
+    @_locked
     def hl_snapshots(self, since_ts: float = 0.0, limit: int = 4000) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM hl_snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT ?", (since_ts, limit)))
 
+    @_locked
     def hl_latest_snapshot(self) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
 
+    @_locked
     def set_pos_hl(self, pid: int, **kw) -> None:
         allowed = ("hl_status", "hl_entry_oid", "hl_stop_oid", "hl_sz")
         sets, vals = [], []
@@ -430,9 +487,11 @@ class DB:
         self.conn.commit()
 
     # ---------------- kill switch（存 configuration 表，DB 优先）
+    @_locked
     def hl_kill(self) -> bool:
         return str(self.get_config().get("hl_exec_kill", "0")).strip() in ("1", "true", "True")
 
+    @_locked
     def hl_set_kill(self, on: bool, reason: str = "") -> None:
         self.set_config("hl_exec_kill", 1 if on else 0)
         if reason:
