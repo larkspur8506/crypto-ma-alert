@@ -104,7 +104,10 @@ class TestKeyformSuccessPage(unittest.TestCase):
 class TestMainRedirectQuotes(unittest.TestCase):
     def test_k_quoted(self):
         import re
-        src = open("/opt/data/cache/scratch/crypto-ma-alert/app/main.py", encoding="utf-8").read()
+        # 不 import app.main（模块级就建 DB，CI 里 /app 不可写）；直接读源文件
+        p = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "app", "main.py")
+        src = open(p, encoding="utf-8").read()
         bad = re.findall(r'RedirectResponse\(f"/admin\?tab=\w+&k=\{k\}"', src)
         self.assertEqual(bad, [], "main.py 重定向里的 k= 必须 urlencode")
 
