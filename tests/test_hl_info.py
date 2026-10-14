@@ -154,7 +154,7 @@ class TestSnapshot(unittest.TestCase):
         self.assertAlmostEqual(snap["positions"][0]["mark_px"], 84000.0)
         self.assertEqual(len(f.calls), 3)
         self.assertEqual([c["type"] for c in f.calls],
-                         ["clearinghouseState", "openOrders", "spotClearinghouseState"])
+                         ["clearinghouseState", "frontendOpenOrders", "spotClearinghouseState"])
 
     def test_empty_response(self):
         info = _info([{}])
@@ -173,7 +173,7 @@ class TestEndpoints(unittest.TestCase):
         info.user_funding_history("0x1", 1)
         info.candles("BTC", "4h", 1, 2)
         info.funding_history("BTC", 1)
-        want_types = ["openOrders", "userFills", "userFillsByTime", "userFunding",
+        want_types = ["frontendOpenOrders", "userFills", "userFillsByTime", "userFunding",
                       "candleSnapshot", "fundingHistory"]
         got = [c["type"] for c in f.calls]
         self.assertEqual(got, want_types)
@@ -224,7 +224,7 @@ class TestUnifiedAccount(unittest.TestCase):
         snap = info.snapshot("0xabc", mids={})
         self.assertEqual(snap["equity_total"], 250.0)
         self.assertEqual(snap["spot_usdc"], 0.0)
-        self.assertEqual([c["type"] for c in f.calls], ["clearinghouseState", "openOrders"])
+        self.assertEqual([c["type"] for c in f.calls], ["clearinghouseState", "frontendOpenOrders"])
 
     def test_spot_read_failure_does_not_break_snapshot(self):
         f = _FakeOpener([self.STATE, [], OSError("spot down"), OSError("spot down"), OSError("spot down")])
@@ -232,6 +232,61 @@ class TestUnifiedAccount(unittest.TestCase):
         snap = info.snapshot("0xabc", mids={})
         self.assertEqual(snap["equity_total"], 0.0)      # 读不到就按 0，不抛异常、不影响持仓读取
         self.assertEqual(snap["positions"], [])
+
+
+class TestRealOrderPayloads(unittest.TestCase):
+    """用交易所**真实返回**（2026-10-14 探针抓下来的）做回归：触发止损单必须被认出来。
+
+    坑：`openOrders` 对触发单不返回 isTrigger/triggerPx（触发价只在 limitPx 里），
+    只读它会把「有仓 + 已挂止损」判成裸奔 → 面板 ❌ / 看守误报 / 对账直接拉 kill switch。
+    """
+
+    REAL_FRONTEND_STOP = {"coin": "BTC", "side": "A", "limitPx": "81843.0", "sz": "0.00014",
+                          "oid": 573830864866, "timestamp": 1791955204194, "origSz": "0.00014",
+                          "triggerCondition": "Price below 81843", "isTrigger": True,
+                          "triggerPx": "81843.0", "children": [], "isPositionTpsl": False,
+                          "reduceOnly": True, "orderType": "Stop Market", "tif": None,
+                          "cloid": "0xcebaa2b0b8a3b809a14741eeb6cbcf4b"}
+    REAL_LEGACY_OPEN = {"coin": "BTC", "side": "A", "limitPx": "81843.0", "sz": "0.00014",
+                        "oid": 573830864866, "timestamp": 1791955204194, "origSz": "0.00014",
+                        "reduceOnly": True, "cloid": "0xcebaa2b0b8a3b809a14741eeb6cbcf4b"}
+
+    def _snap(self, order, fallback=False):
+        state = {"marginSummary": {"accountValue": "0.0"}, "withdrawable": "0.0", "assetPositions": []}
+        script = [state, [order], {"balances": []}]
+        if fallback:                     # frontendOpenOrders 失败 → 回落 openOrders
+            script = [state, OSError("frontend down"), [order], {"balances": []}]
+        f = _FakeOpener(script)
+        info = HlInfo(base_url="https://api.test", opener=f, unified=True,
+                      retries=1 if fallback else 3, backoff=(0, 0, 0))
+        return info.snapshot("0xabc", mids={}), f
+
+    def test_trigger_stop_detected_as_has_stop(self):
+        snap, f = self._snap(self.REAL_FRONTEND_STOP)
+        self.assertEqual(f.calls[1]["type"], "frontendOpenOrders")
+        o = snap["open_orders"][0]
+        self.assertTrue(o["is_trigger"])
+        self.assertTrue(o["reduce_only"])
+        self.assertAlmostEqual(o["trigger_px"], 81843.0)
+        self.assertEqual(o["order_type"], "Stop Market")
+        has_stop = any(x["coin"] == "BTC" and x["reduce_only"] and x["is_trigger"]
+                       for x in snap["open_orders"])
+        self.assertTrue(has_stop, "真实止损单必须被判成 has_stop")
+
+    def test_non_trigger_limit_order_is_not_has_stop(self):
+        snap, _ = self._snap(dict(self.REAL_FRONTEND_STOP, isTrigger=False, triggerPx=None,
+                                  orderType="Limit", reduceOnly=False))
+        has_stop = any(x["coin"] == "BTC" and x["reduce_only"] and x["is_trigger"]
+                       for x in snap["open_orders"])
+        self.assertFalse(has_stop)
+
+    def test_fallback_to_open_orders_keeps_known_gap(self):
+        """回落老接口时 isTrigger 缺失（已知差异）：此时 has_stop 会是 False ——
+        所以只在 frontendOpenOrders 真的不可用时才会走到这里，且会打 WARNING。"""
+        snap, f = self._snap(self.REAL_LEGACY_OPEN, fallback=True)
+        self.assertEqual([c["type"] for c in f.calls],
+                         ["clearinghouseState", "frontendOpenOrders", "openOrders", "spotClearinghouseState"])
+        self.assertFalse(snap["open_orders"][0]["is_trigger"])
 
 
 if __name__ == "__main__":

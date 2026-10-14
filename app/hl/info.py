@@ -113,7 +113,18 @@ class HlInfo:
         return {"agents": agents, "max_valid_until": max(untils) if untils else None}
 
     def open_orders(self, address: str) -> List[dict]:
-        data = self.post({"type": "openOrders", "user": address})
+        """挂单列表 —— **必须用 frontendOpenOrders**。
+
+        实测（2026-10-14）：`openOrders` 对触发单**不返回** `isTrigger` / `triggerPx`
+        （触发价只藏在 limitPx 里），于是「有仓 + 止损单在场」会被判成**裸奔** →
+        面板显示 ❌、看守误报、对账直接把 kill switch 拉起来。
+        `frontendOpenOrders`（UI 同款）才带 isTrigger/triggerPx/orderType/isPositionTpsl。
+        """
+        try:
+            data = self.post({"type": "frontendOpenOrders", "user": address})
+        except HlInfoError as e:                                     # 老接口兜底
+            logger.warning("[hl-info] frontendOpenOrders 不可用，回落 openOrders：%s", e)
+            data = self.post({"type": "openOrders", "user": address})
         return data if isinstance(data, list) else []
 
     def user_fills(self, address: str) -> List[dict]:
@@ -242,6 +253,8 @@ class HlInfo:
                 "reduce_only": bool(o.get("reduceOnly")),
                 "trigger_px": self._num(trig) if trig is not None else 0.0,
                 "is_trigger": bool(o.get("isTrigger")),
+                "order_type": o.get("orderType"),
+                "is_position_tpsl": bool(o.get("isPositionTpsl")),
                 "timestamp": o.get("timestamp"),
             })
         # 统一账户（HL 新账户默认）：余额在**现货**状态里，永续 accountValue 恒为 0。
