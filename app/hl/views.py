@@ -371,9 +371,10 @@ def status_payload(deps: DashboardDeps) -> dict:
             stop_dist_pct = 0.0
 
         try:
-            side = int(d.get("side")) if d.get("side") not in (None, "") else (1 if size >= 0 else -1)
+            side = int(d.get("side")) if d.get("side") not in (None, "") else 1
         except (TypeError, ValueError):
-            side = 1 if size >= 0 else -1
+            side = 1
+        # 注：size 是绝对值，不能用来推方向（旧兜底恒返回 1）；方向以快照 side 为准。
 
         positions_out.append({
             "coin": coin,
@@ -766,8 +767,8 @@ def _render_body(p: dict) -> str:
     o.append(_kv("浮盈浮亏", unreal_txt, unreal_cls))
     o.append(_kv("今日已实现", today_txt, today_cls))
     o.append(_kv("累计已实现", total_txt, total_cls))
-    o.append(_kv("资金费率累计", fund_txt, fund_cls))
-    o.append(_kv("累计手续费", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
+    o.append(_kv("资金费率（持仓期内）", fund_txt, fund_cls))
+    o.append(_kv("净手续费（正=收费）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
     o.append("</div></div>")
 
     # ---------------- 权益曲线 ----------------
@@ -887,7 +888,7 @@ def _render_body(p: dict) -> str:
         o.append("<tr>"
                  + _td(_fmt_dt(f.get("ts")), "num")
                  + _td(_esc(f.get("coin") or "—"))
-                 + _td("买" if _num(f.get("side"), 0) >= 0 else "卖")
+                 + _td("—" if f.get("side") is None else ("买" if _num(f.get("side"), 0) >= 0 else "卖"))
                  + _td(_fmt(f.get("sz")), "num")
                  + _td(_fmt(f.get("px")), "num")
                  + _td(_fmt(f.get("fee"), 4), "num")

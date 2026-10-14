@@ -69,8 +69,9 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         add("执行器从未写过心跳（检查调度器/execute 钩子）")
     else:
         age = time.time() - last
-        add(f"执行器心跳 {age / 60:.1f} 分钟前", ok=age <= HEARTBEAT_MAX_S)
-        if age > HEARTBEAT_MAX_S:
+        if age <= HEARTBEAT_MAX_S:
+            add(f"执行器心跳 {age / 60:.1f} 分钟前", ok=True)
+        else:
             add(f"执行器心跳超期 {age / 60:.1f} 分钟（应 ≤15 分钟）")
 
     # 2) kill switch
@@ -106,7 +107,7 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         has_stop = any(o.get("coin") == p["coin"] and o.get("reduce_only") and o.get("is_trigger")
                        for o in snap.get("open_orders") or [])
         if not has_stop:
-            add(f"⚠️ {p['coin']} 有仓位但没有止损挂单（裸奔仓位，请立刻处理）")
+            add(f"{p['coin']} 有仓位但没有止损挂单（裸奔仓位，请立刻处理）")
         else:
             add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损单在场", ok=True)
     for r in db.recent_positions(20):
@@ -191,7 +192,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     if bad:
         print("⚠️ HL 执行器看守告警")
         for p in bad:
-            print("•", p.lstrip("⚠️ "))
+            body = p[len("⚠️ "):] if p.startswith("⚠️ ") else p
+            print("•", body)
     return 0
 
 

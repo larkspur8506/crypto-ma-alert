@@ -69,14 +69,42 @@ HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 HL_COIN_NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
 
 
-def hl_coin(symbol: str) -> str:
-    """BTC_USDT → BTC。可用 HL_COIN_MAP="BTC_USDT:BTC,ETH_USDT:ETH" 覆盖。"""
-    raw = os.environ.get("HL_COIN_MAP", "")
+def _coin_map() -> dict:
+    """解析 HL_COIN_MAP：兼容 "BTC_USDT:BTC,ETH_USDT:ETH" 与 JSON 两种格式
+    （main.py 用 json.loads、这里用逗号格式 —— 两处口径必须一致，否则信号层与
+    执行器会对同一个 symbol 解析出不同的 coin）。"""
+    raw = os.environ.get("HL_COIN_MAP", "").strip()
+    if not raw:
+        return {}
+    m: dict = {}
+    if raw.startswith("{"):
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                return {str(k).strip(): str(v).strip() for k, v in data.items() if str(v).strip()}
+        except (ValueError, TypeError):
+            pass
     for pair in raw.split(","):
         k, _, v = pair.partition(":")
-        if k.strip() and v.strip() and k.strip() == symbol:
-            return v.strip()
-    return HL_COIN_NAMES.get(symbol, symbol.split("_")[0])
+        if k.strip() and v.strip():
+            m[k.strip()] = v.strip()
+    return m
+
+
+def hl_coin(symbol: str, strict: bool = False) -> str:
+    """BTC_USDT → BTC。可用 HL_COIN_MAP 覆盖（格式见 _coin_map）。
+
+    strict=True（信号路径）：未知 symbol 抛 FeedError —— 静默取 symbol 前缀
+    会让 BTC_USD 这类拼写错误拿到 BTC 的数据、在错误的标的上算信号。
+    """
+    m = _coin_map()
+    if symbol in m:
+        return m[symbol]
+    if symbol in HL_COIN_NAMES:
+        return HL_COIN_NAMES[symbol]
+    if strict:
+        raise FeedError(f"{symbol}: 未知的 symbol（不在 HL_COIN_NAMES / HL_COIN_MAP）")
+    return symbol.split("_")[0]
 
 
 def _hl_post(payload: dict, timeout: int = 20):
@@ -91,7 +119,7 @@ def _hl_post(payload: dict, timeout: int = 20):
 def _hyperliquid(symbol: str) -> List[Bar]:
     """HL 官方 4h K 线（公开、无鉴权）。字段 t/o/h/l/c/v（毫秒 + 字符串价格）。"""
     rows = _hl_post({"type": "candleSnapshot",
-                     "req": {"coin": hl_coin(symbol), "interval": "4h", "startTime": 0}})
+                     "req": {"coin": hl_coin(symbol, strict=True), "interval": "4h", "startTime": 0}})
     bars = [Bar(open_ms=int(c["t"]), open=float(c["o"]), high=float(c["h"]),
                 low=float(c["l"]), close=float(c["c"]), volume=float(c["v"]))
             for c in rows]

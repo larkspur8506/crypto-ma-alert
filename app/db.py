@@ -230,7 +230,15 @@ class DB:
         cur = self.conn.execute(
             f"INSERT OR IGNORE INTO positions({cols}) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", vals)
         self.conn.commit()
-        return cur.lastrowid
+        if cur.rowcount == 0:
+            # INSERT OR IGNORE 被 UNIQUE(symbol, signal_bar_ms) 忽略时，lastrowid
+            # 残留同连接上一次成功 INSERT 的 id（可能是别的表）——直接返回会拿到
+            # 跨表的陈旧 id（确认链接 404 / on_entry 操作错仓）。必须回查真实行。
+            row = self.conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND signal_bar_ms=?",
+                (kw["symbol"], kw["signal_bar_ms"])).fetchone()
+            return int(row["id"]) if row is not None else 0
+        return int(cur.lastrowid) if cur.lastrowid is not None else 0
 
     @_locked
     def position_by_id(self, pid: int) -> Optional[sqlite3.Row]:
@@ -489,7 +497,10 @@ class DB:
     # ---------------- kill switch（存 configuration 表，DB 优先）
     @_locked
     def hl_kill(self) -> bool:
-        return str(self.get_config().get("hl_exec_kill", "0")).strip() in ("1", "true", "True")
+        # 走 get_config_str（json.loads 解引号）+ 完整真值集合。旧版直接读原始 JSON
+        # 文本不剥引号 —— 手工把 "1" 写进 DB 会被读成「未触发」，kill 失效比误触发危险。
+        raw = str(self.get_config_str("hl_exec_kill", "0") or "0").strip().strip('"').strip("'").lower()
+        return raw in ("1", "true", "yes", "on")
 
     @_locked
     def hl_set_kill(self, on: bool, reason: str = "") -> None:

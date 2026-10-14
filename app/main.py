@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -221,11 +222,27 @@ def _job_heartbeat() -> None:
     if cfg.heartbeat_push:
         ok = bool(notifier and notifier.send_message(text))
         db.log_alert(None, None, "heartbeat", text, ok)
-        return
-    # 静默信标：只落库不推送（每日巡检已把同样信息汇总给用户）。
-    # kind='heartbeat_local' 仅供 cma_watch.py / cma_status.py 判断调度器存活。
-    db.log_alert(None, None, "heartbeat_local", text, True)
-    logger.info("心跳（未推送，仅落库）:\n%s", text)
+    else:
+        # 静默信标：只落库不推送（每日巡检已把同样信息汇总给用户）。
+        # kind='heartbeat_local' 仅供 cma_watch.py / cma_status.py 判断调度器存活。
+        db.log_alert(None, None, "heartbeat_local", text, True)
+        logger.info("心跳（未推送，仅落库）:\n%s", text)
+    _prune_alert_logs()
+
+
+def _prune_alert_logs(keep_days: float = 60.0, keep_rows: int = 5000) -> None:
+    """alert_logs 里 bar_ms=NULL 的行（心跳/周报/数据错误）不受 UNIQUE 幂等约束，
+    会无限增长 —— 每天清一次超期的，保留最近 keep_rows 行兜底。失败只记日志。"""
+    try:
+        cutoff = time.time() - keep_days * 86400
+        with db.conn:
+            db.conn.execute(
+                "DELETE FROM alert_logs WHERE bar_ms IS NULL AND created_at < ?", (cutoff,))
+            db.conn.execute(
+                "DELETE FROM alert_logs WHERE id < (SELECT MIN(id) FROM "
+                "(SELECT id FROM alert_logs ORDER BY id DESC LIMIT ?))", (keep_rows,))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("alert_logs 清理失败（忽略）：%s", e)
 
 
 def _job_weekly() -> None:
@@ -275,10 +292,15 @@ def _require_admin(request: Request, k: Optional[str] = None) -> None:
 
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "symbols": config.symbols,
-            "scheduler": bool(scheduler), "dry_run": config.dry_run,
-            "hl_mode": hl_mode(), "hl_kill": db.hl_kill()}
+def health(k: Optional[str] = None):
+    # 基本字段公开（看守/巡检脚本只读 status+scheduler）；带 ?k= 才给 hl_mode/hl_kill
+    # （站点是公网的，无 token 不该暴露执行模式与熔断状态）。
+    payload: Dict[str, Any] = {"status": "ok", "symbols": config.symbols,
+                               "scheduler": bool(scheduler), "dry_run": config.dry_run}
+    if k and config.admin_token and k == config.admin_token:
+        payload["hl_mode"] = hl_mode()
+        payload["hl_kill"] = db.hl_kill()
+    return payload
 
 
 @app.get("/")
@@ -297,7 +319,11 @@ def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> N
     if supplied != token:
         raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
     if k:
-        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400)
+        # Secure 只在 https（含反代 X-Forwarded-Proto）时加：本地 http 调试不受影响
+        https_ = request.url.scheme == "https" or \
+            str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400,
+                            secure=https_, samesite="lax")
 
 
 def _hl_deps():
