@@ -309,10 +309,11 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
                      ("stop_min", stop_min), ("stop_max", stop_max)]:
         try:
-            float(val)
+            num = float(val)
         except ValueError:
             raise HTTPException(400, f"{key} 不是数字")
-        db.set_config(key, val)
+        # 存成 JSON 数字（不是字符串），避免 json.dumps 加引号让 apply_db 解析失败
+        db.set_config(key, num)
     # 复选框：勾选=1，未勾选=不传 → 0
     db.set_config("enable_long", 1 if enable_long else 0)
     db.set_config("enable_shorts", 1 if enable_shorts else 0)

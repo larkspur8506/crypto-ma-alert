@@ -82,7 +82,9 @@ class Config:
         for k in self.OVERRIDABLE:
             if k not in values or values[k] in (None, ""):
                 continue
-            raw = str(values[k]).strip().lower()
+            # 去掉 JSON 引号：set_config 走 json.dumps，字符串值会存成 '"100"'，
+            # 不剥引号 float() 会抛错 → 被 except 静默吞掉 → 面板改的数字参数永远不生效。
+            raw = str(values[k]).strip().strip('"').strip("'").lower()
             cur = getattr(self, k, None)
             try:
                 if isinstance(cur, bool):
