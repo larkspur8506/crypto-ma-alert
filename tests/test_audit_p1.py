@@ -85,10 +85,12 @@ class TestExitResting(P1Base):
         self.info._snap = _snap(positions=[_pos("BTC")], orders=[_stop_order()])
         self.assertTrue(self.executor().on_exit(pid, "ma20", 84400.0))
         row = self.db.position_by_id(pid)
-        self.assertEqual(row["status"], "closed")
-        # 成交回报里的数量 = 实际成交量
-        self.assertTrue(any("部分成交" in e["message"] for e in
-                            (dict(r) for r in self.db.hl_recent_events(50, kind="order"))))
+        # 审计三轮 P1-H3：部分成交后原止损已被撤 → 剩余量必须重挂止损、
+        # 本地保持 open（下一轮继续离场），不再整行关账
+        self.assertEqual(row["status"], "open")
+        stops = [c for c in self.ex.calls if c[0] == "order" and c[6] is not None]
+        self.assertTrue(stops, "剩余量应重挂止损单")
+        self.assertTrue(any("部分成交" in m for m in self.notifier.messages))
 
 
 class TestUrgentCloseSlippage(P1Base):

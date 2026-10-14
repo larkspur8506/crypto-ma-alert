@@ -662,7 +662,11 @@ class TestEffectiveEquity(Base):
     def test_follow_respects_lower_bound_only(self):
         ex = self._ex(equity_mode="follow", equity_min=20.0)
         self.assertEqual(ex.effective_equity({"equity_total": 5.0}), 20.0)     # 低于下限 → 抬到下限
-        self.assertEqual(ex.effective_equity({"equity_total": 0.0}), ex.p.equity)  # 读到 0 → 回落配置
+        # 审计三轮 P1-H1：读到 0/不可信不再回落配置 equity（会把 100U 账户放大成
+        # 1000U 定仓）—— 同样 fail-closed 回落 equity_min
+        self.assertEqual(ex.effective_equity({"equity_total": 0.0}), 20.0)
+        # 现货读取失败（统一账户 spot_ok=False）→ equity_total 不可信 → 回落 equity_min
+        self.assertEqual(ex.effective_equity({"equity_total": 90.0, "spot_ok": False}), 20.0)
 
     def test_fixed_mode_ignores_live(self):
         ex = self._ex(equity_mode="fixed", equity=100.0)
