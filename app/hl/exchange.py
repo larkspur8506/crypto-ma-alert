@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from typing import Any, Dict, Optional
 
@@ -35,6 +36,20 @@ def make_cloid(symbol: str, bar_ms: int, purpose: str) -> str:
     """确定性 cloid（0x + 32 hex）—— 同一 (symbol, bar_ms, purpose) 恒定。"""
     h = hashlib.sha256(f"cma:{symbol}:{bar_ms}:{purpose}".encode()).hexdigest()[:32]
     return "0x" + h
+
+
+def _coerce_cloid(cloid):
+    """SDK 只接受 `Cloid` 对象（内部调 to_raw()），传裸字符串会炸在 SDK 深处
+    （冒烟实测：'str' object has no attribute 'to_raw'）。这里统一转换，
+    并**把两套推导口径统一到 make_cloid** —— 否则 DB 里记的 cloid 与交易所收到的
+    不是同一个值（幂等键对不上，排查/去重都会失效）。"""
+    if cloid is None or hasattr(cloid, "to_raw"):
+        return cloid
+    txt = str(cloid).strip()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{32}", txt):
+        raise ValueError(f"cloid 格式非法（需 0x + 32 位 hex）：{txt[:14]}…")
+    from hyperliquid.utils.types import Cloid
+    return Cloid.from_str(txt)
 
 
 def _err(msg: str, raw: Any = None, status: str = STATUS_ERROR) -> dict:
@@ -137,11 +152,8 @@ class HlExchange:
         return self._init_error
 
     def _cloid(self, symbol: str, bar_ms: int, purpose: str):
-        if self._cloid_cls is None:
-            from hyperliquid.utils.types import Cloid
-            self._cloid_cls = Cloid
-        return self._cloid_cls.from_int(int(hashlib.sha256(
-            f"cma:{symbol}:{bar_ms}:{purpose}".encode()).hexdigest()[:15], 16))
+        """发单用的 cloid —— **必须与 make_cloid() 同源**（DB 里存的就是它）。"""
+        return _coerce_cloid(make_cloid(symbol, bar_ms, purpose))
 
     # ------------------------------------------------------------ 只读辅助
     def mid(self, coin: str) -> float:
@@ -182,8 +194,12 @@ class HlExchange:
         if not self._ensure():
             return _err(self._init_error)
         try:
+            cloid_obj = _coerce_cloid(cloid)
+        except ValueError as e:
+            return _err(str(e))                                      # 宁可拒单，也别炸在 SDK 里
+        try:
             resp = self._exchange.order(coin, bool(is_buy), float(sz), float(limit_px),
-                                        order_type, reduce_only=bool(reduce_only), cloid=cloid)
+                                        order_type, reduce_only=bool(reduce_only), cloid=cloid_obj)
         except Exception as e:                                       # noqa: BLE001
             return _err(f"下单异常：{e}")
         out = parse_order_response(resp)

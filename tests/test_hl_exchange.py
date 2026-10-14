@@ -222,3 +222,48 @@ class TestPricing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCloidCoercion(unittest.TestCase):
+    """冒烟实测踩到的坑（2026-10-14）：
+
+    ① 官方 SDK 只接受 `Cloid` 对象（内部调 to_raw()），传裸字符串会炸在 SDK 深处
+       —— `'str' object has no attribute 'to_raw'`，真下单直接失败；
+    ② 两套 cloid 推导（make_cloid 用 hex 字符串 vs _cloid 用 from_int）原本**不一致**，
+       于是 DB 里记的 cloid 与交易所收到的不是同一个值 —— 幂等键对不上。
+    """
+
+    def test_cloid_same_source_as_make_cloid(self):
+        ex = HlExchange(sdk=_FakeSdk(), account_address="0xabc", private_key="0xkey")
+        c = ex._cloid("BTC_USDT", 1791900000000, "entry")           # noqa: SLF001
+        self.assertTrue(hasattr(c, "to_raw"), "必须是 Cloid 对象")
+        self.assertEqual(c.to_raw().lower(),
+                         make_cloid("BTC_USDT", 1791900000000, "entry").lower())
+
+    def test_coerce_variants(self):
+        from app.hl.exchange import _coerce_cloid
+        self.assertIsNone(_coerce_cloid(None))
+        ex = HlExchange(sdk=_FakeSdk(), account_address="0xabc", private_key="0xkey")
+        obj = ex._cloid("BTC_USDT", 1, "entry")                     # noqa: SLF001
+        self.assertIs(_coerce_cloid(obj), obj)                      # Cloid 原样透传
+        s = "0x" + "ab" * 16
+        self.assertEqual(_coerce_cloid(s).to_raw().lower(), s)      # 字符串 → Cloid
+        for bad in ("0xzz", "abc", "0x" + "a" * 31, "", "0x" + "a" * 33):
+            with self.assertRaises(ValueError):
+                _coerce_cloid(bad)
+
+    def test_place_order_accepts_string_cloid_and_sends_object(self):
+        sdk = _FakeSdk([_ok_order()])
+        ex = HlExchange(sdk=sdk, account_address="0xabc", private_key="0xkey", dry_run=False)
+        r = ex.place_order("BTC", True, 0.01, 83000, cloid="0x" + "ab" * 16)
+        self.assertTrue(r["ok"], r.get("error"))
+        sent = sdk.calls[0][2].get("cloid")
+        self.assertTrue(hasattr(sent, "to_raw"), "传给 SDK 的必须是 Cloid 对象而不是字符串")
+
+    def test_invalid_cloid_rejected_without_calling_sdk(self):
+        sdk = _FakeSdk()
+        ex = HlExchange(sdk=sdk, account_address="0xabc", private_key="0xkey", dry_run=False)
+        r = ex.place_order("BTC", True, 0.01, 83000, cloid="0xzz")
+        self.assertFalse(r["ok"])
+        self.assertIn("cloid", r["error"])
+        self.assertEqual(sdk.calls, [], "非法 cloid 不该发出任何请求")
