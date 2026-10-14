@@ -148,3 +148,20 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 # 只读客户端（不需要凭据）
 /opt/data/cache/scratch/cma-venv/bin/python -c "from app.hl.info import HlInfo; print(len(HlInfo().specs()))"
 ```
+
+## 真机验证发现（2026-10-14，切 live 前最后一轮）
+
+1. **走应用自身链路的 live 真单已通过**（不再只靠旁路彩排脚本）：
+   `_job_tick()` → `engine.tick(executor=build_executor())` → 引擎建仓 → 执行器 live `on_entry`
+   → 真开仓 + 真挂止损 + 对账 → 真 `on_exit` 平仓。实测：成交 83,775 / 止损 81,682（-2.5%）/
+   交易所仓位与挂单与 DB 一致 / 终态仓位 0 挂单 0。空头方向单独验证：止损挂在上方（+2.5%）、
+   强平价在入场价**上方**（83,762 → liq 99,236），方向正确。
+2. **死手开关（HL `scheduleCancel`）在本账户不可用**：接口要求账户有足够成交量，返回
+   `Cannot set scheduled cancel time until enough volume traded`。原实现每轮都记一条错误事件
+   （live 下 288 条/天），已改为状态变化时才记（`hl_deadman_err`）。
+3. **待决策（未改代码）**：`scheduleCancel` 的语义是「机器人失联就把所有挂单撤掉」。对**持仓型**
+   策略这可能是反向的保险 —— 我们的止损单本身就是持仓的唯一保护，被它一起撤掉等于裸奔。
+   倾向：不启用它，改为「交易所侧止损 + 看守每 5 分钟判活 + 巡检」。需用户拍板。
+4. **注入合成行情的教训**：非目标标的必须返回「全平 K 线」。曾把 BTC 的合成价当 ETH 行情，
+   算出「ETH 止损 81,682 而 ETH 价 2,500」的荒谬信号 —— 执行器正确拒绝算仓、引擎兜住
+   （不裸奔、不崩），但仍会多发一条人工操作卡（这是「执行器失败 → 退回人工」的正常设计）。
