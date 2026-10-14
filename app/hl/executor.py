@@ -19,7 +19,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, PURPOSE_STOP,
+from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, PURPOSE_EXIT_REHANG,
+                    PURPOSE_STOP,
                     ST_FAILED, ST_FILLED, ST_INTENT, ST_PLANNED, ST_RESTING, ST_SENT, ST_SKIPPED,
                     EV_DECISION, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
@@ -346,6 +347,24 @@ class Executor:
         return bad
 
     # ------------------------------------------------------------ 开仓
+    def _current_closed_bar_ms(self, symbol: str) -> int:
+        """当前最后一根已收盘 4h bar 的开盘时刻（平仓 cloid 用）。
+
+        取 bar_state 里引擎已处理的进度；读不到时按当前时间对齐 4h 网格推导。
+        返回 0 表示完全无法确定（调用方回落入场 bar）。
+        """
+        try:
+            last = self.db.get_last_bar(symbol)
+            if last:
+                return int(last)
+        except Exception:                                        # noqa: BLE001
+            pass
+        try:
+            now_ms = int(time.time() * 1000)
+            return now_ms - (now_ms % (4 * 3600 * 1000))
+        except Exception:                                        # noqa: BLE001
+            return 0
+
     def on_entry(self, position_id: int) -> bool:
         """接管一次开仓。返回 True = 已接管（调用方不要再走人工确认流）。"""
         row = self.db.position_by_id(position_id)
@@ -515,6 +534,11 @@ class Executor:
         symbol, side = row["symbol"], int(row["side"] or 1)
         coin = self.coin(symbol)
         bar_ms = int(row["signal_bar_ms"])
+        # 平仓/重挂止损的 cloid 用「当前离场 bar」而不是入场 bar：
+        # ① 同一仓位多次触发离场（首次失败后下个 4h 重试）时 cloid 必须变化，
+        #    否则被交易所按重复 cloid 拒单，自动离场永久报废；
+        # ② 重挂止损与开仓止损（PURPOSE_STOP@入场bar）天然不同源，不再撞号。
+        exit_bar_ms = self._current_closed_bar_ms(symbol) or bar_ms
         sz = float(row["hl_sz"] or 0.0)
 
         snap = self._snapshot(force=True)
@@ -567,13 +591,13 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             limit_px = ref_price
             self._event(EV_ERROR, f"平仓限价计算失败（用参考价）：{e}", symbol=symbol)
-        self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_EXIT, side, sz, px=limit_px,
+        self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT, side, sz, px=limit_px,
                                  reduce_only=True, status=ST_SENT,
-                                 cloid=make_cloid(symbol, bar_ms, PURPOSE_EXIT))
+                                 cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT))
         res = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True,
-                                  cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_EXIT))
+                                  cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT))
         if not res["ok"]:
-            self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FAILED,
+            self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error=str(res.get("error"))[:300])
             self._event(EV_ERROR, f"平仓失败：{res['error']}", symbol=symbol)
             self._alert(f"【HL执行】⚠️ {coin} 平仓失败：{res['error']}\n"
@@ -584,23 +608,57 @@ class Executor:
             # 而止损单已被撤掉。处理：撤掉这张挂单、**立即挂回原止损**（保护仓位）、
             # 拉人工提醒；不关本地账，让下一轮 on_exit / 对账继续跟进。
             self.ex.cancel(coin, int(res.get("oid") or 0))
-            self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FAILED,
+            self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error="平仓 IOC 未成交（已撤单并挂回止损）")
+            # 重挂止损用独立 purpose（exit:rehang）：与开仓止损（stop@入场bar）、
+            # 事后补挂（stop:fix）都不同源 —— HL 的 cloid 账户级永久唯一，
+            # 复用任何一个都会被拒单，重挂失败=仓位裸奔。
+            re_stop_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
             re_stop = self.ex.place_order(
-                coin, side != 1, sz, hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec),
-                reduce_only=True, trigger_px=hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec),
-                cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_STOP))
-            self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损（{re_stop.get('status')}）",
-                        symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {coin} 平仓单未成交（已撤）。"
-                        f"止损单已重新挂回（结果 {re_stop.get('status')}）。请人工核对并处理。")
+                coin, side != 1, sz, re_stop_px,
+                reduce_only=True, trigger_px=re_stop_px,
+                cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG))
+            re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
+            self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
+                                     px=re_stop_px, reduce_only=True,
+                                     status=(re_stop.get("status") if re_ok else ST_FAILED),
+                                     cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG),
+                                     error=None if re_ok else str(re_stop.get("error"))[:300])
+            if re_ok:
+                self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损"
+                                      f"（{re_stop.get('status')} @ {re_stop_px:,.2f}）", symbol=symbol)
+                self._alert(f"【HL执行】⚠️ {coin} 平仓单未成交（已撤）。"
+                            f"止损单已重新挂回 @ {re_stop_px:,.2f}。请人工核对并处理。")
+                return True
+            # 重挂失败 → 不允许无保护持仓存在 → 立即市价平掉（与开仓挂止损失败同一口径）
+            self._event(EV_ERROR, f"{symbol} 平仓未成交且止损重挂失败"
+                                  f"（{re_stop.get('error')}）→ 立即平仓", symbol=symbol)
+            try:
+                close_px = hl_sizing.round_price(self.ex.slippage_limit(coin, side != 1), sz_dec)
+            except Exception:                                        # noqa: BLE001
+                close_px = limit_px
+            close = self.ex.place_order(coin, side != 1, sz, close_px, reduce_only=True)
+            closed_ok = bool(close.get("ok")) and close.get("status") == STATUS_FILLED
+            if closed_ok:
+                px = float(close.get("avg_px") or close_px)
+                self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FILLED,
+                                        oid=close.get("oid"), filled_sz=close.get("filled_sz"),
+                                        avg_px=px, raw=str(close.get("raw"))[:2000])
+                self._close_local(position_id, px, reason, sz)
+                r = self._r_multiple(row, px)
+                self._alert(f"【HL执行】⚠️ {coin} 平仓未成交、止损重挂失败，已市价平仓"
+                            f" @ {px:,.2f}（R {r:+.2f}）。请人工核对。")
+            else:
+                self._alert(f"【HL执行】🛑 {coin} 平仓未成交且止损重挂失败、市价平仓未确认"
+                            f"（{close.get('status')}）——仓位可能仍在交易所且无止损，"
+                            f"请立即人工处理！")
             return True
         if res.get("filled_sz") is not None and float(res["filled_sz"] or 0) + 1e-12 < sz:
             # 部分成交：按实际成交量关账；剩余仓位仍受原止损保护（撤单未发生或已被补挂）
             self._event(EV_ORDER, f"{symbol} 平仓部分成交 {res.get('filled_sz')}/{sz}", symbol=symbol)
             sz = float(res["filled_sz"])
         px = float(res["avg_px"] or limit_px)
-        self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FILLED,
+        self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FILLED,
                                 oid=res.get("oid"), filled_sz=res.get("filled_sz"), avg_px=px,
                                 raw=str(res.get("raw"))[:2000])
         self._close_local(position_id, px, reason, sz)

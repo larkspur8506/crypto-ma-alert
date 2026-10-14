@@ -307,7 +307,21 @@ class DB:
 
     # ---------------- alert logs（幂等 + 成功后标记）
     @_locked
-    def was_alerted(self, symbol: Optional[str], bar_ms: Optional[int], kind: str) -> bool:
+    def was_alerted(self, symbol: Optional[str], bar_ms: Optional[int], kind: str,
+                    within_s: Optional[float] = None) -> bool:
+        """是否已推送过。
+
+        bar_ms 为 NULL 的提醒（data_error/心跳类）没有天然幂等键，NULL 会匹配
+        任意历史成功行 → 「每个标的一生只报一次故障」。对这类加时间窗：
+        within_s 秒内报过才算重复，窗口过后允许再报（故障持续时每 2h 提醒一次）。
+        """
+        if bar_ms is None and within_s is not None:
+            cutoff = now() - within_s
+            r = self.conn.execute(
+                "SELECT 1 FROM alert_logs WHERE symbol IS ? AND bar_ms IS NULL AND kind=?"
+                " AND sent_successfully=1 AND created_at > ?",
+                (symbol, kind, cutoff)).fetchone()
+            return bool(r)
         r = self.conn.execute(
             "SELECT 1 FROM alert_logs WHERE symbol IS ? AND bar_ms IS ? AND kind=? AND sent_successfully=1",
             (symbol, bar_ms, kind)).fetchone()
@@ -364,13 +378,14 @@ class DB:
     @_locked
     def hl_record_intent(self, symbol: str, coin: str, bar_ms: int, purpose: str, side: int,
                          sz: float, px: Optional[float] = None, reduce_only: bool = False,
-                         cloid: Optional[str] = None, status: str = "intent") -> int:
+                         cloid: Optional[str] = None, status: str = "intent",
+                         error: Optional[str] = None) -> int:
         """登记一次下单意图（幂等键 symbol+bar_ms+purpose）。已存在则返回原 id（不覆盖）。"""
         cur = self.conn.execute(
             "INSERT OR IGNORE INTO hl_orders(symbol, coin, bar_ms, purpose, side, sz, px, reduce_only,"
-            " status, cloid, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            " status, cloid, error, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (symbol, coin, bar_ms, purpose, side, float(sz), px, 1 if reduce_only else 0,
-             status, cloid, now(), now()))
+             status, cloid, error, now(), now()))
         self.conn.commit()
         if cur.rowcount:
             return int(cur.lastrowid or 0)
