@@ -104,6 +104,10 @@ def hl_params():
         equity_mode=str(getattr(cfg, "equity_mode", "follow") or "follow"),
         equity_min=float(getattr(cfg, "equity_min", 20.0) or 0.0),
         notify_fills=push_on("fill_push"),
+        # 死手开关默认关闭：识别不了的值也按「关」处理（安全侧默认，与推送开关的 fail-open 相反）
+        use_schedule_cancel=str(db.get_config_str(
+            "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
+        ).strip().lower() in ("1", "true", "yes", "on"),
         max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
         max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 1.5),
         max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 2.5),

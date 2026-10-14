@@ -499,8 +499,13 @@ class TestReconcileAndRun(Base):
         self.assertIn("当日亏损", alerts[-1])
         self.assertEqual(self.db.get_config_str("hl_exec_kill_reason"), "当日亏损熔断")
 
-    def test_run_schedules_deadman_switch_when_live(self):
+    def test_run_does_not_schedule_deadman_by_default(self):
+        """死手开关默认关闭（见 docs/HL_RUNBOOK.md：它会连止损一起撤）。"""
         self.executor().run(force_snapshot=True)
+        self.assertNotIn(("schedule_cancel", 30), self.ex.calls)
+
+    def test_run_schedules_deadman_when_explicitly_enabled(self):
+        self.executor(use_schedule_cancel=True).run(force_snapshot=True)
         self.assertIn(("schedule_cancel", 30), self.ex.calls)
 
     def test_run_skips_deadman_when_killed(self):
@@ -736,7 +741,7 @@ class TestDeadmanLogDedupe(Base):
 
     def _ex(self):
         self.ex.schedule_cancel = lambda minutes=60: {"ok": False, "error": "Cannot set scheduled cancel"}
-        return self.executor()
+        return self.executor(use_schedule_cancel=True)
 
     def test_failure_logged_once(self):
         ex = self._ex()
@@ -756,3 +761,40 @@ class TestDeadmanLogDedupe(Base):
         ex.run()
         n = len([e for e in self.events() if "死手开关设置失败" in e["message"]])
         self.assertEqual(n, 2)
+
+
+class TestDeadmanOff(Base):
+    """死手开关默认关闭：绝不能碰交易所，也绝不能拖累后面主流程（成交同步/心跳）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.calls = []
+        self.ex.schedule_cancel = lambda minutes=30: (self.calls.append(minutes) or
+                                                      {"ok": False, "error": "should not be called"})
+
+    def test_default_off_never_calls_exchange(self):
+        self.executor().run()                     # 默认 use_schedule_cancel=False
+        self.assertEqual(self.calls, [], "默认关闭时不该调用 scheduleCancel")
+        self.assertEqual([e for e in self.events() if "死手开关" in e["message"]], [])
+
+    def test_off_does_not_block_rest_of_cycle(self):
+        ex = self.executor()
+        ex.run()
+        self.assertTrue(any(e["kind"] == "heartbeat" for e in self.events()),
+                        "主流程（心跳/成交同步）必须照常走完")
+
+    def test_exception_in_deadman_never_escapes(self):
+        """即使显式开启且接口抛异常，也绝不能把 run() 打断。"""
+        def boom(minutes=30):
+            raise RuntimeError("网络炸了")
+        self.ex.schedule_cancel = boom
+        ex = self.executor(use_schedule_cancel=True)
+        ex.run()                                   # 不抛异常 = 通过
+        self.assertTrue(any("死手开关设置失败" in e["message"] for e in self.events()))
+        self.assertTrue(any(e["kind"] == "heartbeat" for e in self.events()))
+
+    def test_enabled_still_works(self):
+        self.ex.schedule_cancel = lambda minutes=30: (self.calls.append(minutes) or
+                                                      {"ok": True, "error": ""})
+        self.executor(use_schedule_cancel=True).run()
+        self.assertEqual(len(self.calls), 1)
