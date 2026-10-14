@@ -501,3 +501,27 @@ class TestReconcileAndRun(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAlertWording(Base):
+    """推送文案里用 HL 合约名（BTC/ETH），别混着信号层的 MEXC 名。"""
+
+    def test_entry_and_exit_alerts_use_coin_names(self):
+        pid = self.add_signal()
+        self.executor().on_entry(pid)
+        self.assertIn("BTC 已开仓", self.notifier.messages[0])
+        self.assertNotIn("BTC_USDT", self.notifier.messages[0])
+        self.ex.calls.clear()
+        self.ex.exit = {"ok": True, "status": STATUS_FILLED, "oid": 55, "avg_px": 84500.0,
+                        "filled_sz": 0.00833, "error": None, "raw": {}}
+        self.info = FakeInfo(snap=_snap(positions=[_pos("BTC")], orders=[_stop_order()]))
+        self.executor().on_exit(pid, "ma20", 84400.0)
+        self.assertIn("BTC 已平仓", self.notifier.messages[-1])
+        self.assertNotIn("BTC_USDT", self.notifier.messages[-1])
+
+    def test_stop_failure_alert_uses_coin(self):
+        self.ex = FakeExchange(stop={"ok": False, "status": STATUS_ERROR, "error": "trigger rejected",
+                                     "oid": None, "avg_px": None, "filled_sz": None, "raw": None})
+        pid = self.add_signal()
+        self.executor().on_entry(pid)
+        self.assertIn("BTC 止损单挂失败", self.notifier.messages[-1])

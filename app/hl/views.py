@@ -187,6 +187,36 @@ def _coin_of(symbol: Any) -> str:
     return s.split("_")[0] if s else ""
 
 
+# 显示口径：信号层用的是 MEXC 的合约名（BTC_USDT），但真实成交发生在 Hyperliquid，
+# 那里合约就叫 BTC / ETH。面板一律显示 HL 侧的名字，免得看的人以为在交易 USDT 对。
+# 内部键（signal_bar_ms、幂等键、DB 里的 symbol）保持不动 —— 只换展示。
+_DISP_COIN = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+
+
+def _disp(sym: Any) -> str:
+    s = str(sym or "").strip()
+    if not s:
+        return ""
+    if s in _DISP_COIN:
+        return _DISP_COIN[s]
+    for suf in ("_USDT", "_USDC", "_USD"):
+        if s.upper().endswith(suf):
+            return s[: -len(suf)]
+    return s
+
+
+def _disp_text(text: Any) -> str:
+    """展示用：把日志文案里的信号层合约名换成 HL 侧合约名（只替换已知映射）。
+
+    DB 里存的原文本不动（审计保真），只有页面渲染走这里 ——
+    否则交易后事件列表会出现「BTC_USDT 已开仓 0.00833 BTC」这种混着两种名字的句子。
+    """
+    out = str(text or "")
+    for k, v in _DISP_COIN.items():
+        out = out.replace(k, v)
+    return out
+
+
 def _addr_text(a: Any) -> str:
     s = str(a or "").strip()
     if not s:
@@ -424,7 +454,8 @@ def status_payload(deps: DashboardDeps) -> dict:
         if stop in (None, ""):
             stop = d.get("stop_price")
         signals.append({
-            "symbol": d.get("symbol"),
+            "symbol": d.get("symbol"),          # 内部键（信号层 MEXC 名），保留不变
+            "coin": _disp(d.get("symbol")),     # 展示用：HL 侧合约名
             "status": d.get("status"),
             "side": int(_num(d.get("side"), 1)),
             "entry": _opt_num(entry),
@@ -459,7 +490,8 @@ def status_payload(deps: DashboardDeps) -> dict:
         d = _rowd(r)
         ok = _opt_num(d.get("last_ok_at")) is not None
         feed.append({
-            "symbol": d.get("symbol"),
+            "symbol": d.get("symbol"),          # 内部键，保留
+            "coin": _disp(d.get("symbol")),     # 展示用
             "source": d.get("source"),
             "last_ok_at": _opt_num(d.get("last_ok_at")),
             "last_error": d.get("last_error"),
@@ -668,7 +700,10 @@ def _render_body(p: dict) -> str:
         else f"<span class='neg'>&#9679;</span> 对账 <b>不一致</b>"
     ) + "</span>")
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
-    o.append(_badge("pos" if reachable else "neg", "延迟", lat_txt))
+    # 这是「服务器 → Hyperliquid」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
+    o.append(f"<span class='badge' title='oracle1 上的容器请求 Hyperliquid /info 的耗时（含失败重试）；"
+             f"与你的浏览器到本站的延迟无关'>"
+             f"<span class='pos'>&#9679;</span> HL 延迟 <b>{lat_txt}</b></span>")
     o.append(f"<span class='badge'><span class='muted'>&#9679;</span> 更新 "
              f"<b>{_fmt_dt(p.get('ts'))}</b></span>")
     o.append("</div>")
@@ -833,7 +868,7 @@ def _render_body(p: dict) -> str:
         st = str(sg.get("status") or "—")
         st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
         o.append("<tr>"
-                 + _td(_esc(sg.get("symbol") or "—"))
+                 + _td(_esc(sg.get("coin") or _disp(sg.get("symbol")) or "—"))
                  + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>")
                  + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
                  + _td(_fmt(sg.get("entry")), "num")
@@ -850,12 +885,12 @@ def _render_body(p: dict) -> str:
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>时间</th><th>类型</th><th>标的</th><th>内容</th></tr></thead><tbody>")
     for ev in (_as_dict(x) for x in events):
-        msg = str(ev.get("message") or "")
+        msg = _disp_text(ev.get("message") or "")
         shown_msg = msg if len(msg) <= 180 else msg[:180] + "&hellip;"
         o.append("<tr>"
                  + _td(_fmt_dt(ev.get("ts")), "num")
                  + _td(_esc(_EV_TXT.get(str(ev.get("kind")), ev.get("kind") or "—")))
-                 + _td(_esc(ev.get("symbol") or "—"))
+                 + _td(_esc(_disp(ev.get("symbol")) or "—"))
                  + _td(f"<span title='{_esc(msg)}'>{_esc(shown_msg)}</span>")
                  + "</tr>")
     if not events:
@@ -881,7 +916,7 @@ def _render_body(p: dict) -> str:
         for fd in (_as_dict(x) for x in feed):
             ok = bool(fd.get("ok"))
             o.append("<tr>"
-                     + _td(_esc(fd.get("symbol") or "—"))
+                     + _td(_esc(fd.get("coin") or _disp(fd.get("symbol")) or "—"))
                      + _td(f"<span class='{ 'pos' if ok else 'neg'}'>"
                            f"{'正常' if ok else '失败'}</span>")
                      + _td(_fmt_dt(fd.get("last_ok_at")), "num")
@@ -894,7 +929,7 @@ def _render_body(p: dict) -> str:
         o.append("<div class='tablewrap'><table><thead><tr><th>标的</th><th>最后处理 bar</th>"
                  "</tr></thead><tbody>")
         for sym, bar_ms in last_bar.items():
-            o.append("<tr>" + _td(_esc(sym)) + _td(_fmt_dt(bar_ms), "num") + "</tr>")
+            o.append("<tr>" + _td(_esc(_disp(sym))) + _td(_fmt_dt(bar_ms), "num") + "</tr>")
         o.append("</tbody></table></div></div>")
     o.append("</div>")
 

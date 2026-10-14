@@ -223,7 +223,7 @@ class Executor:
             self._event(EV_DECISION, "开仓被闸门拒绝：" + "；".join(gates), symbol=symbol,
                         data={"plan": plan.__dict__})
             if self.p.live:
-                self._alert(f"【HL执行】{symbol} 信号被闸门拒绝（未下单）：\n- " + "\n- ".join(gates))
+                self._alert(f"【HL执行】{coin} 信号被闸门拒绝（未下单）：\n- " + "\n- ".join(gates))
             return True
 
         status = ST_PLANNED if not self.p.live else ST_INTENT
@@ -240,7 +240,7 @@ class Executor:
             # 关键：dry 必须返回 False，让引擎照常发人工操作卡 ——
             # 否则信号被静默吞掉，仓位停在 pending 占住该标的的槽，影子期反而没有可比对的人工动作。
             self._alert("\n".join([
-                f"【HL影子】{symbol} 若为实盘会开仓 {plan.sz} {coin} @~{mid:,.1f}",
+                f"【HL影子】{coin} 若为实盘会开仓 {plan.sz} {coin} @~{mid:,.1f}",
                 f"止损 {stop:,.1f}（{plan.stop_dist * 100:.2f}%）｜风险 {plan.risk_u:.1f}U｜"
                 f"名义 {plan.notional:,.0f}U｜杠杆 {plan.leverage:g}x",
                 "（dry 模式：未下任何单，下面的人工提醒照常）",
@@ -285,7 +285,7 @@ class Executor:
                                     error=str(stop_res.get("error"))[:300])
             # 没有保护的仓位不允许存在 → 立刻平掉
             close = self.ex.place_order(coin, side != 1, filled_sz, limit_px, reduce_only=True)
-            msg = (f"【HL执行】⚠️ {symbol} 止损单挂失败（{stop_res['error']}），已立即平仓"
+            msg = (f"【HL执行】⚠️ {coin} 止损单挂失败（{stop_res['error']}），已立即平仓"
                    f"（平仓结果：{close['status']}）。本次未持仓，请人工核对。")
             self._event(EV_ERROR, f"止损挂单失败 → 立即平仓：{stop_res['error']}",
                         symbol=symbol, data={"close": close})
@@ -303,7 +303,7 @@ class Executor:
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
         drift = (avg_px - mid) / mid if mid else 0.0
         self._alert("\n".join([
-            f"【HL执行】{symbol} 已开仓 {filled_sz} {coin} @ {avg_px:,.2f}",
+            f"【HL执行】{coin} 已开仓 {filled_sz} {coin} @ {avg_px:,.2f}",
             f"止损触发价 {stop:,.2f}（{plan2.stop_dist * 100:.2f}%）｜风险 {plan2.risk_u:.1f}U"
             f"（权益 {self.p.equity:,.0f}U 的 {plan2.risk_u / self.p.equity * 100:.2f}%）",
             f"名义 {plan2.notional:,.0f}U｜保证金 ≈{plan2.margin:,.0f}U｜强平价 {plan2.liq_price:,.0f}",
@@ -314,11 +314,12 @@ class Executor:
         return True
 
     def _entry_failed(self, symbol: str, bar_ms: int, msg: str) -> bool:
+        coin = self.coin(symbol)                     # 文案用 HL 合约名，DB 键仍用 symbol
         self.db.hl_update_order(symbol, bar_ms, PURPOSE_ENTRY, status=ST_FAILED,
                                error=str(msg)[:300])
         self._event(EV_ERROR, f"开仓失败：{msg}", symbol=symbol)
         if self.p.live:
-            self._alert(f"【HL执行】⚠️ {symbol} 开仓失败：{msg}")
+            self._alert(f"【HL执行】⚠️ {coin} 开仓失败：{msg}")
         return True
 
     # ------------------------------------------------------------ 离场
@@ -340,14 +341,14 @@ class Executor:
         if reason == "stop" and coin not in ex_pos:
             px, fills = self._last_fill_px(coin)
             self._close_local(position_id, px or ref_price, "stop", sz)
-            self._alert(f"【HL执行】{symbol} 止损已由交易所触发 @ {px or ref_price:,.2f}，本地已关账")
+            self._alert(f"【HL执行】{coin} 止损已由交易所触发 @ {px or ref_price:,.2f}，本地已关账")
             return True
 
         if not self.p.live:
             # 真实仓位在交易所、执行器却不是 live：绝不能替引擎把本地关账（会造成本地/交易所不一致），
             # 交给人工，并且必须喊出来。
             self._event(EV_DECISION, f"dry 模式：不代平真实仓位 {symbol}（{reason}）", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {symbol} 触发离场（{reason}）但执行器不是 live 模式，"
+            self._alert(f"【HL执行】⚠️ {coin} 触发离场（{reason}）但执行器不是 live 模式，"
                         f"交易所仍有真实仓位 —— 请人工平仓并撤掉止损单")
             return True
 
@@ -361,7 +362,7 @@ class Executor:
             sz = abs(float(ex_pos.get(coin, {}).get("size") or 0.0))
         if sz <= 0:
             self._event(EV_ERROR, f"{symbol} 离场时无法确定持仓量，跳过（请人工处理）", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {symbol} 离场异常：交易所查不到该仓位，已跳过，请人工核对")
+            self._alert(f"【HL执行】⚠️ {coin} 离场异常：交易所查不到该仓位，已跳过，请人工核对")
             return True
         try:
             sz_dec = int((self.info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
@@ -381,7 +382,7 @@ class Executor:
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error=str(res.get("error"))[:300])
             self._event(EV_ERROR, f"平仓失败：{res['error']}", symbol=symbol)
-            self._alert(f"【HL执行】⚠️ {symbol} 平仓失败：{res['error']}\n"
+            self._alert(f"【HL执行】⚠️ {coin} 平仓失败：{res['error']}\n"
                         f"（止损单已撤！请立即人工平仓或手动挂回止损）")
             return True
         px = float(res["avg_px"] or limit_px)
@@ -390,7 +391,7 @@ class Executor:
                                 raw=str(res.get("raw"))[:2000])
         self._close_local(position_id, px, reason, sz)
         r = self._r_multiple(row, px)
-        self._alert(f"【HL执行】{symbol} 已平仓 @ {px:,.2f}（{reason}）｜本次 {r:+.2f}R")
+        self._alert(f"【HL执行】{coin} 已平仓 @ {px:,.2f}（{reason}）｜本次 {r:+.2f}R")
         self._event(EV_ORDER, f"{symbol} 平仓完成 @ {px:,.2f}（{reason}）", symbol=symbol,
                     data={"r": r})
         return True

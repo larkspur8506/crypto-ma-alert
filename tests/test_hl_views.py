@@ -681,3 +681,44 @@ class TestRenderOnly(BaseCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------- 显示口径
+class TestDisplayNames(BaseCase):
+    """面板显示 HL 侧合约名（BTC/ETH）；内部键（幂等键、DB symbol）仍是 MEXC 名。"""
+
+    def test_disp_maps_and_strips_suffix(self):
+        from app.hl.views import _disp, _disp_text, _coin_of
+        self.assertEqual(_disp("BTC_USDT"), "BTC")
+        self.assertEqual(_disp("ETH_USDT"), "ETH")
+        self.assertEqual(_disp("SOL_USDC"), "SOL")      # 未在映射表里的后缀兜底
+        self.assertEqual(_disp("BTC"), "BTC")           # 已经是 HL 名 → 原样
+        self.assertEqual(_disp(""), "")
+        self.assertEqual(_disp(None), "")
+        self.assertEqual(_coin_of("BTC_USDT"), "BTC")
+        self.assertEqual(_disp_text("BTC_USDT 开仓完成，ETH_USDT 无仓"), "BTC 开仓完成，ETH 无仓")
+        self.assertEqual(_disp_text(None), "")
+
+    def test_json_row_carries_coin_and_keeps_internal_symbol(self):
+        self.insert_position(status="open", coin="BTC")
+        p = self.payload()
+        sg = (p.get("signals") or [None])[0]
+        self.assertIsNotNone(sg)
+        self.assertEqual(sg.get("coin"), "BTC")
+        self.assertEqual(sg.get("symbol"), "BTC_USDT")   # 内部键必须保留
+        for fd in (p.get("system") or {}).get("feed") or []:
+            self.assertIn("coin", fd)
+            self.assertNotIn("_USDT", fd["coin"])
+
+    def test_page_never_shows_mexc_pair_names(self):
+        self.insert_position(status="open", coin="BTC")
+        self.db.hl_log_event("order", "BTC_USDT 开仓完成：0.05 @ 101,000", symbol="BTC_USDT")
+        html = render_dashboard(self.payload())      # 参数是 payload，不是 deps
+        self.assertIn(">BTC<", html)
+        for bad in ("BTC_USDT", "ETH_USDT"):
+            self.assertNotIn(bad, html, f"页面上不该出现信号层合约名 {bad}")
+
+    def test_latency_badge_labels_scope(self):
+        html = render_dashboard(self.payload())
+        self.assertIn("HL 延迟", html)          # 说清是服务器→HL 的延迟
+        self.assertIn("与你的浏览器到本站的延迟无关", html)
