@@ -38,6 +38,13 @@ from fastapi.responses import HTMLResponse
 
 logger = logging.getLogger(__name__)
 
+# 公开导出（含面板合并时复用的 _render_body / DASH_CSS；其余为原有公开 API）。
+__all__ = [
+    "SCHEMA_VERSION", "MAINNET_DEFAULT", "DashboardDeps",
+    "status_payload", "render_dashboard", "build_router",
+    "DASH_CSS", "_render_body",
+]
+
 SCHEMA_VERSION = 1
 _DAY = 86400.0
 MAINNET_DEFAULT = "https://api.hyperliquid.xyz"

@@ -114,6 +114,7 @@ class ExecParams:
     equity: float = 1000.0
     equity_mode: str = "follow"          # follow = 跟随实时权益（带下限）；fixed = 用上面的固定值
     equity_min: float = 20.0
+    notify_fills: bool = True            # 成交回报推送（面板开关 fill_push）；异常提醒不受此开关影响
     max_slippage_pct: float = 0.003
     max_notional_mult: float = 1.5        # 单标的名义 / 权益
     max_total_notional_mult: float = 2.5  # 总名义 / 权益
@@ -151,6 +152,13 @@ class Executor:
     # ------------------------------------------------------------ 工具
     def coin(self, symbol: str) -> str:
         return self.p.coin_map.get(symbol, symbol.split("_")[0])
+
+    def _alert_fill(self, text: str) -> None:
+        """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。"""
+        if not getattr(self.p, "notify_fills", True):
+            logger.info("[hl-exec] 成交回报推送已关闭，仅落库")
+            return
+        self._alert(text)
 
     def _alert(self, text: str) -> None:
         try:
@@ -382,7 +390,7 @@ class Executor:
         self.db.confirm_position(position_id, avg_px, int(round(filled_sz)), stop, True)
         plan2 = hl_sizing.HlOrderPlan(**{**plan.__dict__, "entry_price": avg_px,
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
-        self._alert(fmt_entry_alert(
+        self._alert_fill(fmt_entry_alert(
             coin=coin, side=side, sz=filled_sz, entry_px=avg_px, stop=stop,
             stop_dist=plan2.stop_dist, notional=plan2.notional, margin=plan2.margin,
             liq=plan2.liq_price, risk_u=plan2.risk_u, equity=self.p.equity,
@@ -472,7 +480,7 @@ class Executor:
         r = self._r_multiple(row, px)
         gross = (px - float(row["actual_entry"] or row["entry_price"])) * sz * (1 if side == 1 else -1)
         fees = self._fees_since(coin, row["opened_at"])
-        self._alert(fmt_exit_alert(
+        self._alert_fill(fmt_exit_alert(
             coin=coin, side=side, entry_px=float(row["actual_entry"] or row["entry_price"]),
             exit_px=px, sz=sz, reason=reason, r_multiple=r, gross_pnl=gross, fees=fees,
             opened_at=row["opened_at"], when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL))

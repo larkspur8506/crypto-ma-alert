@@ -49,6 +49,11 @@ class Config:
     enable_shorts: bool = _env("ENABLE_SHORTS", "true").lower() in ("1", "true", "yes")
     short_regime_ma: int = _env_i("SHORT_REGIME_MA", strategy.REGIME_MA)
 
+    # 资金口径（feat 资金跟随）：follow = 按交易所实时权益算下单基数（带下限、取整到 10U）；
+    # fixed = 用固定 equity。加进 OVERRIDABLE 后可从 /admin?tab=params 热改。
+    equity_mode: str = _env("HL_EQUITY_MODE", "follow").lower() or "follow"
+    equity_min: float = _env_f("HL_EQUITY_MIN", 20.0)
+
     # 服务
     base_url: str = _env("BASE_URL", "https://ma.222677.xyz")
     admin_token: str = _env("ADMIN_TOKEN")

@@ -696,3 +696,36 @@ class TestEffectiveEquity(Base):
                                 hl_sizing.size_order_hl("BTC", 5, 83000.0, 80600.0, 1000.0, 0.02, 5.0, side=1),
                                 self.info.snapshot("0xabc"), equity=1000.0)
         self.assertEqual([g for g in gates if "上限" in g], [])
+
+
+class TestFillPushSwitch(Base):
+    """面板「成交回报推送」开关（fill_push）必须真管用；异常提醒不受它影响。"""
+
+    def test_off_suppresses_success_alert_but_still_records(self):
+        pid = self.add_signal(entry=83000.0, stop=80600.0)
+        self.executor(notify_fills=False).on_entry(pid)
+        self.assertEqual(self.notifier.messages, [], "成交回报应被开关关掉")
+        self.assertTrue(any("开仓完成" in e["message"] for e in self.events()),
+                        "关掉推送不影响落库与面板")
+
+    def test_on_still_alerts(self):
+        pid = self.add_signal(entry=83000.0, stop=80600.0)
+        self.executor(notify_fills=True).on_entry(pid)
+        self.assertTrue(any("已开仓" in m for m in self.notifier.messages))
+
+    def test_failure_alert_is_never_gated(self):
+        """止损单挂失败属于异常提醒：开关关掉也必须喊（这是最危险的那条）。"""
+        self.ex = FakeExchange(stop={"ok": False, "status": STATUS_ERROR, "error": "trigger rejected",
+                                     "oid": None, "avg_px": None, "filled_sz": None, "raw": None})
+        pid = self.add_signal()
+        self.executor(notify_fills=False).on_entry(pid)
+        self.assertTrue(any("止损单挂失败" in m for m in self.notifier.messages),
+                        self.notifier.messages)
+
+    def test_exit_alert_respects_switch(self):
+        pid = self.add_signal(entry=83000.0, stop=80600.0)
+        ex = self.executor(notify_fills=False)
+        ex.on_entry(pid)
+        self.notifier.messages.clear()
+        ex.on_exit(pid, "ma20", 86000.0)
+        self.assertEqual(self.notifier.messages, [])

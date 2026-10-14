@@ -1,7 +1,15 @@
-"""FastAPI 应用：定时检查 + 状态页 + 确认页（签名链接，无需登录）。"""
+"""FastAPI 应用：定时检查 + 合并管理面板 + 确认页（签名链接，无需登录）。
+
+面板入口（合并版，见 docs/ADMIN_MERGE_PLAN.md 第 2 节）：
+    GET /admin?k=<ADMIN_TOKEN>&tab=overview|params|switch|records
+    POST /admin/params、/admin/switch/mode、/admin/switch/notify、/admin/switch/kill
+旧地址兼容：/hl、/admin/rules、/admin/logs 的 GET 全部 302 到对应 Tab；
+           /admin/rules 的 POST 保留（继续写 DB，老书签的表单还能提交）。
+保留不动：/c/{pid} 确认页、/api/hl/* 四个 JSON 接口、/admin/hl/mode 与 /admin/hl/kill
+          （runbook 里的 curl 还在用）、/admin/tick。
+"""
 from __future__ import annotations
 
-import datetime as dt
 import json
 import logging
 import os
@@ -92,8 +100,10 @@ def hl_params():
         leverage=cfg.leverage,
         risk_pct=cfg.risk_pct,
         equity=cfg.equity,
-        equity_mode=_env("HL_EQUITY_MODE") or getattr(cfg, "equity_mode", "follow"),
+        # 口径 DB > env > 代码默认：Config 已解析好，不要再单独读 env（否则 DB 值会被 env 压掉）
+        equity_mode=str(getattr(cfg, "equity_mode", "follow") or "follow"),
         equity_min=float(getattr(cfg, "equity_min", 20.0) or 0.0),
+        notify_fills=push_on("fill_push"),
         max_slippage_pct=f("HL_MAX_SLIPPAGE_PCT", 0.003),
         max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 1.5),
         max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 2.5),
@@ -136,6 +146,23 @@ def build_executor():
         return None
 
 
+# ---------------------------------------------------------------- 推送开关
+# report_push / fill_push 是新键（首次从面板保存才落库）；缺省值决定「老库」的行为，
+# 所以缺省必须是 1（开），否则升级后周报会突然静默。
+_PUSH_ON = ("1", "true", "yes", "on")
+_PUSH_OFF = ("0", "false", "no", "off")
+
+
+def push_on(key: str, default: str = "1") -> bool:
+    """读推送开关：DB 值优先，缺省为 default；识别不了的值按「开」处理（宁可多推一条）。"""
+    try:
+        raw = str(db.get_config_str(key, default) or default).strip().lower()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读推送开关 %s 失败：%s", key, e)
+        return True
+    return raw not in _PUSH_OFF
+
+
 # ---------------------------------------------------------------- 调度
 
 def _job_tick() -> None:
@@ -172,10 +199,14 @@ def _job_heartbeat() -> None:
 
 
 def _job_weekly() -> None:
-    cfg = current_config()
-    text = engine.weekly_text(db, cfg)
-    ok = bool(notifier and notifier.send_message(text))
-    db.log_alert(None, None, "weekly", text, ok)
+    text = engine.weekly_text(db, current_config())
+    if push_on("report_push"):
+        ok = bool(notifier and notifier.send_message(text))
+        db.log_alert(None, None, "weekly", text, ok)
+        return
+    # 开关关了：只落库（kind=weekly_local，与心跳的静默信标同一套约定）
+    db.log_alert(None, None, "weekly_local", text, True)
+    logger.info("周报（未推送，仅落库）:\n%s", text)
 
 
 @asynccontextmanager
@@ -213,8 +244,6 @@ def _require_admin(request: Request, k: Optional[str] = None) -> None:
         raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
 
 
-# ---------------------------------------------------------------- 路由
-
 @app.get("/health")
 def health():
     return {"status": "ok", "symbols": config.symbols,
@@ -227,78 +256,93 @@ def root():
     return RedirectResponse("/admin")
 
 
-@app.get("/admin", response_class=HTMLResponse)
-def admin_status(request: Request, k: Optional[str] = None):
-    _require_admin(request, k)
-    cfg = current_config()
-    rows = "".join(
-        f"<tr><td>{r['symbol']}</td><td>{'多' if (r['side'] or 1) == 1 else '空'}</td>"
-        f"<td>{r['status']}</td><td>{r['contracts']}</td>"
-        f"<td>{r['entry_price']:,.0f}</td><td>{r['stop_price']:,.0f}</td>"
-        f"<td>{r['stop_dist'] * 100:.1f}%</td>"
-        f"<td>{engine.fmt_ms(r['signal_bar_ms'])}</td>"
-        f"<td><a href='/c/{r['id']}?a=view&t={engine.sign_token(cfg.token_secret, r['id'], 'view')}'>查看</a></td></tr>"
-        for r in db.recent_positions(20))
-    feeds = "".join(
-        f"<tr><td>{r['symbol']}</td><td class='{'ok' if r['last_ok_at'] else 'bad'}'>"
-        f"{r['source'] if r['last_ok_at'] else '失败'}</td>"
-        f"<td class='muted'>{r['last_error'] or ''}</td></tr>" for r in db.feed_status())
-    last_bars = "".join(
-        f"<tr><td>{s}</td><td>{engine.fmt_ms(db.get_last_bar(s)) if db.get_last_bar(s) else '—'}</td></tr>"
-        for s in cfg.symbols)
-    body = f"""
-    <h1>{cfg.alert_prefix}crypto-ma-alert</h1>
-    <div class='card'>
-      <b>配置</b><br>标的：{', '.join(cfg.symbols)}｜权益 {cfg.equity:,.0f}U｜单笔风险 {cfg.risk_pct * 100:.1f}%｜
-      杠杆 {cfg.leverage:.0f}x｜止损过滤 {cfg.stop_min * 100:.1f}%~{cfg.stop_max * 100:.1f}%<br>
-      <span class='muted'>通道：{'企业微信 ' if cfg.wechat_webhook else ''}{'Telegram' if cfg.telegram_token and cfg.telegram_chat_id else ''}
-      ｜dry_run={cfg.dry_run}｜<a href='/admin/rules?k={config.admin_token}'>改参数</a>｜
-      <a href='/admin/logs?k={config.admin_token}'>提醒日志</a></span>
-    </div>
-    <h2>数据源健康</h2><table><tr><th>标的</th><th>状态</th><th>错误</th></tr>{feeds}</table>
-    <h2>已处理到</h2><table><tr><th>标的</th><th>最后处理 bar</th></tr>{last_bars}</table>
-    <h2>最近仓位/信号</h2>
-    <table><tr><th>标的</th><th>方向</th><th>状态</th><th>张数</th><th>入场</th><th>止损</th><th>距离</th><th>信号 bar</th><th></th></tr>
-    {rows or "<tr><td colspan=9 class='muted'>暂无</td></tr>"}</table>
-    <div class='card muted'>待确认（pending）的仓位按假设值计入统计；点「查看」可确认或忽略。</div>
-    """
-    resp = page("crypto-ma-alert", body)
+# ---------------------------------------------------------------- HL 面板与控制
+
+def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> None:
+    """面板与 JSON API 的鉴权：?k=<ADMIN_TOKEN> 或 cma_admin Cookie；带 k 时写 Cookie。"""
+    token = config.admin_token
+    if not token:
+        raise HTTPException(500, "ADMIN_TOKEN 未配置")
+    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
+    if supplied != token:
+        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
     if k:
-        resp.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400)
-    return resp
+        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400)
 
 
-@app.get("/admin/rules", response_class=HTMLResponse)
-def admin_rules(request: Request, k: Optional[str] = None):
-    _require_admin(request, k)
-    cfg = current_config()
-    saved = db.get_config()
-    body = f"""
-    <h1>参数</h1>
-    <div class='card'>
-    <form method='post'>
-      <input type='hidden' name='k' value='{k or ""}'>
-      <p>账户权益(U) <input name='equity' value='{cfg.equity}'></p>
-      <p>单笔风险(小数，0.02=2%) <input name='risk_pct' value='{cfg.risk_pct}'></p>
-      <p>杠杆(逐仓) <input name='leverage' value='{cfg.leverage}'></p>
-      <p>止损距离下限 <input name='stop_min' value='{cfg.stop_min}'></p>
-      <p>止损距离上限 <input name='stop_max' value='{cfg.stop_max}'></p>
-      <p><label><input type='checkbox' name='enable_long' {'checked' if cfg.enable_long else ''}>
-         允许做多</label>
-         <label><input type='checkbox' name='enable_shorts' {'checked' if cfg.enable_shorts else ''}>
-         允许做空</label>
-         <label><input type='checkbox' name='heartbeat_push' {'checked' if cfg.heartbeat_push else ''}>
-         每天推送心跳（默认关：信息已在每日巡检里）</label></p>
-      <p>做空趋势过滤均线 <input name='short_regime_ma' value='{cfg.short_regime_ma}'>
-         （0 = 关闭过滤，不建议）</p>
-      <button type='submit'>保存</button>
-    </form>
-    <div class='muted'>DB 值优先于环境变量。当前 DB 覆盖：{saved or '无'}</div>
-    </div>
-    <p><a class='btn gray' href='/admin?k={k or ""}'>返回</a></p>
+def _hl_deps():
+    from app.hl.views import DashboardDeps
+    return DashboardDeps(
+        db=db,
+        config_fn=current_config,
+        info=get_hl_info(),
+        address_fn=lambda: hl_params().account_address,
+        mode_fn=hl_mode,
+        base_url_fn=lambda: hl_params().base_url,
+    )
+
+
+def _mount_hl_views() -> None:
+    try:
+        from app.hl.views import build_router
+        app.include_router(build_router(_hl_deps()), dependencies=[Depends(hl_guard)])
+        logger.info("已挂载 /hl 监控面板（模式=%s）", hl_mode())
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载 /hl 面板失败（不影响提醒与执行器）：%s", e)
+
+
+def _mount_hl_keyform() -> None:
+    """一次性私钥录入页：给「手机连不上 oracle1:22」时用的 HTTPS 通道。
+
+    注意鉴权方式不同：它用自己的一次性令牌（15 分钟、用过即废），**不是** ADMIN_TOKEN，
+    所以**不能**挂 hl_guard（否则还得带上 admin token）。
     """
-    return page("参数", body)
+    try:
+        from app.hl.keyform import KeyFormDeps, build_router as build_key_router
+        app.include_router(build_key_router(KeyFormDeps.from_env(db)))
+        logger.info("已挂载 /admin/hl/key 私钥录入页（一次性令牌）")
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载私钥录入页失败（不影响其他功能）：%s", e)
 
+
+# ---------------------------------------------------------------- 合并管理面板
+def _admin_deps():
+    """装配合并面板的依赖（全部走可替换函数，测试里可换成假实现）。"""
+    from app.admin_ui import AdminDeps
+    hl = _hl_deps()
+    return AdminDeps(
+        db=db,
+        config_fn=current_config,
+        hl_deps=hl,
+        mode_fn=hl_mode,
+        token_fn=lambda: config.admin_token,
+        address_fn=lambda: hl_params().account_address,
+        private_key_fn=lambda: hl_params().private_key,
+        mids_fn=lambda: get_hl_info().all_mids(),
+        # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
+        price_fallback=0.0,
+    )
+
+
+def _mount_admin_ui() -> None:
+    """先挂合并面板，再挂 /hl：让 /hl 的 302 覆盖 views 里的原路由。"""
+    from app.admin_ui import build_admin_router
+    try:
+        app.include_router(build_admin_router(_admin_deps()))
+        logger.info("已挂载合并管理面板 /admin（四 Tab）")
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("挂载合并管理面板失败：%s", e)
+
+
+# 顺序有讲究：/admin 系列先注册，/hl 的旧路由被 302 覆盖，/api/hl/* 原样保留。
+_mount_admin_ui()
+_mount_hl_views()
+_mount_hl_keyform()
+
+
+# ---------------------------------------------------------------- 旧参数表单兼容
+# 新表单走 POST /admin/params；这条留给老书签/老代码（比如还没删的 curl），
+# 口径不变：仍然只写 DB 的五个数字字段。
 
 @app.post("/admin/rules")
 def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = Form(...),
@@ -307,7 +351,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
                      enable_shorts: Optional[str] = Form(None),
                      heartbeat_push: Optional[str] = Form(None),
                      short_regime_ma: str = Form("200"), k: str = Form("")):
-    _require_admin(request, k)
+    _require_admin(request, k or None)
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
                      ("stop_min", stop_min), ("stop_max", stop_max)]:
         try:
@@ -325,22 +369,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
     except ValueError:
         raise HTTPException(400, "short_regime_ma 不是数字")
     db.set_config("short_regime_ma", int(float(short_regime_ma)))
-    return RedirectResponse(f"/admin/rules?k={k}", status_code=303)
-
-
-@app.get("/admin/logs", response_class=HTMLResponse)
-def admin_logs(request: Request, k: Optional[str] = None):
-    _require_admin(request, k)
-    rows = "".join(
-        f"<tr><td>{engine.fmt_ms(int(r['created_at'] * 1000))}</td><td>{r['kind']}</td>"
-        f"<td>{r['symbol'] or '—'}</td>"
-        f"<td class='{'ok' if r['sent_successfully'] else 'bad'}'>"
-        f"{'已送达' if r['sent_successfully'] else '失败'}</td>"
-        f"<td><details><summary>内容</summary><pre>{r['message']}</pre></details></td></tr>"
-        for r in db.recent_alerts(50))
-    return page("提醒日志", f"<h1>提醒日志</h1><table><tr><th>时间</th><th>类型</th><th>标的</th>"
-                            f"<th>状态</th><th>内容</th></tr>{rows}</table>"
-                            f"<p><a class='btn gray' href='/admin?k={k or ''}'>返回</a></p>")
+    return RedirectResponse(f"/admin?tab=params&k={k}", status_code=303)
 
 
 # ---------------------------------------------------------------- 确认页
@@ -467,7 +496,7 @@ def _close_form(row) -> HTMLResponse:
     if row["status"] == "closed":
         hint = (f"<p class='muted'>当前记录：离场价 <b>{row['exit_price'] or 0:,.2f}</b>"
                 f"（{row['exit_reason']}，约 {row['r_multiple'] or 0:+.2f}R）。"
-                f"保存后按新价重算 R。</p>")
+                "保存后按新价重算 R。</p>")
     body = f"""
     <h1>录入平仓 #{row['id']}</h1>
     <div class='card'>
@@ -477,7 +506,7 @@ def _close_form(row) -> HTMLResponse:
     <form method='post'>
       <input type='hidden' name='a' value='close'>
       <input type='hidden' name='t' value='{engine.sign_token(config.token_secret, row["id"], "close")}'>
-      {'<input type="hidden" name="edit" value="1">' if row['status'] == 'closed' else ''}
+      {'<input type="hidden" name="edit" value="1">' if row["status"] == "closed" else ''}
       <p>实际平仓价 <input name='exit_price' value='{row["exit_price"] or 0:.2f}'></p>
       <p>离场原因
         <select name='exit_reason' style='background:#0f1115;color:#e6e6e6;padding:8px;border-radius:6px'>
@@ -589,59 +618,7 @@ def admin_tick(request: Request, k: Optional[str] = None):
     return {"sent": len(sent), "messages": sent}
 
 
-# ---------------------------------------------------------------- HL 面板与控制
-
-def hl_guard(request: Request, response: Response, k: Optional[str] = None) -> None:
-    """面板与 JSON API 的鉴权：?k=<ADMIN_TOKEN> 或 cma_admin Cookie；带 k 时写 Cookie。"""
-    token = config.admin_token
-    if not token:
-        raise HTTPException(500, "ADMIN_TOKEN 未配置")
-    supplied = k or request.query_params.get("k") or request.cookies.get("cma_admin")
-    if supplied != token:
-        raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-    if k:
-        response.set_cookie("cma_admin", k, httponly=True, max_age=30 * 86400)
-
-
-def _hl_deps():
-    from app.hl.views import DashboardDeps
-    return DashboardDeps(
-        db=db,
-        config_fn=current_config,
-        info=get_hl_info(),
-        address_fn=lambda: hl_params().account_address,
-        mode_fn=hl_mode,
-        base_url_fn=lambda: hl_params().base_url,
-    )
-
-
-def _mount_hl_views() -> None:
-    try:
-        from app.hl.views import build_router
-        app.include_router(build_router(_hl_deps()), dependencies=[Depends(hl_guard)])
-        logger.info("已挂载 /hl 监控面板（模式=%s）", hl_mode())
-    except Exception as e:                                           # noqa: BLE001
-        logger.warning("挂载 /hl 面板失败（不影响提醒与执行器）：%s", e)
-
-
-def _mount_hl_keyform() -> None:
-    """一次性私钥录入页：给「手机连不上 oracle1:22」时用的 HTTPS 通道。
-
-    注意鉴权方式不同：它用自己的一次性令牌（15 分钟、用过即废），**不是** ADMIN_TOKEN，
-    所以**不能**挂 hl_guard（否则还得带上 admin token）。
-    """
-    try:
-        from app.hl.keyform import KeyFormDeps, build_router as build_key_router
-        app.include_router(build_key_router(KeyFormDeps.from_env(db)))
-        logger.info("已挂载 /admin/hl/key 私钥录入页（一次性令牌）")
-    except Exception as e:                                           # noqa: BLE001
-        logger.warning("挂载私钥录入页失败（不影响其他功能）：%s", e)
-
-
-_mount_hl_views()
-_mount_hl_keyform()
-
-
+# ---------------------------------------------------------------- HL 模式 / kill（runbook 的 curl 在用）
 @app.post("/admin/hl/mode")
 def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
     """切换执行器模式（off/dry/live）。live 要求已配置地址与私钥。"""
@@ -656,7 +633,7 @@ def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
     db.hl_log_event("decision", f"人工切换执行器模式 → {mode}")
     if mode != "live":
         db.hl_set_kill(False, "")
-    return RedirectResponse(f"/admin?k={k}", status_code=303)
+    return RedirectResponse(f"/admin?tab=switch&k={k}", status_code=303)
 
 
 @app.post("/admin/hl/kill")
@@ -666,4 +643,4 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
     want = on in ("1", "true", "on")
     db.hl_set_kill(want, "人工" if want else "")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
-    return RedirectResponse(f"/admin?k={k}", status_code=303)
+    return RedirectResponse(f"/admin?tab=switch&k={k}", status_code=303)
