@@ -207,6 +207,17 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
         retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
                                                               "weekly", "weekly_local",
                                                               "exec_alert_fills")]
+        # bar_ms=NULL 的行不受 UNIQUE 约束（NULL 互不相等），同一故障可能累积多条
+        # 失败行 —— 按 (symbol, kind) 只补推最新一条，避免同一告警被连发 N 次。
+        _seen: set = set()
+        _dedup = []
+        for r in retry:
+            key = (r["symbol"], r["kind"], r["bar_ms"])
+            if key in _seen:
+                continue
+            _seen.add(key)
+            _dedup.append(r)
+        retry = _dedup
         for r in retry[:limit]:
             text = r["message"] or ""
             if not text:

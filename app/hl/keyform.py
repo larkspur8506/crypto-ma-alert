@@ -128,7 +128,11 @@ def write_key(key: str, path: str = DEFAULT_ENV_PATH) -> Tuple[bool, str]:
     if not KEY_LINE.search(txt):
         return False, f"{path} 里找不到 HL_PRIVATE_KEY 占位行"
     try:
-        shutil.copy2(path, path + ".bak-" + time.strftime("%Y%m%d-%H%M%S"))
+        bak = path + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
+        shutil.copy2(path, bak)
+        # 备份同样收敛到 600（copy2 会复制源的权限；源若是 644，
+        # 注释掉的旧私钥明文就会以 644 留在盘上）
+        os.chmod(bak, 0o600)
     except OSError as e:
         logger.warning("[hl-keyform] 备份失败（继续写）：%s", e)
     out = KEY_LINE.sub("HL_PRIVATE_KEY=" + key, txt, count=1)
@@ -178,7 +182,8 @@ def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
 def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool = True) -> HTMLResponse:
     st = token_state(deps.db)
     already = has_key(deps.env_path)
-    msg = f"<div class='card'><span class='{'ok' if ok else 'bad'}'>{message}</span></div>" if message else ""
+    msg = (f"<div class='card'><span class='{'ok' if ok else 'bad'}'>"
+           f"{_html_escape(str(message))}</span></div>") if message else ""
     if already:
         body = (msg + "<div class='card'><h1>已存在私钥</h1>"
                 "<div class='muted'>文件里已有 HL_PRIVATE_KEY，本页拒绝覆盖。<br>"

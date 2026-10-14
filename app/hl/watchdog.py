@@ -87,38 +87,41 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         detail = "；".join(f"#{r['id']} {r['symbol']}/{r['purpose']}({r['status']})" for r in stuck[:5])
         add(f"有 {len(stuck)} 条卡住的意图单（>3 分钟未回结果）：{detail}")
 
-    # 4) 交易所侧：仓位与止损
+    # 4) 交易所侧：仓位与止损。
+    #    审计三轮 L：地址缺失只跳过交易所侧（4/7/8），不提前 return ——
+    #    后面的 24h 失败单、时钟偏差检查与交易所无关，必须照常执行。
     address = _env("HL_ACCOUNT_ADDRESS")
     if info is None or not address:
         add("未配置 HL_ACCOUNT_ADDRESS，跳过交易所侧检查")
-        return notes
-    try:
-        snap = info.snapshot(address)
-    except HlInfoError as e:
-        add(f"读不到 HL 账户：{e}")
-        return notes
-    ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
-    orders_trusted = bool(snap.get("orders_trusted", False))
-    for p in ex_pos.values():
-        if not orders_trusted:
-            # 挂单接口回落（读不到 isTrigger）：与执行器同口径 —— 只提示、不判裸奔
-            add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损状态无法确认（挂单接口不可信）")
-            continue
-        has_stop = any(o.get("coin") == p["coin"] and o.get("reduce_only") and o.get("is_trigger")
-                       for o in snap.get("open_orders") or [])
-        if not has_stop:
-            add(f"{p['coin']} 有仓位但没有止损挂单（裸奔仓位，请立刻处理）")
-        else:
-            add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损单在场", ok=True)
-    for r in db.recent_positions(20):
-        if (r["hl_status"] or "") == "mismatch":
-            add(f"仓位 #{r['id']} {r['symbol']} 处于 mismatch（本地与交易所不一致）")
-    local_open = [r for r in db.recent_positions(20)
-                  if r["status"] == "open" and (r["hl_status"] or "") == "open"]
-    for r in local_open:
-        coin = r["symbol"].split("_")[0]
-        if coin not in ex_pos:
-            add(f"本地显示 {r['symbol']} 持仓中（#{r['id']}），但交易所查不到该仓位")
+    snap = None
+    if address and info is not None:
+        try:
+            snap = info.snapshot(address)
+        except HlInfoError as e:
+            add(f"读不到 HL 账户：{e}")
+    if snap is not None:
+        ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
+        orders_trusted = bool(snap.get("orders_trusted", False))
+        for p in ex_pos.values():
+            if not orders_trusted:
+                # 挂单接口回落（读不到 isTrigger）：与执行器同口径 —— 只提示、不判裸奔
+                add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损状态无法确认（挂单接口不可信）")
+                continue
+            has_stop = any(o.get("coin") == p["coin"] and o.get("reduce_only") and o.get("is_trigger")
+                           for o in snap.get("open_orders") or [])
+            if not has_stop:
+                add(f"{p['coin']} 有仓位但没有止损挂单（裸奔仓位，请立刻处理）")
+            else:
+                add(f"{p['coin']} 仓位 {p['size']} @ {p['entry_px']:,.2f}，止损单在场", ok=True)
+        for r in db.recent_positions(20):
+            if (r["hl_status"] or "") == "mismatch":
+                add(f"仓位 #{r['id']} {r['symbol']} 处于 mismatch（本地与交易所不一致）")
+        local_open = [r for r in db.recent_positions(20)
+                      if r["status"] == "open" and (r["hl_status"] or "") == "open"]
+        for r in local_open:
+            coin = r["symbol"].split("_")[0]
+            if coin not in ex_pos:
+                add(f"本地显示 {r['symbol']} 持仓中（#{r['id']}），但交易所查不到该仓位")
 
     # 5) 近 24h 失败单
     since = time.time() - 86400
@@ -138,15 +141,17 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     else:
         add(f"时钟偏差 {skew:+.2f} 秒", ok=True)
 
-    # 7) 权益（统一账户下余额在现货状态里）
-    if snap.get("unified"):
+    # 7) 权益（统一账户下余额在现货状态里）—— snap 可能因地址缺失/读取失败为 None
+    if snap is not None and snap.get("unified"):
         add(f"账户总值 {snap.get('equity_total', 0):,.2f} USDC"
             f"（统一账户：抵押品 {snap.get('spot_usdc', 0):,.2f} 在现货 + 浮动盈亏）", ok=True)
-    else:
+    elif snap is not None:
         add(f"账户权益 {snap.get('equity', 0):,.2f} USDC（可用 {snap.get('withdrawable', 0):,.2f}）",
             ok=True)
 
     # 8) agent（API 钱包）授权到期 —— 到期后所有下单会被拒，必须提前发现
+    if not address or info is None:
+        return notes
     try:
         ag = info.agent_status(address)
         agents = ag.get("agents") or []

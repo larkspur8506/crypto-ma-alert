@@ -32,7 +32,7 @@ STOP_MAX = 0.10            # 止损距离上限（配合逐仓 5x：强平 -19.5
 WARMUP_BARS = 120          # SMA120 需要的最小根数
 REGIME_MA = 200            # 做空趋势过滤：只在收盘价低于该均线时做空（回测验证过）
 # 算一次有效分位需要：250 根窗口 + 120 根预热（band 在前 119 根为 None）
-MIN_BARS_REQUIRED = BAND_WINDOW + WARMUP_BARS + 2
+MIN_BARS_REQUIRED = BAND_WINDOW + WARMUP_BARS + 6
 
 
 @dataclass(frozen=True)

@@ -205,7 +205,8 @@ def _rows(deps: "AdminDeps", name: str, limit: int = 50) -> List[Dict[str, Any]]
         out = fn(limit) or []
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[admin] %s 读取失败：%s", name, e)
-        return []
+        # 读取失败要能被看出来（以前显示成「暂无记录」，运维分不清是空还是坏）
+        return [{"_error": f"读取失败：{type(e).__name__}"}]
     return [_rowd(r) for r in out]
 
 
@@ -627,7 +628,11 @@ def render_records(deps: AdminDeps) -> str:
     # ---- 下单记录 ----
     o.append("<div class='card'><div class='sec'>下单记录（hl_orders）</div>")
     rows = ""
-    for r in _rows(deps, "hl_recent_orders", 50):
+    _orders_rows = _rows(deps, "hl_recent_orders", 50)
+    if _orders_rows and _orders_rows[0].get("_error"):
+        rows += f"<tr><td colspan='8' class='bad'>{_esc(_orders_rows[0]['_error'])}</td></tr>"
+        _orders_rows = []
+    for r in _orders_rows:
         st = str(r.get("status") or "—")
         st_cls = "neg" if st == "failed" else ("warn" if st in ("intent", "sent") else "")
         err = str(r.get("error") or "")[:60]
@@ -635,8 +640,8 @@ def render_records(deps: AdminDeps) -> str:
                  f"<td>{_esc(_coin(r.get('coin'), r.get('symbol')))}</td>"
                  f"<td>{_esc(_PURPOSE_TXT.get(str(r.get('purpose')), r.get('purpose') or '—'))}</td>"
                  f"<td><span class='{st_cls}'>{_esc(_ORDER_ST_TXT.get(st, st))}</span></td>"
-                 f"<td class='num'>{_fmt(r.get('filled_sz') or r.get('sz'), 4)}</td>"
-                 f"<td class='num'>{_fmt(r.get('avg_px') or r.get('px'))}</td>"
+                 f"<td class='num'>{_fmt(r['filled_sz'] if r.get('filled_sz') is not None else r.get('sz'), 4)}</td>"
+                 f"<td class='num'>{_fmt(r['avg_px'] if r.get('avg_px') is not None else r.get('px'))}</td>"
                  f"<td><span class='muted'>{_esc(err or '—')}</span></td></tr>")
     o.append(_table("<th>时间</th><th>标的</th><th>用途</th><th>状态</th>"
                     "<th class='num'>数量</th><th class='num'>均价</th><th>错误</th>",
