@@ -40,7 +40,7 @@ CREATE TABLE IF NOT EXISTS positions (
     notional REAL NOT NULL,
     risk_u REAL NOT NULL,
     actual_entry REAL,                 -- 用户确认的实际成交价
-    actual_contracts INTEGER,
+    actual_contracts REAL,             -- 实际数量（HL 是币数量如 0.00095；MEXC 人工流是张数）
     actual_stop REAL,
     stop_placed INTEGER DEFAULT 0,
     exit_price REAL,
@@ -237,7 +237,7 @@ class DB:
         return self.conn.execute("SELECT * FROM positions WHERE id=?", (pid,)).fetchone()
 
     @_locked
-    def confirm_position(self, pid: int, actual_entry: float, actual_contracts: int,
+    def confirm_position(self, pid: int, actual_entry: float, actual_contracts: float,
                          actual_stop: float, stop_placed: bool) -> None:
         self.conn.execute(
             "UPDATE positions SET status='open', actual_entry=?, actual_contracts=?, actual_stop=?, "
@@ -246,7 +246,7 @@ class DB:
         self.conn.commit()
 
     @_locked
-    def update_fill(self, pid: int, actual_entry: float, actual_contracts: int,
+    def update_fill(self, pid: int, actual_entry: float, actual_contracts: float,
                     actual_stop: float, stop_placed: bool) -> None:
         """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。"""
         p = self.position_by_id(pid)

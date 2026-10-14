@@ -298,14 +298,17 @@ def impact(cfg: Any, price: float, base: Optional[float] = None,
     notional = risk_u / sd
     return {"price": price, "equity": eq, "risk_pct": rp, "leverage": lev,
             "stop_dist": sd, "risk_u": risk_u, "notional": notional,
-            "margin": notional / lev, "liq": sizing.liq_price(price, lev, 1)}
+            "margin": notional / lev, "liq": sizing.liq_price(price, lev, 1),
+            # 做空参考（同参数镜像）：预览页给出两个方向的强平价，防误读
+            "liq_short": sizing.liq_price(price, lev, -1)}
 
 
 def _impact_line(d: Optional[dict]) -> str:
     if not d:
         return "影响预览：无法取价（等只读接口恢复后再算）"
     return (f"按 BTC 现价 {d['price']:,.0f}：单笔风险 {d['risk_u']:.2f}U · "
-            f"名义 {d['notional']:,.0f}U · 保证金 {d['margin']:,.0f}U · 强平 {d['liq']:,.0f}")
+            f"名义 {d['notional']:,.0f}U · 保证金 {d['margin']:,.0f}U · "
+            f"强平 多{d['liq']:,.0f}/空{d['liq_short']:,.0f}")
 
 
 # ---------------------------------------------------------------- 参数 Tab
@@ -361,6 +364,8 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
         mode = str(getattr(cfg, "equity_mode", "follow") or "follow")
         if mode == "fixed":
             return "固定：按上面写的基数下单，不跟账户盈亏走"
+        if live <= 0:
+            return f"⚠️ 读不到实时权益（{live:,.2f}）→ 实际按固定基数 {base:,.0f}U 下单，不是跟随"
         return f"跟随：实时权益 {live:,.2f}U → 当前生效基数 {base:,.0f}U"
     if key == "equity_min":
         return f"跟随模式下基数不低于 {_num(getattr(cfg, 'equity_min', 0)):,.0f}U"
@@ -371,7 +376,7 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
         lev = _num(getattr(cfg, 'leverage', 5))
         if imp:
             return f"名义 {imp['notional']:,.0f}U ÷ {lev:g}x = 保证金 {imp['margin']:,.0f}U；" \
-                   f"强平 ≈{imp['liq']:,.0f}"
+                   f"强平 ≈多 {imp['liq']:,.0f} / 空 {imp['liq_short']:,.0f}"
         return f"{lev:g}x 逐仓（取价失败，保证金/强平不算）"
     if key == "stop_min":
         return f"最紧止损 {_num(getattr(cfg, 'stop_min', 0)) * 100:.2f}% → 名义 " \

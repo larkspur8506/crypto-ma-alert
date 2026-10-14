@@ -26,7 +26,7 @@ def _snap(equity=1000.0, positions=(), orders=(), notional=0.0, ts=None):
     return {"ts": time.time() if ts is None else ts, "address": "0xabc", "equity": equity,
             "withdrawable": equity,
             "margin_used": 100.0, "notional": notional,
-            "positions": list(positions), "open_orders": list(orders)}
+            "positions": list(positions), "open_orders": list(orders), "orders_trusted": True}
 
 
 def _pos(coin="BTC", size=0.01, entry=83000.0, side=1, upnl=0.0):
