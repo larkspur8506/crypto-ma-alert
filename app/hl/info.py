@@ -128,7 +128,13 @@ class HlInfo:
         """
         try:
             data = self.post({"type": "frontendOpenOrders", "user": address})
-            return (data if isinstance(data, list) else []), True
+            if not isinstance(data, list):
+                # 非 list（错误对象/限流响应）≠ 空挂单列表。当可信空表会把
+                # 「有仓 + 止损单在场」判成裸仓 → 触发自动补挂/平仓真实仓位。
+                logger.warning("[hl-info] frontendOpenOrders 返回非列表（%s），标记为不可信",
+                               str(data)[:120])
+                return [], False
+            return data, True
         except HlInfoError as e:                                     # 老接口兜底（不可信）
             logger.warning("[hl-info] frontendOpenOrders 不可用，回落 openOrders"
                            "（挂单列表标记为不可信，不做止损判断）：%s", e)

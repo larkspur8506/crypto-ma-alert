@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import logging
 import os
+import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -28,6 +29,9 @@ from app.sizing import size_order
 
 logger = logging.getLogger(__name__)
 INTERVAL_MS = market.INTERVAL_MS
+# pending（待确认）仓位超过这个数量的 4h 根就自动作废释放槽位：
+# 用户漏看一次提醒不该永久堵死该标的的后续信号（历史 bug：pending 永久占槽）。
+PENDING_BARS_MAX = 3
 
 # 提醒里的时间一律按**北京时间**显示（用户在国内看）：bar 用 UTC 开盘时间做键，
 # 但给人看的时间要换成 +08，否则对不上自己的下单/平仓时刻。
@@ -352,13 +356,27 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
             logger.exception("执行器 run() 异常: %s", e)
     for symbol in cfg.symbols:
         try:
-            feed = market.fetch(symbol, now_ms)
+            _tick_symbol(db, cfg, notifier, symbol, now_ms, executor, sent)
         except market.FeedError as e:
             db.mark_feed(symbol, "", False, str(e))
             _emit(db, notifier, cfg, Alert("data_error", symbol, None,
                                            format_data_error(cfg, symbol, str(e))), sent)
-            continue
-        db.mark_feed(symbol, feed.source, True)
+        except Exception as e:                                   # noqa: BLE001
+            # 单个标的的任何异常（未知 symbol、非法配置、DB 故障…）都不能
+            # 打断其余标的 —— 旧版一个 KeyError 就让所有标的的 tick 静默停摆。
+            logger.exception("[tick] %s 处理异常: %s", symbol, e)
+            try:
+                _emit(db, notifier, cfg, Alert(
+                    "data_error", symbol, None,
+                    f"{cfg.alert_prefix}{symbol} 处理异常：{type(e).__name__}: {e}（其余标的照常）"),
+                    sent)
+            except Exception:                                    # noqa: BLE001
+                logger.exception("[tick] 异常提醒发送失败: %s", symbol)
+    return sent
+
+
+def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[str]) -> None:
+        feed = market.fetch(symbol, now_ms)
         bars = feed.bars
         ind = strategy.compute_indicators(bars)
         sq = strategy.squeeze_flags(ind["band"], cfg.band_window, cfg.band_quantile,
@@ -373,10 +391,24 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
             from_i = (idx + 1) if idx is not None else latest_closed_i
         if from_i > latest_closed_i:
             db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
-            continue
+            return
 
         row = db.open_position(symbol)
-        position = _row_to_state(row) if row else None
+        # pending（用户还没确认）不算真仓：不对它判离场（否则从未开过的仓会被
+        # 自动关账、写 r_multiple 污染统计）；但超过 PENDING_BARS_MAX 根 4h 未处理
+        # 就作废释放槽位，否则一次漏看提醒会永久堵死该标的的新信号。
+        if row is not None and row["status"] == "pending":
+            ref_now = int(now_ms if now_ms is not None else time.time() * 1000)
+            age_bars = (ref_now - int(row["signal_bar_ms"])) // INTERVAL_MS
+            if age_bars >= PENDING_BARS_MAX:
+                db.ignore_position(int(row["id"]))
+                _emit(db, notifier, cfg, Alert(
+                    "exit", symbol, int(row["signal_bar_ms"]),
+                    (f"{cfg.alert_prefix}{symbol} 待确认仓位已作废：信号超过 {PENDING_BARS_MAX} 根 4h"
+                     f"（{age_bars} 根）未确认，槽位已释放。若你实际开了仓，请自行管理离场。")),
+                    sent)
+                row = None
+        position = _row_to_state(row) if row is not None and row["status"] != "pending" else None
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
                                latest_closed_i)
 
@@ -425,7 +457,6 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
                 _emit(db, notifier, cfg, Alert("entry_missed", symbol, ev.bar_ms,
                                                format_missed(cfg, ev.sig)), sent)
         db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
-    return sent
 
 
 def _emit(db, notifier, cfg, alert: Alert, sent: List[str]) -> None:
