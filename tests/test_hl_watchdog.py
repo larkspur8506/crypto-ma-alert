@@ -186,5 +186,25 @@ class TestMain(Base):
         self.assertIn("kill switch", out)
 
 
+class TestAgentExpiry(Base):
+    """agent（API 钱包）授权到期必须提前告警 —— 到期后所有下单会被拒。"""
+
+    def test_warns_when_expiring_soon(self):
+        self.db.hl_log_event("heartbeat", "ok")
+        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": (time.time() + 3600) * 1000}
+        joined = " ".join(self.bad(self.checks()))
+        self.assertIn("agent 授权只剩", joined)
+
+    def test_quiet_when_far_from_expiry(self):
+        self._heartbeat()
+        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": (time.time() + 30 * 86400) * 1000}
+        self.assertEqual(self.bad(self.checks()), [])
+
+    def test_no_expiry_is_fine(self):
+        self._heartbeat()
+        self.info.agent_status = lambda addr: {"agent_address": "0x3f7a", "agent_valid_until": None}
+        self.assertEqual(self.bad(self.checks()), [])
+
+
 if __name__ == "__main__":
     unittest.main()

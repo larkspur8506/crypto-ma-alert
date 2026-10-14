@@ -454,8 +454,9 @@ class Executor:
         day0 = _today_start_ts()
         base = self.db.hl_snapshots(since_ts=day0, limit=1)
         if base and not self.db.hl_kill():
+            # 统一账户下 snap["equity"]（永续口径）恒为 0 → 必须用账户总值，否则熔断永不触发
             start_eq = float(base[0]["equity"] or 0.0)
-            now_eq = float(snap.get("equity") or 0.0)
+            now_eq = float(snap.get("equity_total", snap.get("equity")) or 0.0)
             if start_eq > 0 and (now_eq - start_eq) / start_eq <= -self.p.max_daily_loss_pct:
                 self.db.hl_set_kill(True, "当日亏损熔断")
                 self._event(EV_KILL, f"当日亏损 {((now_eq - start_eq) / start_eq) * 100:.1f}% → kill",
@@ -470,7 +471,8 @@ class Executor:
                 self._event(EV_ERROR, f"死手开关设置失败：{r['error']}")
 
         # 4) 心跳（看守据此判断执行器存活）
-        self._event(EV_HEARTBEAT, f"executor 心跳（equity {snap.get('equity')}）",
+        self._event(EV_HEARTBEAT,
+                    f"executor 心跳（equity {snap.get('equity_total', snap.get('equity'))}）",
                     data={"kill": self.db.hl_kill(), "mode": self.p.mode})
         for a in alerts:
             self._alert(a)

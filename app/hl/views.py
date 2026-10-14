@@ -528,7 +528,10 @@ def status_payload(deps: DashboardDeps) -> dict:
         },
         "account": {
             "address": address,
-            "equity": _num(snap.get("equity")),
+            "equity": _num(snap.get("equity_total", snap.get("equity"))),   # 总值（统一账户友好）
+            "perp_equity": _num(snap.get("equity")),                        # 永续口径（原字段语义）
+            "spot_usdc": _num(snap.get("spot_usdc")),
+            "unified": bool(snap.get("unified", False)),
             "withdrawable": _num(snap.get("withdrawable")),
             "margin_used": _num(snap.get("margin_used")),
             "notional": _num(snap.get("notional")),
@@ -720,7 +723,11 @@ def _render_body(p: dict) -> str:
     total_txt, total_cls = _sign(acc.get("total_realized"))
     fund_txt, fund_cls = _sign(acc.get("funding_total"))
     fees = _num(acc.get("fees_total"))
-    o.append(_kv("账户权益", f"{_fmt(acc.get('equity'))} U"))
+    o.append(_kv("账户总值", f"{_fmt(acc.get('equity'))} U"))
+    if acc.get("unified"):
+        # 统一账户：钱在现货状态里，永续口径恒为 0 —— 说清楚，免得以为「没资金」
+        o.append(_kv("　现货 USDC（抵押品）", f"{_fmt(acc.get('spot_usdc'))} U", "muted"))
+        o.append(_kv("　永续账户口径", f"{_fmt(acc.get('perp_equity'))} U", "muted"))
     o.append(_kv("可提余额", f"{_fmt(acc.get('withdrawable'))} U"))
     o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
     o.append(_kv("持仓名义", f"{_fmt(acc.get('notional'))} U"))

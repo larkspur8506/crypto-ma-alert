@@ -401,7 +401,9 @@ class DB:
         self.conn.execute(
             "INSERT INTO hl_snapshots(ts, equity, withdrawable, margin_used, notional, unrealized_pnl,"
             " positions_json, created_at) VALUES(?,?,?,?,?,?,?,?)",
-            (float(snap.get("ts") or now()), float(snap.get("equity") or 0.0),
+            (float(snap.get("ts") or now()),
+             # 优先存「账户总值」：统一账户下 equity（永续口径）恒为 0，存它曲线会全是 0
+             float(snap.get("equity_total", snap.get("equity")) or 0.0),
              float(snap.get("withdrawable") or 0.0), float(snap.get("margin_used") or 0.0),
              float(snap.get("notional") or 0.0), upnl,
              json.dumps(positions, ensure_ascii=False), now()))

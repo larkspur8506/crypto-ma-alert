@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import urllib.error
 import urllib.request
@@ -30,8 +31,14 @@ class HlInfoError(Exception):
 
 class HlInfo:
     def __init__(self, base_url: str = MAINNET, timeout: float = 10.0,
-                 retries: int = 3, backoff=(1.0, 3.0, 9.0), opener=None):
+                 retries: int = 3, backoff=(1.0, 3.0, 9.0), opener=None,
+                 unified: Optional[bool] = None):
         self.base_url = (base_url or MAINNET).rstrip("/")
+        # 统一账户（HL 新账户默认）：余额与占用都在现货状态里，永续 accountValue 恒为 0。
+        # 默认按统一账户读（多一次 spotClearinghouseState 请求）；标准账户设 HL_UNIFIED_ACCOUNT=0。
+        if unified is None:
+            unified = (os.environ.get("HL_UNIFIED_ACCOUNT", "1") or "1").strip().lower() not in ("0", "false", "no", "off")
+        self.unified = bool(unified)
         self.timeout = timeout
         self.retries = max(1, retries)
         self.backoff = tuple(backoff)
@@ -74,7 +81,18 @@ class HlInfo:
         return out
 
     def user_state(self, address: str) -> dict:
-        return self.post({"type": "clearinghouseState", "user": address})
+        return self.post({"type": "clearinghouseState", "user": address}) or {}
+
+    def spot_state(self, address: str) -> dict:
+        """现货状态。**统一账户（HL 新账户默认）下余额与占用都在这里**：
+        官方文档 Important details #3 ——「对 API 用户，统一账户/组合保证金把余额和占用
+        显示在现货状态里，各个 perp dex 的用户状态没有意义」。"""
+        return self.post({"type": "spotClearinghouseState", "user": address}) or {}
+
+    def agent_status(self, address: str) -> dict:
+        """UI 同款聚合接口里的 agent 授权信息（agentAddress / agentValidUntil）。"""
+        w = self.post({"type": "webData2", "user": address}) or {}
+        return {"agent_address": w.get("agentAddress"), "agent_valid_until": w.get("agentValidUntil")}
 
     def open_orders(self, address: str) -> List[dict]:
         data = self.post({"type": "openOrders", "user": address})
@@ -208,10 +226,34 @@ class HlInfo:
                 "is_trigger": bool(o.get("isTrigger")),
                 "timestamp": o.get("timestamp"),
             })
+        # 统一账户（HL 新账户默认）：余额在**现货**状态里，永续 accountValue 恒为 0。
+        # 只看永续会误报「没资金」，而且日内熔断的基准会变成 0（永远不触发）。
+        spot_usdc = 0.0
+        spot_balances: List[dict] = []
+        if self.unified:
+            try:
+                for b in (self.spot_state(address).get("balances") or []):
+                    coin = str(b.get("coin") or "")
+                    total = self._num(b.get("total"))
+                    hold = self._num(b.get("hold"))
+                    if total or hold:
+                        spot_balances.append({"coin": coin, "total": total, "hold": hold})
+                    if coin == "USDC":
+                        spot_usdc += total
+            except HlInfoError as e:                                     # noqa: BLE001
+                logger.warning("[hl-info] 现货状态读取失败（统一账户余额将显示为 0）：%s", e)
+        perp_equity = self._num(ms.get("accountValue"))
+        upnl = sum(p["unrealized_pnl"] for p in positions)
+        # 统一账户：账户总值 = 抵押品（现货 USDC）+ 未实现盈亏；标准账户：永续 accountValue 已含盈亏
+        equity_total = (spot_usdc + upnl) if self.unified else perp_equity
         return {
             "ts": time.time(),
             "address": address,
-            "equity": self._num(ms.get("accountValue")),
+            "equity": perp_equity,              # 永续账户口径（标准模式=总值；统一模式通常为 0）
+            "equity_total": equity_total,       # 账户总值：面板与熔断都用它
+            "unified": self.unified,
+            "spot_usdc": spot_usdc,
+            "spot_balances": spot_balances,
             "withdrawable": self._num(st.get("withdrawable")),
             "margin_used": self._num(ms.get("totalMarginUsed")),
             "notional": self._num(ms.get("totalNtlPos")),

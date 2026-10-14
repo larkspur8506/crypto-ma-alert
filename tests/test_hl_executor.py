@@ -66,6 +66,13 @@ class FakeInfo:
     def user_fills(self, address):
         return list(self._fills)
 
+    def spot_state(self, address):
+        return {"balances": [{"coin": "USDC", "total": "100.79", "hold": "0.0"}]}
+
+    def agent_status(self, address):
+        return {"agent_address": "0x3f7aaf0334c7ab4baaf36d6f5860389ce742d1f3",
+                "agent_valid_until": 1793162156561}
+
 
 class FakeExchange:
     """按脚本返回结果的假写通道，并记录所有调用。"""

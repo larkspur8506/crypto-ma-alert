@@ -148,11 +148,13 @@ class TestSnapshot(unittest.TestCase):
         self.assertAlmostEqual(snap["equity"], 5.0)
 
     def test_mids_can_be_passed_in(self):
-        f = _FakeOpener([self._state(), []])          # 只两次调用：state + openOrders
+        f = _FakeOpener([self._state(), [], {"balances": []}])   # state + openOrders + 现货
         info = HlInfo(base_url="https://api.test", opener=f)
         snap = info.snapshot("0xabc", mids={"BTC": 84000.0})
         self.assertAlmostEqual(snap["positions"][0]["mark_px"], 84000.0)
-        self.assertEqual(len(f.calls), 2)
+        self.assertEqual(len(f.calls), 3)
+        self.assertEqual([c["type"] for c in f.calls],
+                         ["clearinghouseState", "openOrders", "spotClearinghouseState"])
 
     def test_empty_response(self):
         info = _info([{}])
@@ -177,6 +179,59 @@ class TestEndpoints(unittest.TestCase):
         self.assertEqual(got, want_types)
         self.assertEqual(f.calls[4]["req"], {"coin": "BTC", "interval": "4h",
                                              "startTime": 1, "endTime": 2})
+
+
+class TestUnifiedAccount(unittest.TestCase):
+    """统一账户（HL 新账户默认）：余额在现货状态里，永续 accountValue 恒为 0。
+
+    官方文档 Important details #3：「对 API 用户，统一账户/组合保证金把余额和占用
+    显示在现货状态里，各个 perp dex 的用户状态没有意义」。
+    """
+
+    STATE = {"marginSummary": {"accountValue": "0.0", "totalMarginUsed": "0.0",
+                              "totalNtlPos": "0.0"},
+             "withdrawable": "0.0", "assetPositions": []}
+
+    def test_unified_equity_comes_from_spot(self):
+        f = _FakeOpener([self.STATE, [], {"balances": [{"coin": "USDC", "total": "100.79", "hold": "0.0"},
+                                                       {"coin": "HYPE", "total": "3.0", "hold": "0.0"}]}])
+        info = HlInfo(base_url="https://api.test", opener=f, unified=True)
+        snap = info.snapshot("0xabc", mids={})
+        self.assertEqual(snap["equity"], 0.0)                 # 永续口径（统一账户下为 0）
+        self.assertAlmostEqual(snap["equity_total"], 100.79)  # 总值 = 现货 USDC
+        self.assertAlmostEqual(snap["spot_usdc"], 100.79)
+        self.assertTrue(snap["unified"])
+        self.assertEqual([b["coin"] for b in snap["spot_balances"]], ["USDC", "HYPE"])
+
+    def test_unified_total_adds_unrealized_pnl(self):
+        state = dict(self.STATE)
+        state["assetPositions"] = [{"position": {"coin": "BTC", "szi": "0.01", "entryPx": "83000",
+                                                "positionValue": "830", "liquidationPx": "70000",
+                                                "marginUsed": "166", "unrealizedPnl": "-7.5",
+                                                "leverage": {"type": "isolated", "value": 5},
+                                                "cumFunding": {"sinceOpen": "0.01"}}}]
+        f = _FakeOpener([state, [], {"balances": [{"coin": "USDC", "total": "100.79", "hold": "83.0"}]}])
+        info = HlInfo(base_url="https://api.test", opener=f, unified=True)
+        snap = info.snapshot("0xabc", mids={"BTC": 82500.0})
+        self.assertAlmostEqual(snap["equity_total"], 100.79 - 7.5, places=6)
+        self.assertAlmostEqual(snap["spot_balances"][0]["hold"], 83.0)   # 占用照实显示
+
+    def test_standard_mode_keeps_perp_equity_and_skips_spot_call(self):
+        state = dict(self.STATE)
+        state["marginSummary"] = {"accountValue": "250.0", "totalMarginUsed": "10.0", "totalNtlPos": "0.0"}
+        f = _FakeOpener([state, []])                    # 不该再去读现货
+        info = HlInfo(base_url="https://api.test", opener=f, unified=False)
+        snap = info.snapshot("0xabc", mids={})
+        self.assertEqual(snap["equity_total"], 250.0)
+        self.assertEqual(snap["spot_usdc"], 0.0)
+        self.assertEqual([c["type"] for c in f.calls], ["clearinghouseState", "openOrders"])
+
+    def test_spot_read_failure_does_not_break_snapshot(self):
+        f = _FakeOpener([self.STATE, [], OSError("spot down"), OSError("spot down"), OSError("spot down")])
+        info = HlInfo(base_url="https://api.test", opener=f, retries=3, backoff=(0, 0, 0), unified=True)
+        snap = info.snapshot("0xabc", mids={})
+        self.assertEqual(snap["equity_total"], 0.0)      # 读不到就按 0，不抛异常、不影响持仓读取
+        self.assertEqual(snap["positions"], [])
 
 
 if __name__ == "__main__":

@@ -25,6 +25,7 @@ from app.hl.info import HlInfoError
 STUCK_ORDER_S = 180.0
 HEARTBEAT_MAX_S = 15 * 60
 CLOCK_SKEW_MAX_S = 2.0
+AGENT_WARN_DAYS = 3.0        # agent 授权剩余天数低于此值就告警（到期=无法下单）
 
 
 def _env(key: str, default: str = "") -> str:
@@ -131,8 +132,29 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     else:
         add(f"时钟偏差 {skew:+.2f} 秒", ok=True)
 
-    # 7) 权益
-    add(f"账户权益 {snap.get('equity', 0):,.2f} USDC（可用 {snap.get('withdrawable', 0):,.2f}）", ok=True)
+    # 7) 权益（统一账户下余额在现货状态里）
+    if snap.get("unified"):
+        add(f"账户总值 {snap.get('equity_total', 0):,.2f} USDC"
+            f"（统一账户：抵押品 {snap.get('spot_usdc', 0):,.2f} 在现货 + 浮动盈亏）", ok=True)
+    else:
+        add(f"账户权益 {snap.get('equity', 0):,.2f} USDC（可用 {snap.get('withdrawable', 0):,.2f}）",
+            ok=True)
+
+    # 8) agent（API 钱包）授权到期 —— 到期后所有下单会被拒，必须提前发现
+    try:
+        ag = info.agent_status(address)
+        until = ag.get("agent_valid_until")
+        if until:
+            days_left = (float(until) / 1000.0 - time.time()) / 86400.0
+            if days_left <= AGENT_WARN_DAYS:
+                add(f"⚠️ agent 授权只剩 {days_left:.1f} 天（{str(ag.get('agent_address'))[:10]}…）"
+                    f"—— 到期后自动交易会全部失败，请到 HL 设置里重新生成/延长 API 钱包")
+            else:
+                add(f"agent 授权还有 {days_left:.0f} 天", ok=True)
+        else:
+            add("agent 授权无到期时间", ok=True)
+    except Exception as e:                                           # noqa: BLE001
+        add(f"读不到 agent 授权状态：{e}")
     return notes
 
 
