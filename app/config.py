@@ -33,8 +33,10 @@ def _env_i(key: str, default: int) -> int:
 @dataclass
 class Config:
     # 策略（可被 DB 覆盖的放 db_overridable）
+    # 默认三标的（BTC/ETH/SOL）。线上容器用 compose 的 SYMBOLS env 覆盖（当前
+    # 显式设成 BTC_USDT,ETH_USDT —— 靠 env 控制上线节奏，不随代码默认值改变）。
     symbols: List[str] = field(default_factory=lambda: [s for s in _env(
-        "SYMBOLS", "BTC_USDT,ETH_USDT").split(",") if s])
+        "SYMBOLS", "BTC_USDT,ETH_USDT,SOL_USDT").split(",") if s])
     risk_pct: float = _env_f("RISK_PCT", 0.02)
     equity: float = _env_f("ACCOUNT_EQUITY", 1000.0)
     leverage: float = _env_f("LEVERAGE", 5.0)

@@ -43,7 +43,7 @@ uvicorn app.main:app --port 8000
 
 | 变量 | 说明 |
 |---|---|
-| `SYMBOLS` | 默认 `BTC_USDT,ETH_USDT` |
+| `SYMBOLS` | 标的清单，默认 `BTC_USDT,ETH_USDT,SOL_USDT`（线上靠 compose 显式设成 `BTC_USDT,ETH_USDT` 控制上线节奏） |
 | `ACCOUNT_EQUITY` | 账户权益（U），算仓位用；后台可改 |
 | `RISK_PCT` | 单笔风险比例，默认 0.02 |
 | `LEVERAGE` | 默认 5 |
