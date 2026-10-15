@@ -137,5 +137,15 @@ class TestRehearseScript(unittest.TestCase):
         self.assertIn("未发送任何网络推送", out)
 
 
+class TestWatchdogWording(unittest.TestCase):
+    """看守文案也用白话：不出现「抵押品/永续口径」。"""
+
+    def test_no_jargon_in_watchdog(self):
+        src = (ROOT / "app" / "hl" / "watchdog.py").read_text(encoding="utf-8")
+        self.assertNotIn("抵押品", src)
+        self.assertNotIn("永续口径", src)
+        self.assertIn("（统一账户：现货 ", src)
+
+
 if __name__ == "__main__":
     unittest.main()
