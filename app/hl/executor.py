@@ -28,10 +28,14 @@ from app.hl import sizing as hl_sizing
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
+from app import symbol_registry as registry
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_COIN_MAP = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+# coin 映射的**默认值从单一注册表派生**（app/symbol_registry.py）——上一版手写
+# {"BTC_USDT": "BTC", "ETH_USDT": "ETH"} 漏了 SOL，靠 `coin()` 的 split 兜底才没炸；
+# split 兜底已删除（见 Executor.coin），所以这里必须与注册表同源。
+DEFAULT_COIN_MAP = {s: registry.hl_coin(s) for s in registry.known_symbols()}
 
 
 # ---------------------------------------------------------------- 推送文案（人类可读）
@@ -176,8 +180,34 @@ class Executor:
         self._op_lock = threading.Lock()
 
     # ------------------------------------------------------------ 工具
+    def _coin_or_none(self, symbol: str) -> Optional[str]:
+        """解析 symbol → HL 合约名；未命中返回 None（**不抛**）。
+
+        三层顺序与行情层 `market.hl_coin` 一致：executor coin_map（= env/DB 覆盖，
+        由 main.py 从 `HL_COIN_MAP` 装配）→ 注册表 → None。
+        供闸门/容错路径使用（那些路径不能因为一个配置错误就抛异常崩掉整轮 tick）。
+        """
+        m = self.p.coin_map or {}
+        if symbol in m:
+            return m[symbol]
+        try:
+            return registry.hl_coin(symbol)
+        except registry.SymbolNotConfigured:
+            return None
+
     def coin(self, symbol: str) -> str:
-        return self.p.coin_map.get(symbol, symbol.split("_")[0])
+        """symbol → HL 合约名；未配置即抛 `SymbolNotConfigured`（fail-closed）。
+
+        **去掉了 `symbol.split("_")[0]` 兜底**：`1000PEPE_USDT` 会拼出 `1000PEPE`
+        这种（在这个执行器里）并不存在的 HL 名 → 静默打错 API、可能下错标的的单。
+        未注册/未配置一律抛出，调用方要么显性拦截（入场闸门）要么降级告警，
+        绝不允许静默猜一个名字。
+        """
+        c = self._coin_or_none(symbol)
+        if c is None:
+            raise registry.SymbolNotConfigured(
+                f"未配置 HL coin 映射：{symbol}（不在注册表 symbol_registry / executor coin_map）")
+        return c
 
     def _alert_fill(self, text: str) -> None:
         """成交回报（开仓/平仓成功）。受面板「成交回报推送」开关控制；异常类提醒一律走 _alert。
@@ -266,7 +296,12 @@ class Executor:
                       and (r["hl_status"] or "") in ("open", "mismatch", "")]
         seen = set()
         for r in local_open:
-            coin = self.coin(r["symbol"])
+            # coin 解析不出（未注册）：无法与交易所仓比对，也不许拿猜的名字去补挂/平仓
+            # → 记成问题（fail-closed，走既有告警/停手口径），但不抛异常打断整轮对账。
+            coin = self._coin_or_none(r["symbol"])
+            if coin is None:
+                problems.append(f"未配置 HL coin 映射：{r['symbol']}（本地仓 #{r['id']}，无法对账）")
+                continue
             seen.add(coin)
             if coin not in ex_pos:
                 problems.append(f"{r['symbol']} 本地有仓（#{r['id']}）但交易所无仓位")
@@ -292,7 +327,13 @@ class Executor:
         补挂成功也不解锁 kill —— 异常已经发生，由人工核对后决定是否恢复自动交易。
         """
         symbol = str(row.get("symbol"))
-        coin = self.coin(symbol)
+        # 映射缺失 → 不知道交易所上的标的，**绝不动交易所**（补挂/平仓都不做），只提示
+        coin = self._coin_or_none(symbol)
+        if coin is None:
+            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，不自动补挂止损", symbol=symbol)
+            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，无法自动补挂止损/平仓"
+                        f"（fail-closed）—— 请人工核对交易所并处理。")
+            return
         bar_ms = int(row.get("signal_bar_ms") or 0)
         side = int(row.get("side") or 1)
         # 非 live 模式绝不动交易所：dry 的 place_order 返回 STATUS_DRY（非
@@ -366,6 +407,11 @@ class Executor:
     def _entry_gates(self, symbol: str, plan, snap: dict, equity: Optional[float] = None) -> List[str]:
         p = self.p
         bad: List[str] = []
+        # ① coin 映射（第一道显性闸门）：未注册/未配置 → 拒绝开仓。
+        #    没有映射就没法定位交易所标的，影子模式也不能静默走「猜一个前缀」的旧路。
+        coin = self._coin_or_none(symbol)
+        if coin is None:
+            bad.append(f"未配置 HL coin 映射：{symbol}（拒绝开仓）")
         if self.db.hl_kill():
             bad.append("kill switch 已触发")
         if self.p.live and not self.ex.available:
@@ -398,8 +444,9 @@ class Executor:
         if fails >= p.max_fail_streak:
             bad.append(f"近一小时失败 {fails} 次（上限 {p.max_fail_streak}）")
         for coin_pos in (snap or {}).get("positions") or []:
-            if coin_pos["coin"] == self.coin(symbol):
-                bad.append(f"交易所已有 {self.coin(symbol)} 仓位，拒绝重复开仓")
+            # coin 解析不出时不做仓位查重（比对不了），但上面的映射闸门已经拦下来了
+            if coin is not None and coin_pos["coin"] == coin:
+                bad.append(f"交易所已有 {coin} 仓位，拒绝重复开仓")
         return bad
 
     # ------------------------------------------------------------ 开仓
@@ -462,8 +509,19 @@ class Executor:
         if row is None or self.p.mode == MODE_OFF:
             return False
         symbol, side = row["symbol"], int(row["side"] or 1)
-        coin = self.coin(symbol)
         bar_ms = int(row["signal_bar_ms"])
+        # ② 入口容错闸门：coin 映射缺失 → 不进入下单流程（dry 也不能抛崩整轮 tick）。
+        #    落一条 skipped 意图留痕 + 告警（live 下引擎按 alert_logs 补推）。
+        #    该行的 coin 列写原始 symbol —— 没有映射可用；行状态是 skipped，绝不会用于发单。
+        coin = self._coin_or_none(symbol)
+        if coin is None:
+            self.db.hl_record_intent(symbol, symbol, bar_ms, PURPOSE_ENTRY, side, 0.0,
+                                     status=ST_SKIPPED)
+            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，拒绝开仓", symbol=symbol)
+            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，**拒绝开仓**"
+                        f"（fail-closed：无法定位交易所标的，绝不猜合约名）。"
+                        f"请到 app/symbol_registry.py 登记该标的。")
+            return True
 
         # 已有意图/结果 → 不重复处理（幂等）
         existing = self.db.hl_order(symbol, bar_ms, PURPOSE_ENTRY)
@@ -626,7 +684,8 @@ class Executor:
         return True
 
     def _entry_failed(self, symbol: str, bar_ms: int, msg: str) -> bool:
-        coin = self.coin(symbol)                     # 文案用 HL 合约名，DB 键仍用 symbol
+        # 文案用 HL 合约名（解析不出就退回 symbol，仅影响文案，不影响落库/状态）
+        coin = self._coin_or_none(symbol) or symbol
         self.db.hl_update_order(symbol, bar_ms, PURPOSE_ENTRY, status=ST_FAILED,
                                error=str(msg)[:300])
         self._event(EV_ERROR, f"开仓失败：{msg}", symbol=symbol)
@@ -647,8 +706,16 @@ class Executor:
         if (row["hl_status"] or "") not in ("open",):
             return False
         symbol, side = row["symbol"], int(row["side"] or 1)
-        coin = self.coin(symbol)
+        # 离场也不能猜 coin：解析不出就**让出接管权**（return False）→ 引擎照常走人工提醒流，
+        # 而不是拿一个猜出来的合约名去平仓/撤单（可能平错标的）。
+        coin = self._coin_or_none(symbol)
+        if coin is None:
+            self._event(EV_ERROR, f"未配置 HL coin 映射：{symbol}，不自动离场", symbol=symbol)
+            self._alert(f"【HL执行】⛔ {symbol} 未配置 HL coin 映射，无法自动平仓/撤单"
+                        f"（fail-closed）—— 请人工核对交易所并处理。")
+            return False
         bar_ms = int(row["signal_bar_ms"])
+
         # 平仓/重挂止损的 cloid 用「当前离场 bar」而不是入场 bar：
         # ① 同一仓位多次触发离场（首次失败后下个 4h 重试）时 cloid 必须变化，
         #    否则被交易所按重复 cloid 拒单，自动离场永久报废；
