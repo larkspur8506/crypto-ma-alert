@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+from app import posfields
 from app.ui_theme import THEME_CSS, normalize_theme, theme_attr, theme_switch_html
 
 logger = logging.getLogger(__name__)
@@ -535,10 +536,12 @@ def status_payload(deps: DashboardDeps) -> dict:
             "side": int(_num(d.get("side"), 1)),
             "entry": _opt_num(entry),
             "stop": _opt_num(stop),
-            "contracts": d.get("contracts"),
-            # HL 执行器管的仓：数量按币量显示（审计三轮 M5 —— positions 行里的
-            # contracts 是 MEXC 人工口径「张数」，HL 仓显示 85 张与真实 0.00084 BTC 矛盾）
-            "hl_qty": _opt_num(d.get("hl_sz")) if (d.get("hl_status") or "") else None,
+            "contracts": d.get("contracts"),    # 原始 MEXC 口径张数（兼容字段，展示不用）
+            # 双口径收敛（app/posfields.py）：数量走统一读侧 —— HL 仓 = 真实币量
+            # （actual_contracts/hl_sz），历史 MEXC 行 = 张数。行里的 contracts 在
+            # HL 仓上是 MEXC 人工口径的「张数」，直接显示会出现「85 张 vs 0.00084 BTC」。
+            "qty": _opt_num(posfields.qty(d)),
+            "qty_unit": posfields.qty_unit(d),
             "bar_ms": _opt_num(d.get("signal_bar_ms")),
         })
 
@@ -1003,8 +1006,7 @@ def _render_body(p: dict) -> str:
                  + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
                  + _td(_fmt(sg.get("entry")), "num")
                  + _td(_fmt(sg.get("stop")), "num")
-                 + _td(_fmt_sz(sg.get("hl_qty") if sg.get("hl_qty") is not None
-                               else sg.get("contracts")), "num")
+                 + _td(_fmt_sz(sg.get("qty")), "num")
                  + _td(_fmt_dt(sg.get("bar_ms")), "num")
                  + "</tr>")
     if not signals:

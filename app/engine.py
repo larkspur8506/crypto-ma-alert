@@ -22,7 +22,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from app import market, strategy
+from app import market, posfields, strategy
 from app.sizing import SPECS as CONTRACT_SPECS
 from app.sizing import metrics as sizing_metrics
 from app.sizing import size_order
@@ -201,7 +201,8 @@ def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
 
 
 def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: int,
-                entry: float, stop: float, contracts: int, source: str = "contracts") -> dict:
+                entry: float, stop: float, contracts: int, source: str = "contracts",
+                equity: Optional[float] = None) -> dict:
     """确认开仓后按**真实成交**做一次风险体检（纯计算，不落库）。
 
     为什么需要：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额
@@ -213,10 +214,14 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
 
     所以必须在成交后回算一次并把偏差讲清楚，而不是让用户以为
     「填了提醒里的金额 = 风险就是 2%」。
+
+    `equity`：这行的**下单基数**（positions.equity_at_entry；HL 仓由执行器写回
+    实际生效基数，MEXC 行是建行时的配置值）。不传则退回 `cfg.equity`（行为不变）。
     """
     contract_size = CONTRACT_SPECS[symbol][0]
     m = sizing_metrics(symbol, entry, stop, contracts, cfg.leverage)
-    target = cfg.equity * cfg.risk_pct
+    base = float(equity) if equity else cfg.equity
+    target = base * cfg.risk_pct
     drift = (entry - suggested_entry) / suggested_entry if suggested_entry else 0.0
     notes: List[str] = []
 
@@ -234,8 +239,8 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
     dev = (m["risk_u"] - target) / target if target else 0.0
     if abs(dev) >= 0.2:
         notes.append(
-            f"实际风险 {m['risk_u']:.1f}U（权益 {cfg.equity:,.0f}U 的 "
-            f"{m['risk_u'] / cfg.equity * 100:.1f}%）偏离目标 {target:.0f}U {dev * 100:+.0f}%")
+            f"实际风险 {m['risk_u']:.1f}U（基数 {base:,.0f}U 的 "
+            f"{m['risk_u'] / base * 100:.1f}%）偏离目标 {target:.0f}U {dev * 100:+.0f}%")
         if m["risk_unit"] > 0:
             want = int(target / (m["risk_unit"] * contract_size))
             cap = int((target / cfg.stop_min) / entry / contract_size) if entry > 0 else 0
@@ -251,7 +256,7 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
 
     return {"level": "warn" if notes else "ok", "notes": notes, "contracts": contracts,
             "source": source, "entry": entry, "stop": stop, "drift": drift,
-            "target_risk_u": target, "equity": cfg.equity, **m}
+            "target_risk_u": target, "equity": base, **m}
 
 
 def regime_note(side: int, price: float, ma200: float) -> dict:
@@ -623,9 +628,11 @@ def heartbeat_text(db, cfg) -> str:
         row = db.open_position(symbol)
         if row:
             st = "待确认" if row["status"] == "pending" else "持仓中"
-            lines.append(f"{symbol}: {st} {row['contracts']} 张 @ "
-                         f"{fmt_money(row['actual_entry'] or row['entry_price'])}，"
-                         f"止损 {fmt_money(row['actual_stop'] or row['stop_price'])}")
+            # 双口径：HL 仓的 contracts 是 MEXC 人工口径张数，真实数量是 actual_*（币量）
+            qty = posfields.qty(row)
+            lines.append(f"{symbol}: {st} {qty:g} {posfields.qty_unit(row)} @ "
+                         f"{fmt_money(posfields.entry_px(row) or 0.0)}，"
+                         f"止损 {fmt_money(posfields.stop_px(row) or 0.0)}")
     if not any(db.open_position(s) for s in cfg.symbols):
         lines.append("当前无持仓")
     recent = db.recent_alerts(limit=200)
