@@ -90,9 +90,13 @@ class TestViewsDisplay(unittest.TestCase):
         self.assertNotIn('_kv("永续口径', src)
 
     def test_fills_render_capped(self):
+        """成交表渲染必须截断（不能全量渲染）：2026-10-15 起改成按「每页行数」设置
+        （默认 20，可切 10/20/50）；下拉数据的取数上限仍在。"""
         from app.hl import views
         src = open(views.__file__, encoding="utf-8").read()
-        self.assertIn("[:50]", src)
+        self.assertIn("DEFAULT_ROWS = 20", src)
+        self.assertIn("rows_n = rows_of(p)", src)
+        self.assertIn("[:rows_n]", src)
         self.assertIn('fills_out[:100]', src)
 
 

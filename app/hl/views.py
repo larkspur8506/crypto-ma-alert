@@ -45,7 +45,14 @@ __all__ = [
     "SCHEMA_VERSION", "MAINNET_DEFAULT", "DashboardDeps",
     "status_payload", "render_dashboard", "build_router",
     "DASH_CSS", "_render_body", "THEME_CSS",
+    "ROW_CHOICES", "DEFAULT_ROWS", "ROWS_COOKIE", "normalize_rows", "rows_of",
 ]
+
+# 长表每页行数（手机优先）：默认 20，面板上可切 10/20/50，选择存 cookie `cma_rows`。
+# 只作用于「记录/历史」类长表；「信号」表（仓位历史）与权益曲线不受它影响。
+ROW_CHOICES = (10, 20, 50)
+DEFAULT_ROWS = 20
+ROWS_COOKIE = "cma_rows"
 
 SCHEMA_VERSION = 1
 _DAY = 86400.0
@@ -144,6 +151,20 @@ def _fmt_dt(v: Any, pattern: str = "%m-%d %H:%M:%S") -> str:
 
 def _esc(v: Any) -> str:
     return html.escape(str(v if v is not None else ""))
+
+
+def normalize_rows(v: Any) -> int:
+    """cookie/查询参数 → 合法行数；认不出一律回落默认（不改用途，只影响展示）。"""
+    try:
+        n = int(str(v or "").strip())
+    except (TypeError, ValueError):
+        return DEFAULT_ROWS
+    return n if n in ROW_CHOICES else DEFAULT_ROWS
+
+
+def rows_of(payload: Any) -> int:
+    """本次渲染要用的行数（admin_ui 读 cookie 后注入 payload['rows']）。"""
+    return normalize_rows((payload or {}).get("rows"))
 
 
 _DIR_TXT = {
@@ -448,7 +469,7 @@ def status_payload(deps: DashboardDeps) -> dict:
         })
 
     orders_recent: List[dict] = []
-    for r in (_db_call(deps.db, "hl_recent_orders", 30) or []):
+    for r in (_db_call(deps.db, "hl_recent_orders", 50) or []):
         d = _rowd(r)
         orders_recent.append({
             "symbol": d.get("symbol"),
@@ -737,6 +758,8 @@ def _sign(v: Any, unit: str = " U") -> tuple:
 
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
+    # 长表每页行数（面板可切 10/20/50，默认 20）：只影响历史类长表
+    rows_n = rows_of(p)
     net = _as_dict(p.get("network"))
     acc = _as_dict(p.get("account"))
     system = _as_dict(p.get("system"))
@@ -908,12 +931,12 @@ def _render_body(p: dict) -> str:
     o.append("</tbody></table></div>")
 
     # ---------------- 下单记录 ----------------
-    o.append("<h2>下单记录</h2>")
+    o.append(f"<h2>下单记录（最近 {rows_n} 条）</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>时间</th><th>标的</th><th>用途</th><th>状态</th><th class='num'>数量</th>"
              "<th class='num'>下单价</th><th class='num'>成交量</th><th class='num'>均价</th>"
              "<th>错误</th></tr></thead><tbody>")
-    for od in (_as_dict(x) for x in orders_recent):
+    for od in list(_as_dict(x) for x in orders_recent)[:rows_n]:
         st = str(od.get("status") or "—")
         st_cls = "neg" if st == "failed" else ("warn" if st in ("intent", "sent") else "")
         err = str(od.get("error") or "")
@@ -933,15 +956,15 @@ def _render_body(p: dict) -> str:
     o.append("</tbody></table></div>")
 
     # ---------------- 最近成交 ----------------
-    o.append("<h2>最近成交</h2>")
+    o.append(f"<h2>最近成交（最近 {rows_n} 条）</h2>")
     # 表头 9 列（2026-10-15 修）：上一版加了「买/卖」列但没改表头，8 列表头配 9 格数据行，
     # 从「数量」起整行左移一格 —— 数量列显示买/卖、价格列显示数量、手续费列显示价格。
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
              "<th class='num'>价格</th><th class='num'>手续费</th><th>方向</th>"
              "<th class='num'>平仓盈亏</th><th>减仓</th></tr></thead><tbody>")
-    # 只渲染最近 50 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
-    for f in list(_as_dict(x) for x in fills)[:50]:
+    # 只渲染最近 rows_n 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
+    for f in list(_as_dict(x) for x in fills)[:rows_n]:
         cp_txt, cp_cls = _sign(f.get("closed_pnl"))
         d = str(f.get("dir") or "")
         # 买卖方向由 dir 推导（审计三轮 M9）：side 是多空方向，Close Long 实为卖出、
@@ -988,24 +1011,9 @@ def _render_body(p: dict) -> str:
         o.append("<tr><td colspan='7' class='muted'>暂无信号</td></tr>")
     o.append("</tbody></table></div>")
 
-    # ---------------- 执行器事件 ----------------
-    o.append("<h2>执行器事件</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>时间</th><th>类型</th><th>标的</th><th>内容</th></tr></thead><tbody>")
-    for ev in (_as_dict(x) for x in events):
-        msg = _disp_text(ev.get("message") or "")
-        shown_msg = msg if len(msg) <= 180 else msg[:180] + "&hellip;"
-        o.append("<tr>"
-                 + _td(_fmt_dt(ev.get("ts")), "num")
-                 + _td(_esc(_EV_TXT.get(str(ev.get("kind")), ev.get("kind") or "—")))
-                 + _td(_esc(_disp(ev.get("symbol")) or "—"))
-                 + _td(f"<span title='{_esc(msg)}'>{_esc(shown_msg)}</span>")
-                 + "</tr>")
-    if not events:
-        o.append("<tr><td colspan='4' class='muted'>暂无执行器事件</td></tr>")
-    o.append("</tbody></table></div>")
-
     # ---------------- 系统卡片 ----------------
+    # 注：原来的「执行器事件」表已从总览移除（2026-10-15 用户反馈：与「记录」页
+    # 的 hl_events 表完全重复）。要事件去 /admin?tab=records。
     o.append("<h2>系统</h2>")
     o.append("<div class='card'><div class='grid'>")
     o.append(_kv("执行器最后事件", _fmt_dt(system.get("executor_last_event_at"))))

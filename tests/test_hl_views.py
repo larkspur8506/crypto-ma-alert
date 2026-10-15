@@ -141,7 +141,7 @@ class TestHtmlPage(BaseCase):
         r = self.client.get("/hl")
         self.assertEqual(r.status_code, 200)
         for text in ("账户", "权益曲线", "仓位", "交易所挂单", "下单记录",
-                     "最近成交", "信号", "执行器事件", "系统"):
+                     "最近成交", "信号", "系统"):
             self.assertIn(text, r.text, f"缺少区块：{text}")
         # 数据真的渲染进去了
         self.assertIn("BTC", r.text)
@@ -651,7 +651,7 @@ class TestRenderOnly(BaseCase):
         from app.hl.views import render_dashboard
         html = render_dashboard(self.payload())
         for text in ("Hyperliquid 执行器监控", "账户", "仓位", "权益曲线",
-                     "最近成交", "执行器事件", "系统"):
+                     "最近成交", "系统"):
             self.assertIn(text, html)
 
     def test_render_dashboard_stop_marks(self):
