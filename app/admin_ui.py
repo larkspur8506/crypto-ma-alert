@@ -31,11 +31,43 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
-from app.hl.views import DASH_CSS, _render_body, status_payload
+from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _render_body,
+                        normalize_rows, status_payload)
 from app.ui_theme import (THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
 
 logger = logging.getLogger(__name__)
+
+# 提醒日志（alert_logs.kind）→ 中文。以前直接显示英文原文（heartbeat_local /
+# exec_alert_fills），和「执行器事件」那张表的中文列不一致、看不懂（用户 2026-10-15 反馈）。
+_ALERT_KIND_TXT = {
+    "entry": "开仓提醒",
+    "exit": "离场提醒",
+    "data_error": "数据源异常",
+    "heartbeat": "心跳（推送）",
+    "heartbeat_local": "心跳（静默）",
+    "weekly": "周报（推送）",
+    "weekly_local": "周报（静默）",
+    "exec_alert": "执行器告警",
+    "exec_alert_fills": "执行器成交回报",
+}
+
+# 回填标记：2026-10-15 之前执行器推送不落 alert_logs，历史推送由 hl_events 回填，
+# message 一律以此前缀开头（面板据此提示口径，也便于一键回滚）。
+BACKFILL_PREFIX = "[回填] "
+
+
+def rows_switch_html(tab: str, current: int, k: str = "") -> str:
+    """页脚「每页行数」切换行（零 JS，纯链接；与主题切换同一套做法）。"""
+    cur = normalize_rows(current)
+    q = quote(str(k or ""), safe="")
+    links = []
+    for n in ROW_CHOICES:
+        cls = "btn" if n == cur else "btn gray"
+        links.append(f"<a class='{cls}' href='/admin/rows?n={n}&tab={_esc(tab)}&k={q}'>{n}</a>")
+    return ("<div class='foot'><span class='muted'>每页行数：</span>" + " ".join(links)
+            + "<span class='muted'>&nbsp;（历史类长表；信号与曲线不受影响）</span></div>")
+
 
 TABS: Tuple[Tuple[str, str], ...] = (
     ("overview", "总览"),
@@ -622,15 +654,17 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
 
 
 # ---------------------------------------------------------------- 记录 Tab
-def render_records(deps: AdminDeps) -> str:
+def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
+    n = normalize_rows(rows_n)
     o: List[str] = []
     o.append("<h2>记录</h2>")
-    o.append(f"<div class='hint'>时间均为{engine.TZ_LABEL}；每块最多 50 行。</div>")
+    o.append(f"<div class='hint'>时间均为{engine.TZ_LABEL}；每块最多 {n} 行"
+             f"（页脚「每页行数」可切 10/20/50）。</div>")
 
     # ---- 下单记录 ----
-    o.append("<div class='card'><div class='sec'>下单记录（hl_orders）</div>")
+    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）</div>")
     rows = ""
-    _orders_rows = _rows(deps, "hl_recent_orders", 50)
+    _orders_rows = _rows(deps, "hl_recent_orders", n)
     if _orders_rows and _orders_rows[0].get("_error"):
         rows += f"<tr><td colspan='8' class='bad'>{_esc(_orders_rows[0]['_error'])}</td></tr>"
         _orders_rows = []
@@ -651,14 +685,14 @@ def render_records(deps: AdminDeps) -> str:
     o.append("</div>")
 
     # ---- 成交 ----
-    o.append("<div class='card'><div class='sec'>成交（hl_fills）</div>")
+    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）</div>")
     rows = ""
     # 买卖方向由 dir 推导（2026-10-15 修）：side 是多空方向不是买卖方向，
     # 以前 side>=0→买 把「平多（卖出）」也标成买。四向口径：
     # Open Long / Close Short = 买；Close Long / Open Short = 卖。
     _BS = {"Open Long": "买", "Close Short": "买",
            "Close Long": "卖", "Open Short": "卖"}
-    for r in _rows(deps, "hl_recent_fills", 50):
+    for r in _rows(deps, "hl_recent_fills", n):
         cp = _opt_num(r.get("closed_pnl"))
         cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
         d = str(r.get("dir") or "")
@@ -678,14 +712,22 @@ def render_records(deps: AdminDeps) -> str:
     o.append("</div>")
 
     # ---- 提醒日志 ----
-    o.append("<div class='card'><div class='sec'>提醒日志（alert_logs）</div>")
+    o.append(f"<div class='card'><div class='sec'>提醒日志（alert_logs · 最近 {n} 条）</div>")
+    _alert_rows = _rows(deps, "recent_alerts", n)
+    _backfilled = sum(1 for r in _alert_rows
+                      if str(r.get("message") or "").startswith(BACKFILL_PREFIX))
+    if _backfilled:
+        o.append(f"<div class='hint'>2026-10-15 之前执行器推送不落库（当时版本限制），"
+                 f"下表含 {_backfilled} 条按执行器事件（hl_events）回填的历史记录，"
+                 f"标记为「[回填]」。</div>")
     rows = ""
-    for r in _rows(deps, "recent_alerts", 50):
+    for r in _alert_rows:
         ok = bool(r.get("sent_successfully"))
         msg = str(r.get("message") or "")
         shown = msg if len(msg) <= 160 else msg[:160] + "&hellip;"
+        _kind = str(r.get("kind") or "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
-                 f"<td>{_esc(r.get('kind') or '—')}</td>"
+                 f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
                  f"<td>{_esc(r.get('symbol') or '—')}</td>"
                  f"<td><span class='{'pos' if ok else 'neg'}'>"
                  f"{'已送达' if ok else '失败'}</span></td>"
@@ -695,9 +737,9 @@ def render_records(deps: AdminDeps) -> str:
     o.append("</div>")
 
     # ---- 执行器事件 ----
-    o.append("<div class='card'><div class='sec'>执行器事件（hl_events）</div>")
+    o.append(f"<div class='card'><div class='sec'>执行器事件（hl_events · 最近 {n} 条）</div>")
     rows = ""
-    for r in _rows(deps, "hl_recent_events", 50):
+    for r in _rows(deps, "hl_recent_events", n):
         kind = str(r.get("kind") or "—")
         msg = str(r.get("message") or "")
         shown = msg if len(msg) <= 160 else msg[:160] + "&hellip;"
@@ -801,7 +843,7 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
 
 
 def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
-          theme: str = DEFAULT_THEME) -> HTMLResponse:
+          theme: str = DEFAULT_THEME, rows_n: int = DEFAULT_ROWS) -> HTMLResponse:
     label = dict(TABS).get(tab, "总览")
     banner = ""
     if msg:
@@ -816,6 +858,7 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
         f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
         f"{theme_switch_html(tab, theme, token)}"
+        f"{rows_switch_html(tab, rows_n, token)}"
         "<div class='foot'><span class='muted'>手机可用 · 零 JS · "
         "面板只读，不持私钥</span></div></div></body></html>")
 
@@ -850,7 +893,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         if tab not in _TAB_KEYS:
             tab = "overview"
         cfg = _call(deps.config_fn)
+        # 每页行数：?n= 优先（页脚链接会用），否则读 cookie，认不出回落默认 20
+        rows_n = normalize_rows(request.query_params.get("n")
+                                or request.cookies.get(ROWS_COOKIE))
         payload = get_payload(deps)
+        payload["rows"] = rows_n          # 总览的两张长表按这个切片（views._render_body）
         strip = _status_strip(payload)
         if tab == "overview":
             body = _overview_body(deps, payload)
@@ -859,9 +906,10 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         elif tab == "switch":
             body = render_switch(deps, cfg)
         else:
-            body = render_records(deps)
+            body = render_records(deps, rows_n)
         resp = _page(token, tab, strip, body, msg,
-                     theme=normalize_theme(request.cookies.get(THEME_COOKIE)))
+                     theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
+                     rows_n=rows_n)
         # Cookie 必须设在返回的 response 上：Starlette 在函数返回新 Response 时会丢弃
         # 注入的 response 上写的头（所以这里不能用依赖注入的 response）。
         if k:
@@ -973,6 +1021,20 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         resp = RedirectResponse(f"/admin?tab={tab}&k={quote(str(token))}", status_code=302)
         # max_age=0 删除；auto 也写死成 cookie（显式「跟随系统」选择）
         resp.set_cookie(THEME_COOKIE, theme, max_age=365 * 86400,
+                        secure=https_, samesite="lax")
+        return resp
+
+    # ---------------- 每页行数切换（零 JS：设 cookie 后跳回） ----------------
+    @router.get("/admin/rows")
+    def admin_rows(request: Request, n: str = str(DEFAULT_ROWS), tab: str = "records",
+                   k: Optional[str] = None):
+        rows_n = normalize_rows(n)
+        tab = tab if tab in _TAB_KEYS else "overview"
+        token = _auth(deps, request, k or None)
+        https_ = request.url.scheme == "https" or \
+            str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+        resp = RedirectResponse(f"/admin?tab={tab}&k={quote(str(token))}", status_code=302)
+        resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
         return resp
 

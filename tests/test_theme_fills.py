@@ -129,7 +129,7 @@ if FastAPI is not None:
         """表头 9 列 + 数据 9 格 + 列序对齐（回归本 bug）。"""
 
         def _rows(self, html):
-            m = re.search(r"最近成交</h2>.*?<tbody>(.*?)</tbody>", html, re.S)
+            m = re.search(r"最近成交（最近 \d+ 条）</h2>.*?<tbody>(.*?)</tbody>", html, re.S)
             self.assertIsNotNone(m, "找不到最近成交表")
             out = []
             for tr in re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S):
@@ -141,7 +141,7 @@ if FastAPI is not None:
 
         def test_overview_header_has_9_columns_in_order(self):
             html = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
-            m = re.search(r"最近成交</h2>.*?<thead><tr>(.*?)</tr></thead>", html, re.S)
+            m = re.search(r"最近成交（最近 \d+ 条）</h2>.*?<thead><tr>(.*?)</tr></thead>", html, re.S)
             self.assertIsNotNone(m)
             heads = [re.sub(r"<[^>]+>", "", h).strip()
                      for h in re.findall(r"<th[^>]*>(.*?)</th>", m.group(1), re.S)]
@@ -183,7 +183,7 @@ if FastAPI is not None:
             self.ins_fill("r1", "Close Long", 0.005, 100_000.0, pnl=5.0, reduce=True)
             self.ins_fill("r2", "Open Short", 0.005, 100_000.0)
             html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
-            m = re.search(r"成交（hl_fills）.*?<table>(.*?)</table>", html, re.S)
+            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<table>(.*?)</table>", html, re.S)
             self.assertIsNotNone(m)
             trs = re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S)
             body = [t for t in trs if "<td" in t]

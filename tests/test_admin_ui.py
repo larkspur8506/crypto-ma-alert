@@ -208,14 +208,16 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "权益曲线", "下单记录", "仓位", "交易所挂单", "执行器事件"):
+        for s in ("账户总值", "权益曲线", "下单记录", "仓位", "交易所挂单"):
             self.assertIn(s, html)
+        # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
+        self.assertNotIn("执行器事件", html)
 
     def test_overview_reuses_hl_body_without_duplicate_title(self):
         html = self.body(tab="overview")
         self.assertEqual(html.count("<h1>"), 1, "整页只能有一个 <h1>（hl 自带标题已剥掉）")
         # <h2> 区块是 hl/views._render_body 的产物，admin_ui 自己一个 <h2> 都不渲染
-        for h2 in ("<h2>仓位</h2>", "<h2>权益曲线</h2>", "<h2>下单记录</h2>"):
+        for h2 in ("<h2>仓位</h2>", "<h2>权益曲线</h2>", "<h2>下单记录（最近 20 条）</h2>"):
             self.assertIn(h2, html, f"总览应内嵌 _render_body 的 {h2}")
 
     def test_status_strip_is_always_present(self):
@@ -457,14 +459,23 @@ class TestRecordsTab(BaseCase):
         self.assertIn("10-09 16:53", html)
         self.assertNotIn("10-09 08:53", html)
 
-    def test_records_limits_each_table_to_50(self):
+    def test_records_default_20_rows_and_switches(self):
+        """默认每页 20 行（手机优先）；?n=10 / ?n=50 可切；非法值回落默认。"""
         for i in range(60):
             self.db.log_alert("BTC_USDT", 1_700_000_000_000 + i, "signal", f"REC-{i:03d}", True)
         html = self.body(tab="records")
         self.assertIn("REC-059", html)
-        self.assertIn("REC-010", html)
-        self.assertNotIn("REC-009", html)
-        self.assertNotIn("REC-000", html)
+        self.assertIn("REC-040", html)
+        self.assertNotIn("REC-039", html, "默认应只渲染 20 行")
+        html10 = self.body(tab="records", n=10)
+        self.assertIn("REC-050", html10)
+        self.assertNotIn("REC-049", html10)
+        html50 = self.body(tab="records", n=50)
+        self.assertIn("REC-010", html50)
+        self.assertNotIn("REC-009", html50, "?n=50 应渲染 50 行")
+        html_bad = self.body(tab="records", n="999")
+        self.assertIn("REC-040", html_bad)
+        self.assertNotIn("REC-039", html_bad, "非法 n 应回落默认 20")
 
     def test_records_untouched_by_render_errors(self):
         class BrokenDB:
