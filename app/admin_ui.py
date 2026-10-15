@@ -50,6 +50,7 @@ _ALERT_KIND_TXT = {
     "weekly_local": "周报（静默）",
     "exec_alert": "执行器告警",
     "exec_alert_fills": "执行器成交回报",
+    "tick_error": "处理异常告警",
 }
 
 # 回填标记：2026-10-15 之前执行器推送不落 alert_logs，历史推送由 hl_events 回填，
