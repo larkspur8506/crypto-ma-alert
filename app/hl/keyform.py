@@ -28,7 +28,11 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 from fastapi import APIRouter, Form, Query, Request
+from fastapi.responses import HTMLResponse
+
 from fastapi.responses import HTMLResponse, RedirectResponse
+
+from app.ui_theme import normalize_theme, page_shell
 
 logger = logging.getLogger(__name__)
 
@@ -160,26 +164,27 @@ class KeyFormDeps:
 
 _STYLE = """
 *{box-sizing:border-box}body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
-background:#0f1115;color:#e6e6e6;line-height:1.6;font-size:15px;padding:18px}
-.wrap{max-width:560px;margin:0 auto}.card{background:#171a21;border:1px solid #262a33;border-radius:10px;
-padding:16px;margin-bottom:14px}label{display:block;color:#8b95a5;font-size:12.5px;margin:10px 0 4px}
-input[type=password]{width:100%;padding:10px 12px;border-radius:8px;border:1px solid #3a4150;
-background:#0f1115;color:#e6e6e6;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
-button{margin-top:14px;background:#2563eb;color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:14px}
-h1{font-size:18px;margin:0 0 6px}.muted{color:#8b95a5;font-size:12.5px}
-.ok{color:#4ade80}.bad{color:#f87171}.warn{color:#fbbf24}a{color:#60a5fa}
+background:var(--bg);color:var(--fg);line-height:1.6;font-size:15px;padding:18px}
+.wrap{max-width:560px;margin:0 auto}.card{background:var(--card);border:1px solid var(--line);border-radius:10px;
+padding:16px;margin-bottom:14px}label{display:block;color:var(--muted);font-size:12.5px;margin:10px 0 4px}
+input[type=password]{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--line);
+background:var(--input);color:var(--fg);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px}
+button{margin-top:14px;background:var(--btn);color:#fff;border:0;border-radius:8px;padding:11px 18px;font-size:14px}
+h1{font-size:18px;margin:0 0 6px}.muted{color:var(--muted);font-size:12.5px}
+.ok{color:var(--pos)}.bad{color:var(--neg)}.warn{color:var(--warn)}a{color:var(--link)}
 """
 
 
-def _page(title: str, body: str, status: int = 200) -> HTMLResponse:
-    html = (f"<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
-            f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-            f"<title>{title}</title><style>{_STYLE}</style></head><body><div class='wrap'>"
-            f"{body}</div></body></html>")
+def _page(title: str, body: str, status: int = 200,
+          request: "Request | None" = None) -> HTMLResponse:
+    theme = normalize_theme(request.cookies.get("cma_theme")) if request is not None else "auto"
+    html = page_shell(theme, title, f"<div class='wrap'>{body}</div>",
+                      head_extra=f"<style>{_STYLE}</style>")
     return HTMLResponse(html, status_code=status)
 
 
-def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool = True) -> HTMLResponse:
+def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool = True,
+                request: "Request | None" = None) -> HTMLResponse:
     st = token_state(deps.db)
     already = has_key(deps.env_path)
     msg = (f"<div class='card'><span class='{'ok' if ok else 'bad'}'>"
@@ -203,20 +208,20 @@ def render_form(deps: KeyFormDeps, token: str = "", message: str = "", ok: bool 
                 "placeholder='0x…（64 位 hex）' required>"
                 "<button type='submit'>提交</button></form></div>"
                 "<div class='muted'>提交后还需重启容器才会生效（Hermes 会做）。</div>")
-    return _page("录入私钥", body)
+    return _page("录入私钥", body, request=request)
 
 
 def build_router(deps: KeyFormDeps) -> APIRouter:
     r = APIRouter()
 
     @r.get("/admin/hl/key", response_class=HTMLResponse)
-    def key_form(t: str = Query("")):
+    def key_form(request: Request, t: str = Query("")):
         ok, why = check_token(deps.db, t)
         if not ok:
             return _page("录入私钥", f"<div class='card'><span class='bad'>{why}</span>"
                                     "<div class='muted'>链接是一次性的、默认 15 分钟有效。请让 Hermes 重新签发。</div></div>",
-                         status=403)
-        return render_form(deps, token=t.strip())
+                         status=403, request=request)
+        return render_form(deps, token=t.strip(), request=request)
 
     @r.post("/admin/hl/key", response_class=HTMLResponse)
     def key_submit(request: Request, key: str = Form(""), t: str = Form("")):
@@ -231,7 +236,8 @@ def build_router(deps: KeyFormDeps) -> APIRouter:
             # 的矛盾文案拼在成功提示下面。
             return _page("录入私钥",
                          f"<div class='card'><span class='ok'>✅ 已写入（{info}）。</span>"
-                         "<div class='muted'>令牌已作废；请让 Hermes 重启容器并核对后切换模式。</div></div>")
-        return render_form(deps, token=t.strip(), message=f"❌ {info}", ok=False)
+                         "<div class='muted'>令牌已作废；请让 Hermes 重启容器并核对后切换模式。</div></div>",
+                         request=request)
+        return render_form(deps, token=t.strip(), message=f"❌ {info}", ok=False, request=request)
 
     return r

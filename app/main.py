@@ -25,6 +25,7 @@ from app import engine, market, sizing, strategy
 from app.config import Config
 from app.db import DB
 from app.notify import get_notifier
+from app.ui_theme import THEME_CSS, normalize_theme, page_shell
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("cma")
@@ -38,26 +39,34 @@ scheduler = None
 PAGE_CSS = """
 <style>
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-     margin:0;padding:16px;background:#0f1115;color:#e6e6e6;line-height:1.5}
-h1{font-size:18px;margin:0 0 12px}h2{font-size:15px;margin:18px 0 8px;color:#9ad}
+     margin:0;padding:16px;background:var(--bg);color:var(--fg);line-height:1.5}
+h1{font-size:18px;margin:0 0 12px}h2{font-size:15px;margin:18px 0 8px;color:var(--h2)}
 table{border-collapse:collapse;width:100%;font-size:13px}
-th,td{border-bottom:1px solid #262a33;padding:6px 8px;text-align:left}
-th{color:#8b95a5;font-weight:500}
-.card{background:#171a21;border:1px solid #262a33;border-radius:8px;padding:12px;margin-bottom:12px}
-.ok{color:#4ade80}.bad{color:#f87171}.muted{color:#8b95a5;font-size:12px}
-a.btn,button{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:6px;
+th,td{border-bottom:1px solid var(--line);padding:6px 8px;text-align:left}
+th{color:var(--muted);font-weight:500}
+.card{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px;margin-bottom:12px}
+.ok{color:var(--pos)}.bad{color:var(--neg)}.muted{color:var(--muted);font-size:12px}
+a.btn,button{display:inline-block;background:var(--btn);color:#fff;border:0;border-radius:6px;
      padding:10px 14px;font-size:14px;text-decoration:none;margin:4px 6px 4px 0;cursor:pointer}
-button.gray{background:#374151}button.red{background:#b91c1c}
-input{background:#0f1115;border:1px solid #374151;color:#e6e6e6;border-radius:6px;padding:8px;width:130px}
-pre{background:#0f1115;border:1px solid #262a33;border-radius:6px;padding:10px;overflow-x:auto;font-size:12px}
+button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
+input{background:var(--input);border:1px solid var(--line);color:var(--fg);border-radius:6px;padding:8px;width:130px}
+pre{background:var(--input);border:1px solid var(--line);border-radius:6px;padding:10px;overflow-x:auto;font-size:12px}
 </style>
 """
 
 
-def page(title: str, body: str) -> HTMLResponse:
-    return HTMLResponse(f"<!doctype html><html><head><meta charset='utf-8'>"
-                        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
-                        f"<title>{title}</title>{PAGE_CSS}</head><body>{body}</body></html>")
+def _req_theme(request: Request) -> str:
+    """从请求 cookie 读主题（签名确认页无登录态，主题是纯展示偏好，跟 cookie 走）。"""
+    try:
+        return normalize_theme(request.cookies.get("cma_theme"))
+    except Exception:                                            # noqa: BLE001
+        return "auto"
+
+
+def page(title: str, body: str, request: "Request | None" = None,
+         theme: "str | None" = None) -> HTMLResponse:
+    t = theme if theme is not None else (_req_theme(request) if request is not None else "auto")
+    return HTMLResponse(page_shell(t, title, body, head_extra=PAGE_CSS))
 
 
 def current_config() -> Config:
@@ -465,17 +474,17 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
         # 提醒消息里的 a=close 链接：该仓尚未录入真实平仓价（系统自动关的）→ 直接给表单；
         # 已经录入过（用户自己确认的）→ 给只读摘要，改正要走「修改平仓数据」按钮。
         if a == "close" and row["status"] == "closed" and not row["auto_closed"]:
-            return _summary(row, pid)
-        return _close_form(row)
+            return _summary(row, pid, request)
+        return _close_form(row, request)
     if a == "edit_open":
-        return _entry_form(row, pid, editing=True)
+        return _entry_form(row, pid, editing=True, request=request)
     if row["status"] == "pending":
-        return _entry_form(row, pid, editing=False)
+        return _entry_form(row, pid, editing=False, request=request)
     # 已确认开仓 / 已平仓 → 只读摘要（改动必须点「修改」显式进入表单，防手滑覆盖）
     return _summary(row, pid)
 
 
-def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
+def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLResponse:
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
     side_txt = "做多" if (row["side"] or 1) == 1 else "做空"
     stop_hint = "（价格下方）" if (row["side"] or 1) == 1 else "（价格上方）"
@@ -536,7 +545,7 @@ def _entry_form(row, pid: int, editing: bool) -> HTMLResponse:
     </form>'''}
     <p><a class='btn gray' href='/c/{pid}?a=view&t={tok("view")}'>返回</a></p>
     """
-    return page(title, body)
+    return page(title, body, request=request)
 
 
 def _status_label(row) -> str:
@@ -544,7 +553,7 @@ def _status_label(row) -> str:
             "ignored": "已忽略"}.get(row["status"], row["status"])
 
 
-def _summary(row, pid: int) -> HTMLResponse:
+def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     """只读摘要页：只显示当前记录 + 显式入口（修改 / 手动平仓）。"""
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
@@ -578,10 +587,10 @@ def _summary(row, pid: int) -> HTMLResponse:
     body = (f"<h1>{_status_label(row)} #{pid}</h1>"
             f"<div class='card'>{'<br>'.join(lines)}</div>"
             f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")
-    return page(f"{_status_label(row)} #{pid}", body)
+    return page(f"{_status_label(row)} #{pid}", body, request=request)
 
 
-def _close_form(row) -> HTMLResponse:
+def _close_form(row, request: Request = None) -> HTMLResponse:
     entry = row["actual_entry"] or row["entry_price"]
     stop = row["actual_stop"] or row["stop_price"]
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
@@ -602,7 +611,7 @@ def _close_form(row) -> HTMLResponse:
       {'<input type="hidden" name="edit" value="1">' if row["status"] == "closed" else ''}
       <p>实际平仓价 <input name='exit_price' value='{row["exit_price"] or 0:.2f}'></p>
       <p>离场原因
-        <select name='exit_reason' style='background:#0f1115;color:#e6e6e6;padding:8px;border-radius:6px'>
+        <select name='exit_reason' style='padding:8px;border-radius:6px'>
           <option value='ma20' {'selected' if row['exit_reason'] == 'ma20' else ''}>收到提醒后平仓</option>
           <option value='stop' {'selected' if row['exit_reason'] == 'stop' else ''}>止损单被触发</option>
           <option value='manual' {'selected' if row['exit_reason'] == 'manual' else ''}>手动提前平</option>
@@ -611,7 +620,7 @@ def _close_form(row) -> HTMLResponse:
     </form>
     <p><a class='btn gray' href='/c/{row['id']}?a=view&t={engine.sign_token(config.token_secret, row['id'], "view")}'>返回</a></p>
     """
-    return page(f"录入平仓 #{row['id']}", body)
+    return page(f"录入平仓 #{row['id']}", body, request=request)
 
 
 @app.post("/c/{pid}", response_class=HTMLResponse)
@@ -629,7 +638,7 @@ async def confirm_post(pid: int, request: Request):
         if row["status"] not in ("pending", "open"):
             raise HTTPException(400, f"该仓位已是 {row['status']}，无需忽略")
         db.ignore_position(pid)
-        return page("已忽略", f"<h1>已忽略 #{pid}</h1><p>{row['symbol']} 这笔不计入统计。</p>")
+        return page("已忽略", f"<h1>已忽略 #{pid}</h1><p>{row['symbol']} 这笔不计入统计。</p>", request=request)
     if a == "close":
         editing = bool(form.get("edit"))
         # pending/open → 正常平仓；closed + (系统自动关 或 从「修改平仓数据」进来) → 允许改正。
@@ -646,7 +655,7 @@ async def confirm_post(pid: int, request: Request):
             raise HTTPException(400, "平仓价不是数字")
         reason = str(form.get("exit_reason") or "ma20")
         db.close_position(pid, px, reason)
-        return page("已平仓", f"<h1>已记录平仓 #{pid}</h1><p>{row['symbol']} @ {px:,.2f}（{reason}）</p>")
+        return page("已平仓", f"<h1>已记录平仓 #{pid}</h1><p>{row['symbol']} @ {px:,.2f}（{reason}）</p>", request=request)
     if a == "open":
         editing = bool(form.get("edit"))
         if row["status"] == "pending":
@@ -703,7 +712,8 @@ async def confirm_post(pid: int, request: Request):
                   + "</div>")
         return page("已确认", f"<h1>已确认开仓 #{pid}</h1>"
                               f"<p>{row['symbol']} @ {entry:,.2f}，{qty} 张，止损 {stop:,.2f}<br>"
-                              f"<span class='muted'>{src_txt}</span></p>{warn}{review}")
+                              f"<span class='muted'>{src_txt}</span></p>{warn}{review}",
+                    request=request)
     raise HTTPException(400, f"未知操作 {a}")
 
 
