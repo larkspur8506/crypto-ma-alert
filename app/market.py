@@ -65,8 +65,8 @@ def _http_json(url: str, timeout: int = 15) -> dict:
 
 # ---------------------------------------------------------------- HL（实盘主源）
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
-# 信号层的键是 MEXC 风格（BTC_USDT），HL 只认合约名（BTC/ETH）
-HL_COIN_NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+# 信号层的键是 MEXC 风格（BTC_USDT），HL 只认合约名（BTC/ETH/SOL）
+HL_COIN_NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH", "SOL_USDT": "SOL"}
 
 
 def _coin_map() -> dict:

@@ -17,6 +17,10 @@ from dataclasses import dataclass
 SPECS = {
     "BTC_USDT": (0.0001, 1, 1, 1),
     "ETH_USDT": (0.01, 1, 1, 2),
+    # SOL_USDT 面值 0.1 SOL/张、价格精度 2（实测 contract.mexc.com/api/v1/contract/detail）。
+    # 缺了它 engine.walk → size_order(symbol) 会 KeyError，SOL 信号整轮被 tick 的
+    # per-symbol try/except 吞成「处理异常」，所以是加标的的必需项。
+    "SOL_USDT": (0.1, 1, 1, 2),
 }
 MAINTENANCE_MARGIN_RATE = 0.005   # 一档维持保证金率近似值（算强平价用）
 
