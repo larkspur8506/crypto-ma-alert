@@ -28,8 +28,6 @@ from dataclasses import dataclass
 from typing import Any, Optional, Tuple
 
 from fastapi import APIRouter, Form, Query, Request
-from fastapi.responses import HTMLResponse
-
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app.ui_theme import normalize_theme, page_shell

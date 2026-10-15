@@ -748,7 +748,14 @@ class TestWithdrawableDisplay(BaseCase):
         self.assertIn("可提余额", html)
         self.assertIn("100.47 U（提现收 1U 手续费）", html)
         self.assertIn("统一账户下的实际可提", html)
-        self.assertIn("资金都在现货（统一账户）", html)
+        # 2026-10-15：一行说清「资金分布（统一账户）」，去掉看不懂的「永续口径」，
+        # 且合约侧占用与「已用保证金」合并（不再重复一列）
+        self.assertIn("资金分布（统一账户）", html)
+        self.assertIn("合约占用", html)
+        self.assertNotIn("永续口径", html)
+        # 「已用保证金」那一列在统一账户下不再单列（数字已并入上一行）；
+        # title 提示里仍会提到这个名字，所以只断言**不再有该行**
+        self.assertNotIn("<span class='k'>已用保证金</span>", html)
 
     def test_non_unified_keeps_perp_withdrawable(self):
         snap = dict(self.info._snap)
