@@ -21,6 +21,8 @@ import urllib.request
 from dataclasses import dataclass, field
 from typing import Callable, List, Optional, Tuple
 
+from app import symbol_registry as registry
+
 from app.strategy import Bar, MIN_BARS_REQUIRED
 
 INTERVAL_MS = 4 * 3600 * 1000
@@ -65,8 +67,10 @@ def _http_json(url: str, timeout: int = 15) -> dict:
 
 # ---------------------------------------------------------------- HL（实盘主源）
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
-# 信号层的键是 MEXC 风格（BTC_USDT），HL 只认合约名（BTC/ETH/SOL）
-HL_COIN_NAMES = {"BTC_USDT": "BTC", "ETH_USDT": "ETH", "SOL_USDT": "SOL"}
+# 信号层的键是 MEXC 风格（BTC_USDT），HL 只认合约名（BTC/ETH/SOL）。
+# **从单一注册表派生**（唯一定义在 app/symbol_registry.py）：加标的只改注册表一处，
+# 别再往这里手写映射。env `HL_COIN_MAP` 仍可覆盖（见 hl_coin / _coin_map）。
+HL_COIN_NAMES = {s: registry.hl_coin(s) for s in registry.known_symbols()}
 
 
 def _coin_map() -> dict:
@@ -92,19 +96,21 @@ def _coin_map() -> dict:
 
 
 def hl_coin(symbol: str, strict: bool = False) -> str:
-    """BTC_USDT → BTC。可用 HL_COIN_MAP 覆盖（格式见 _coin_map）。
+    """BTC_USDT → BTC。三层解析：**env HL_COIN_MAP 覆盖 → 注册表 → 报错**。
 
-    strict=True（信号路径）：未知 symbol 抛 FeedError —— 静默取 symbol 前缀
-    会让 BTC_USD 这类拼写错误拿到 BTC 的数据、在错误的标的上算信号。
+    未命中一律抛 FeedError（fail-closed）。**绝不回落 `symbol.split("_")[0]`**：
+    `1000PEPE_USDT` 会拼出 `1000PEPE`（或任何前缀）这种并不存在的 HL 合约名，
+    静默拿错标的的行情 / 在错标的上算信号 —— 宁可停手报错。
+
+    `strict` 参数保留只为向后兼容（旧调用点传 True）：现在取值真假都是 fail-closed。
     """
     m = _coin_map()
     if symbol in m:
         return m[symbol]
     if symbol in HL_COIN_NAMES:
         return HL_COIN_NAMES[symbol]
-    if strict:
-        raise FeedError(f"{symbol}: 未知的 symbol（不在 HL_COIN_NAMES / HL_COIN_MAP）")
-    return symbol.split("_")[0]
+    raise FeedError(
+        f"未配置 HL coin 映射：{symbol}（不在注册表 symbol_registry / env HL_COIN_MAP）")
 
 
 def _hl_post(payload: dict, timeout: int = 20):
@@ -156,7 +162,12 @@ def _binance_fapi(symbol: str) -> List[Bar]:
 
 
 def _okx(symbol: str) -> List[Bar]:
-    """OKX 单次上限 300 根，需要翻页到 ≥ MIN_BARS_REQUIRED 根，否则分位永远算不出来。"""
+    """OKX 单次上限 300 根，需要翻页到 ≥ MIN_BARS_REQUIRED 根，否则分位永远算不出来。
+
+    这里的 `split("_")[0]` **不是** HL coin 映射（OKX 的 instId 就是基础币种名，
+    如 `BTC-USDT-SWAP`），且本函数只出现在 `DIAGNOSTIC_SOURCES` 里、绝不参与下单。
+    HL 侧的 coin 一律走 `hl_coin()` / 注册表。
+    """
     base = symbol.split("_")[0]
     bars: List[Bar] = []
     after = ""

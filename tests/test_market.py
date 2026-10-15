@@ -77,7 +77,11 @@ class TestHlSource(unittest.TestCase):
 
     def test_eth_mapping(self):
         self.assertEqual(market.hl_coin("ETH_USDT"), "ETH")
-        self.assertEqual(market.hl_coin("SOL_USDT"), "SOL")   # 未知键退化成币种名
+        # SOL 已登记进注册表（feat/add-sol）；旧版「未命中取 symbol 前缀」的静默兜底
+        # 已在 feat/coin-failclosed 删除，未注册一律抛 FeedError（见 test_coin_failclosed.py）
+        self.assertEqual(market.hl_coin("SOL_USDT"), "SOL")
+        with self.assertRaises(FeedError):
+            market.hl_coin("1000PEPE_USDT")
 
 
 class TestFetchPolicy(unittest.TestCase):
