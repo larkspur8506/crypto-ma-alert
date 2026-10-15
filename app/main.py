@@ -481,7 +481,7 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
     if row["status"] == "pending":
         return _entry_form(row, pid, editing=False, request=request)
     # 已确认开仓 / 已平仓 → 只读摘要（改动必须点「修改」显式进入表单，防手滑覆盖）
-    return _summary(row, pid)
+    return _summary(row, pid, request)
 
 
 def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLResponse:
