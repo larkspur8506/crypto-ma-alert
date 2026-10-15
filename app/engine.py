@@ -129,9 +129,19 @@ def confirm_url(cfg, position_id: int, action: str = "view") -> str:
 
 # ---------------------------------------------------------------- 文案
 
-def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool = False) -> str:
+def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool = False,
+                 executor_managed: bool = False) -> str:
+    """开仓提醒文案。
+
+    `executor_managed`（执行模式）：True = 执行器已接管（mode=live/dry，调用方
+    `_tick_symbol` 传 `executor is not None`）。此时提醒里**不能出现 MEXC 人工下单指引**
+    （逐仓 5x / 单位选 USDT / 输入 X USDT / N 张）—— 那些数字是按配置 equity 算的
+    人工口径，与 HL 实际成交（跟随实时权益、coin 数量）不是一个口径，照着做就是误导。
+    风险行同理不再写具体 U 数，只报目标风险比例并注明以 HL 开仓回报为准。
+    默认 False（纯提醒模式）保持原有 MEXC 文案逐字符不变。
+    """
     if stale:
-        return format_missed(cfg, sig)
+        return format_missed(cfg, sig, executor_managed=executor_managed)
     long = sig.is_long
     stop_note = f"距离 {sig.stop_dist * 100:.2f}%" + ("" if long else "，在价格上方")
     lines = [
@@ -139,7 +149,10 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         f"入场：市价（当前 {fmt_money(sig.entry_price)}）",
         f"止损触发价：{fmt_money(sig.stop_price)}（{stop_note}）",
     ]
-    if order is None:
+    if executor_managed:
+        # 托管模式：MEXC 人工下单段（含张数建议）整段退役，换成一句执行说明。
+        lines.append("▶ 系统将自动在 Hyperliquid 执行，成交后推送回报")
+    elif order is None:
         # 场所规格缺失（registry 里没有该标的的 MEXC 段）：**信号与提醒照常产出**，
         # 只把张数段换成一句显式说明。旧版这里会 KeyError，被 tick 的 per-symbol
         # except 吞成「处理异常」，整个标的的信号一个都出不来（静默坏）。
@@ -154,15 +167,21 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         f"止损单：计划委托，触发价 {fmt_money(sig.stop_price)}，{sig.close_side}，触发参考=最新成交价",
         f"止盈：不设",
     ]
-    if order is not None:
+    if executor_managed:
+        # 权益口径不同（配置 equity vs 实时生效权益）→ 不写具体 U 数。
+        lines.append(f"风险：单笔 {cfg.risk_pct * 100:.2f}% 权益（实际以 HL 开仓回报为准）")
+    elif order is not None:
         lines.append(
             f"风险：{order.risk_u:.1f}U"
             + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}% = "
                f"{cfg.equity * cfg.risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
                else f"（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%）") + "，"
             f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U")
+    if not executor_managed:
+        # 离场是 executor.on_exit 的活（自动挂止损/自动平仓 + 成交回报），
+        # 人工模式的「4 小时内自己市价平仓」在这个模式下是误导，整行不出现。
+        lines.append(f"离场：收到本系统提醒后 4 小时内市价平仓")
     lines += [
-        f"离场：收到本系统提醒后 4 小时内市价平仓",
         f"确认开仓：{confirm_url(cfg, position_id)}",
     ]
     return "\n".join(lines)
@@ -256,12 +275,21 @@ def regime_note(side: int, price: float, ma200: float) -> dict:
     return {"level": "ok", "text": f"当前价 {price:,.0f} 在 MA200 上方 {dev:+.2f}%（趋势配合）"}
 
 
-def format_missed(cfg, sig: strategy.Signal) -> str:
+def format_missed(cfg, sig: strategy.Signal, executor_managed: bool = False) -> str:
+    """错过的信号补报。
+
+    托管模式下**不能写「不建议追」这种人工处置建议**：系统本来就不会追补
+    （entry_missed 事件不交给执行器），用户能做的只有什么都不做 —— 文案据实说。
+    人工模式逐字符保持原样。注意本函数不含 MEXC 张数/名义段（不引用 order）。
+    """
+    tail = ("该信号已超过一根 4h，入场价已变、风险几何失效，系统不会自动追补。仅作记录。"
+            if executor_managed
+            else "该信号已超过一根 4h，入场价已变、风险几何失效，不建议追。仅作记录。")
     return "\n".join([
         f"{cfg.alert_prefix}⚠️ 错过的信号（补报）",
         f"{sig.symbol} 在 {fmt_bar_close(sig.bar_open_ms)} {TZ_LABEL}的 4h 收盘触发{sig.action}"
         f"（当时入场 {fmt_money(sig.entry_price)}，止损 {fmt_money(sig.stop_price)}）",
-        f"该信号已超过一根 4h，入场价已变、风险几何失效，不建议追。仅作记录。",
+        tail,
     ])
 
 
@@ -544,12 +572,14 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 if handled:
                     position = new_pos
                     continue
-                text = format_entry(cfg, ev.sig, ev.order, pid)
+                text = format_entry(cfg, ev.sig, ev.order, pid,
+                                    executor_managed=(executor is not None))
                 _emit(db, notifier, cfg, Alert("entry", symbol, ev.bar_ms, text), sent)
                 position = new_pos
             else:                                     # entry_missed
                 _emit(db, notifier, cfg, Alert("entry_missed", symbol, ev.bar_ms,
-                                               format_missed(cfg, ev.sig)), sent)
+                                               format_missed(cfg, ev.sig,
+                                                             executor_managed=(executor is not None))), sent)
         db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
 
 
