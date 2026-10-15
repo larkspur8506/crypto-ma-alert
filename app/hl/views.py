@@ -516,7 +516,11 @@ def status_payload(deps: DashboardDeps) -> dict:
             "reduce_only": bool(d.get("reduce_only")),
         })
 
-    funding_total = sum(_num(d.get("funding_since_open")) for d in (_rowd(p) for p in snap_positions))
+    # 资金费取「收付视角」：HL 的 cumFunding.sinceOpen 是**仓位成本视角**（付出为正，
+    # 空头收钱时该值为负），与 userFunding.delta.usdc 的**入账视角**（正=收入）符号相反。
+    # 面板统一按「正=收入」渲染，所以此处对每个 sinceOpen 取反；
+    # payload 的 funding_total（及 /api/hl/* 消费者）与总览同用这一个口径。
+    funding_total = sum(-_num(d.get("funding_since_open")) for d in (_rowd(p) for p in snap_positions))
     unrealized_pnl = sum(p["unrealized_pnl"] for p in positions_out)
 
     # ---------------- 信号 ----------------
@@ -847,10 +851,12 @@ def _render_body(p: dict) -> str:
         o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
     o.append(_kv("持仓名义", f"{_fmt(acc.get('notional'))} U"))
     o.append(_kv("浮盈浮亏", unreal_txt, unreal_cls))
-    o.append(_kv("今日已实现", today_txt, today_cls))
-    o.append(_kv("累计已实现", total_txt, total_cls))
-    o.append(_kv("资金费率（持仓期内）", fund_txt, fund_cls))
-    o.append(_kv("净手续费（正=收费）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
+    o.append(_kv("今日已实现", today_txt, today_cls,
+                 title="交易所 closedPnl 口径，未扣手续费与资金费"))
+    o.append(_kv("累计已实现", total_txt, total_cls,
+                 title="交易所 closedPnl 口径，未扣手续费与资金费"))
+    o.append(_kv("资金费（持仓期内，正=收入）", fund_txt, fund_cls))
+    o.append(_kv("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
     o.append("</div></div>")
 
     # ---------------- 权益曲线 ----------------
@@ -914,7 +920,7 @@ def _render_body(p: dict) -> str:
     o.append("<h2>交易所挂单</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>币种</th><th>类型</th><th>方向</th><th class='num'>数量</th>"
-             "<th class='num'>限价</th><th class='num'>触发价</th><th class='num'>触发时间</th>"
+             "<th class='num'>限价</th><th class='num'>触发价</th><th class='num'>时间</th>"
              "</tr></thead><tbody>")
     for od in (_as_dict(x) for x in orders_open):
         kind = "止损触发" if od.get("is_trigger") else ("市价/限价" if od.get("limit_px") else "下单")
@@ -1020,7 +1026,8 @@ def _render_body(p: dict) -> str:
     o.append("<div class='card'><div class='grid'>")
     o.append(_kv("执行器最后事件", _fmt_dt(system.get("executor_last_event_at"))))
     o.append(_kv("卡在 intent/sent 的下单", f"{int(stuck or 0)} 笔",
-                 "neg" if stuck else "muted"))
+                 "neg" if stuck else "muted",
+                 title="持续 3 分钟未推进才计入"))
     o.append(_kv("对账", "一致" if not mismatch else "不一致", "pos" if not mismatch else "neg"))
     o.append(_kv("交易所地址", _esc(net.get("base_url") or "—")))
     o.append(_kv("环境", "测试网" if net.get("testnet") else "主网"))
@@ -1029,7 +1036,10 @@ def _render_body(p: dict) -> str:
     feed = _as_list(system.get("feed"))
     if feed:
         o.append("<div style='margin-top:10px'><div class='sec'>数据源健康</div>")
-        o.append("<div class='tablewrap'><table><thead><tr><th>标的</th><th>来源</th>"
+        # 表头「来源」原本渲染的是 正常/失败（源名 payload 里有 source，但行内没渲染）
+        # → 改「状态」并在表头挂口径 title；源名见 payload.feed[].source。
+        o.append("<div class='tablewrap'><table><thead><tr><th>标的</th>"
+                 "<th title='信号源固定 hl-candle（fail-closed）'>状态</th>"
                  "<th>最后成功</th><th>错误</th></tr></thead><tbody>")
         for fd in (_as_dict(x) for x in feed):
             ok = bool(fd.get("ok"))

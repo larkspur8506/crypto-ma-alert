@@ -220,7 +220,8 @@ class TestHtmlPage(BaseCase):
         self.assertIn("+42.00 U", html)      # 今日已实现
         self.assertIn("-0.25 U", html)       # 累计手续费（负号）
         self.assertIn(">0.2500<", html)      # 成交表里手续费列 4 位小数
-        self.assertIn("-1.50 U", html)       # 资金费率累计
+        # 资金费按收付视角渲染（正=收入）：快照里 sinceOpen=-1.5 = 收 1.5U
+        self.assertIn("+1.50 U", html)
 
 
 # ---------------------------------------------------------------- JSON API
@@ -260,7 +261,8 @@ class TestStatusPayload(BaseCase):
         self.assertAlmostEqual(a["margin_used"], 260.0)
         self.assertAlmostEqual(a["notional"], 1300.0)
         self.assertAlmostEqual(a["unrealized_pnl"], 50.0)
-        self.assertAlmostEqual(a["funding_total"], -1.5)
+        # 资金费取「收付视角」（正=收入）：cumFunding.sinceOpen 是成本视角，故取反
+        self.assertAlmostEqual(a["funding_total"], 1.5)
         for k in ("today_realized", "total_realized", "fees_total"):
             self.assertIsInstance(a[k], (int, float), k)
 
