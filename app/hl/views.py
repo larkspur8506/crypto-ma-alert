@@ -36,13 +36,15 @@ from typing import Any, Callable, Dict, List, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
+from app.ui_theme import THEME_CSS, normalize_theme, theme_attr, theme_switch_html
+
 logger = logging.getLogger(__name__)
 
 # 公开导出（含面板合并时复用的 _render_body / DASH_CSS；其余为原有公开 API）。
 __all__ = [
     "SCHEMA_VERSION", "MAINNET_DEFAULT", "DashboardDeps",
     "status_payload", "render_dashboard", "build_router",
-    "DASH_CSS", "_render_body",
+    "DASH_CSS", "_render_body", "THEME_CSS",
 ]
 
 SCHEMA_VERSION = 1
@@ -631,7 +633,7 @@ def _equity_svg(points: List[List[float]], width: int = 760, height: int = 160) 
         return (f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' "
                 f"aria-label='权益曲线'>"
                 f"<text x='{width / 2}' y='{height / 2}' text-anchor='middle' "
-                f"fill='#8b95a5' font-size='12'>暂无权益快照（等执行器落一次 hl_snapshots）</text></svg>")
+                f"class='gtext' font-size='12'>暂无权益快照（等执行器落一次 hl_snapshots）</text></svg>")
 
     xs = [_num(p[0]) for p in points]
     ys = [_num(p[1]) for p in points]
@@ -652,7 +654,7 @@ def _equity_svg(points: List[List[float]], width: int = 760, height: int = 160) 
     grid = "".join(
         f"<line x1='{pad_l}' y1='{round(pad_t + f * (height - pad_t - pad_b), 1)}' "
         f"x2='{width - pad_r}' y2='{round(pad_t + f * (height - pad_t - pad_b), 1)}' "
-        f"stroke='#262a33' stroke-width='1'/>"
+        f"class='gline' stroke-width='1'/>"
         for f in (0.25, 0.5, 0.75))
     first_y = round(sy(ys[0]), 1)
     last_x, last_y = sx(xs[-1]), sy(ys[-1])
@@ -660,11 +662,11 @@ def _equity_svg(points: List[List[float]], width: int = 760, height: int = 160) 
         f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' aria-label='权益曲线'>"
         + grid
         + f"<line x1='{pad_l}' y1='{first_y}' x2='{width - pad_r}' y2='{first_y}' "
-        f"stroke='#8b95a5' stroke-width='1' stroke-dasharray='4 4' opacity='0.45'/>"
-        + f"<polygon points='{area}' fill='#60a5fa' opacity='0.13'/>"
-        + f"<polyline points='{pts}' fill='none' stroke='#60a5fa' stroke-width='2' "
+        f"class='gbase' stroke-width='1' stroke-dasharray='4 4' opacity='0.45'/>"
+        + f"<polygon points='{area}' class='garea' opacity='0.13'/>"
+        + f"<polyline points='{pts}' fill='none' class='gline2' stroke-width='2' "
         f"stroke-linejoin='round' stroke-linecap='round'/>"
-        + f"<circle cx='{last_x}' cy='{last_y}' r='3.5' fill='#60a5fa'/>"
+        + f"<circle cx='{last_x}' cy='{last_y}' r='3.5' class='gdot'/>"
         + "</svg>")
 
 
@@ -673,46 +675,52 @@ DASH_CSS = """<style>
 *{box-sizing:border-box}
 html,body{margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
-     background:#0f1115;color:#e6e6e6;line-height:1.55;font-size:14px;padding:14px}
+     background:var(--bg);color:var(--fg);line-height:1.55;font-size:14px;padding:14px}
 .wrap{max-width:1180px;margin:0 auto}
 h1{font-size:19px;margin:0 0 10px;font-weight:600}
-h2{font-size:12px;margin:20px 0 8px;color:#9ad;letter-spacing:1.5px}
-.card{background:#171a21;border:1px solid #262a33;border-radius:10px;padding:12px 14px;margin-bottom:12px}
+h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
-.badge{display:inline-flex;align-items:center;gap:6px;background:#171a21;border:1px solid #262a33;
+.badge{display:inline-flex;align-items:center;gap:6px;background:var(--card);border:1px solid var(--line);
        border-radius:999px;padding:6px 12px;font-size:12px;white-space:nowrap}
 .badge b{font-size:13px;font-weight:600}
-.sec{font-size:11px;color:#8b95a5;letter-spacing:1.5px;margin-bottom:8px}
+.sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
 .kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:4px 0;
-    border-bottom:1px solid #1e222b}
+    border-bottom:1px solid var(--line2)}
 .kv:last-child{border-bottom:0}
-.kv .k{color:#8b95a5;white-space:nowrap}
+.kv .k{color:var(--muted);white-space:nowrap}
 .kv .v{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
-.pos{color:#4ade80}.neg{color:#f87171}.warn{color:#fbbf24}.muted{color:#8b95a5;font-size:12px}
+.pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.muted{color:var(--muted);font-size:12px}
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;
-            border:1px solid #262a33;border-radius:10px;background:#171a21}
+            border:1px solid var(--line);border-radius:10px;background:var(--card)}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
-th,td{border-bottom:1px solid #262a33;padding:6px 9px;text-align:left;white-space:nowrap}
-thead th{color:#8b95a5;font-weight:500;font-size:11.5px;background:#14171e}
+th,td{border-bottom:1px solid var(--line);padding:6px 9px;text-align:left;white-space:nowrap}
+thead th{color:var(--muted);font-weight:500;font-size:11.5px;background:var(--card2)}
 tr:last-child td{border-bottom:0}
 .num{text-align:right;font-variant-numeric:tabular-nums}
 .mono{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
-.banner{border:1px solid #7f1d1d;background:#2a1215;color:#fca5a5;border-radius:10px;
+.banner{border:1px solid var(--banner-line);background:var(--banner-bg);color:var(--banner-fg);border-radius:10px;
         padding:10px 14px;margin-bottom:12px;font-size:13px}
-.banner .muted{color:#c99}
-.chart-wrap{background:#171a21;border:1px solid #262a33;border-radius:10px;padding:10px 12px 6px}
+.banner .muted{color:var(--banner-muted)}
+.chart-wrap{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:10px 12px 6px}
 .chart-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
-            font-size:12px;color:#8b95a5;margin-bottom:2px}
-.chart-head b{color:#e6e6e6}
+            font-size:12px;color:var(--muted);margin-bottom:2px}
+.chart-head b{color:var(--fg)}
 svg.chart{display:block;width:100%;height:160px}
-.btn{display:inline-block;background:#2563eb;color:#fff;border-radius:6px;padding:5px 11px;
+svg.chart .gtext{fill:var(--muted)}
+svg.chart .gline{stroke:var(--line)}
+svg.chart .gbase{stroke:var(--muted)}
+svg.chart .garea{fill:var(--link)}
+svg.chart .gline2{stroke:var(--link)}
+svg.chart .gdot{fill:var(--link)}
+.btn{display:inline-block;background:var(--btn);color:#fff;border-radius:6px;padding:5px 11px;
      font-size:12px;text-decoration:none;white-space:nowrap}
-.btn.gray{background:#374151}
-.foot{margin:18px 0 6px;color:#8b95a5;font-size:12px;display:flex;flex-wrap:wrap;
+.btn.gray{background:var(--btn-gray)}
+.foot{margin:18px 0 6px;color:var(--muted);font-size:12px;display:flex;flex-wrap:wrap;
       gap:8px;align-items:center}
 .foot .spacer{flex:1}
-a{color:#60a5fa}
+a{color:var(--link)}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
     .badge{padding:5px 10px;font-size:11px}.grid{grid-template-columns:1fr}}
 </style>"""
@@ -921,8 +929,10 @@ def _render_body(p: dict) -> str:
 
     # ---------------- 最近成交 ----------------
     o.append("<h2>最近成交</h2>")
+    # 表头 9 列（2026-10-15 修）：上一版加了「买/卖」列但没改表头，8 列表头配 9 格数据行，
+    # 从「数量」起整行左移一格 —— 数量列显示买/卖、价格列显示数量、手续费列显示价格。
     o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>时间</th><th>币种</th><th class='num'>数量</th>"
+             "<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
              "<th class='num'>价格</th><th class='num'>手续费</th><th>方向</th>"
              "<th class='num'>平仓盈亏</th><th>减仓</th></tr></thead><tbody>")
     # 只渲染最近 50 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
@@ -931,12 +941,14 @@ def _render_body(p: dict) -> str:
         d = str(f.get("dir") or "")
         # 买卖方向由 dir 推导（审计三轮 M9）：side 是多空方向，Close Long 实为卖出、
         # Close Short 实为买入 —— 以前拿 side 反推会把平仓方向显示反。
-        _d = str(f.get("dir") or "")
-        _buy_sell = "买" if _d.startswith("Open") else ("卖" if _d.startswith("Close") else "—")
+        # 推导口径（开仓=按方向，平仓=反方向）：Open Long/Close Short=买、
+        # Close Long/Open Short=卖。此前 startswith("Close")→卖 会把 Close Short（买入平空）标成卖。
+        _bs = "买" if d in ("Open Long", "Close Short") else (
+            "卖" if d in ("Close Long", "Open Short") else "—")
         o.append("<tr>"
                  + _td(_fmt_dt(f.get("ts")), "num")
                  + _td(_esc(f.get("coin") or "—"))
-                 + _td(_buy_sell)
+                 + _td(_bs)
                  + _td(_fmt_sz(f.get("sz")), "num")
                  + _td(_fmt(f.get("px")), "num")
                  + _td(_fmt(f.get("fee"), 4), "num")
@@ -1027,16 +1039,19 @@ def _render_body(p: dict) -> str:
     return "".join(o)
 
 
-def _render_footer(cur: int) -> str:
+def _render_footer(cur: int, theme: str = "auto", k: str = "") -> str:
     links = []
     for n, label in ((0, "手动刷新"), (10, "每 10 秒"), (30, "每 30 秒"), (60, "每 60 秒")):
         href = "/hl" if n == 0 else f"/hl?refresh={n}"
         cls = "btn" if n == cur else "btn gray"
         links.append(f"<a class='{cls}' href='{href}'>{label}</a>")
+    # 主题切换（黑/白/跟随系统）：与 /admin 面板同一套 cookie 与路由
+    theme_row = theme_switch_html("overview", theme, k)
     return ("<div class='foot'><span class='muted'>自动刷新：</span>"
             + " ".join(links)
             + "<span class='spacer'></span>"
-            + f"<span class='muted'>本页只读、不持私钥 &middot; schema v{SCHEMA_VERSION}</span></div>")
+            + f"<span class='muted'>本页只读、不持私钥 &middot; schema v{SCHEMA_VERSION}</span></div>"
+            + theme_row)
 
 
 def render_dashboard(payload: dict) -> str:
@@ -1052,11 +1067,14 @@ def render_dashboard(payload: dict) -> str:
     if refresh not in (10, 30, 60):
         refresh = 0
     meta = f"<meta http-equiv='refresh' content='{refresh}'>" if refresh else ""
+    theme = normalize_theme(p.get("theme"))
+    attr = theme_attr(theme)
+    attr_html = f" data-theme='{attr}'" if attr else ""
     return (
-        "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"{meta}<title>Hyperliquid 执行器监控</title>{DASH_CSS}</head>"
-        f"<body><div class='wrap'>{body}{_render_footer(refresh)}</div></body></html>")
+        f"{meta}<title>Hyperliquid 执行器监控</title>{THEME_CSS}{DASH_CSS}</head>"
+        f"<body><div class='wrap'>{body}{_render_footer(refresh, theme, str(p.get('admin_k') or ''))}</div></body></html>")
 
 
 # ---------------------------------------------------------------- 路由
@@ -1098,6 +1116,8 @@ def build_router(deps: DashboardDeps) -> Any:
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         payload = dict(status_payload(deps))
         payload["refresh"] = refresh if refresh in (10, 30, 60) else 0
+        payload["theme"] = normalize_theme(request.cookies.get("cma_theme"))
+        payload["admin_k"] = str(k or "")
         return HTMLResponse(render_dashboard(payload))
 
     @router.get("/api/hl/status")

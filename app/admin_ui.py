@@ -32,6 +32,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
 from app.hl.views import DASH_CSS, _render_body, status_payload
+from app.ui_theme import (THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
+                          theme_attr, theme_switch_html)
 
 logger = logging.getLogger(__name__)
 
@@ -651,18 +653,25 @@ def render_records(deps: AdminDeps) -> str:
     # ---- 成交 ----
     o.append("<div class='card'><div class='sec'>成交（hl_fills）</div>")
     rows = ""
+    # 买卖方向由 dir 推导（2026-10-15 修）：side 是多空方向不是买卖方向，
+    # 以前 side>=0→买 把「平多（卖出）」也标成买。四向口径：
+    # Open Long / Close Short = 买；Close Long / Open Short = 卖。
+    _BS = {"Open Long": "买", "Close Short": "买",
+           "Close Long": "卖", "Open Short": "卖"}
     for r in _rows(deps, "hl_recent_fills", 50):
         cp = _opt_num(r.get("closed_pnl"))
         cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
+        d = str(r.get("dir") or "")
+        bs = _BS.get(d, "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('ts') or r.get('created_at'))}</td>"
                  f"<td>{_esc(r.get('coin') or _coin('', r.get('symbol')))}</td>"
-                 f"<td>{'买' if _num(r.get('side'), 0) >= 0 else '卖'}</td>"
+                 f"<td>{bs}</td>"
                  f"<td class='num'>{_fmt(r.get('sz'), 4)}</td>"
                  f"<td class='num'>{_fmt(r.get('px'))}</td>"
                  f"<td class='num'>{_fmt(r.get('fee'), 4)}</td>"
                  f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
                  f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
-    o.append(_table("<th>时间</th><th>币种</th><th>方向</th><th class='num'>数量</th>"
+    o.append(_table("<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
                     "<th class='num'>价格</th><th class='num'>手续费</th>"
                     "<th class='num'>平仓盈亏</th><th>减仓</th>",   # 列名「减仓」= 这笔是不是平仓性质
                     rows, "暂无成交记录", 8))
@@ -714,30 +723,31 @@ def _coin(coin: Any, symbol: Any) -> str:
 # ---------------------------------------------------------------- 页面骨架
 ADMIN_CSS = """<style>
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 14px}
-.tabs a{font-size:13px;padding:7px 13px;border-radius:8px;background:#171a21;
-        border:1px solid #262a33;color:#9ad;text-decoration:none;white-space:nowrap}
-.tabs a.on{background:#2563eb;border-color:#2563eb;color:#fff;font-weight:600}
+.tabs a{font-size:13px;padding:7px 13px;border-radius:8px;background:var(--card);
+        border:1px solid var(--line);color:var(--link);text-decoration:none;white-space:nowrap}
+.tabs a.on{background:var(--btn);border-color:var(--btn);color:#fff;font-weight:600}
 table{font-size:13px}
 th,td{padding:6px 8px}
 .field{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:9px 0;
-       border-bottom:1px solid #1e222b}
+       border-bottom:1px solid var(--line2)}
 .field:last-child{border-bottom:0}
 .field .lbl{flex:1 1 160px;min-width:130px;font-size:13px}
-.field input[type=text]{width:118px;background:#0f1115;border:1px solid #374151;color:#e6e6e6;
+.field input[type=text]{width:118px;background:var(--input);border:1px solid var(--line);color:var(--fg);
        border-radius:6px;padding:7px 9px;font-size:13px}
-.field select{background:#0f1115;border:1px solid #374151;color:#e6e6e6;
+.field select{background:var(--input);border:1px solid var(--line);color:var(--fg);
        border-radius:6px;padding:7px 9px;font-size:13px}
 .field .hint,.hint{width:100%}
-.hint{font-size:12.5px;color:#8b95a5;margin:2px 0 6px;line-height:1.5}
-.hint.big{font-size:13px;color:#e6e6e6}
-.src{color:#8b95a5;font-size:11.5px}
+.hint{font-size:12.5px;color:var(--muted);margin:2px 0 6px;line-height:1.5}
+.hint.big{font-size:13px;color:var(--fg)}
+.src{color:var(--muted);font-size:11.5px}
 .chk,.rad{display:flex;align-items:center;gap:8px;font-size:13px;margin:7px 0}
-.chk.warnline{color:#fbbf24}
-.chk input,.rad input{width:17px;height:17px;accent-color:#2563eb}
-.banner.warn{border-color:#78350f;background:#2a1d08;color:#fcd34d}
-button{display:inline-block;background:#2563eb;color:#fff;border:0;border-radius:6px;
+.chk.warnline{color:var(--warn)}
+.chk input,.rad input{width:17px;height:17px;accent-color:var(--btn)}
+.banner.warn{border-color:var(--wb-line);background:var(--wb-bg);color:var(--wb-fg)}
+.banner.ok{border-color:var(--okb-line);background:var(--okb-bg);color:var(--okb-fg)}
+button{display:inline-block;background:var(--btn);color:#fff;border:0;border-radius:6px;
        padding:9px 15px;font-size:13.5px;cursor:pointer;margin:6px 8px 0 0}
-button.gray{background:#374151}button.red{background:#b91c1c}
+button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
    .badge{padding:5px 9px;font-size:11.5px}h2{font-size:13px}
    .grid{grid-template-columns:1fr}table{font-size:13px}th,td{padding:5px 7px}
@@ -790,18 +800,22 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
     return body
 
 
-def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "") -> HTMLResponse:
+def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
+          theme: str = DEFAULT_THEME) -> HTMLResponse:
     label = dict(TABS).get(tab, "总览")
     banner = ""
     if msg:
-        banner = (f"<div class='banner' style='border-color:#14532d;background:#0f2418;"
-                  f"color:#86efac'>{_esc(msg)}</div>")
+        banner = f"<div class='banner ok'>{_esc(msg)}</div>"
+    attr = theme_attr(theme)
+    attr_html = f" data-theme='{attr}'" if attr else ""
+    from app.hl.views import THEME_CSS
     return HTMLResponse(
-        "<!doctype html><html lang='zh-CN'><head><meta charset='utf-8'>"
+        f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         "<meta name='viewport' content='width=device-width,initial-scale=1'>"
-        f"<title>crypto-ma-alert · {label}</title>{DASH_CSS}{ADMIN_CSS}</head>"
+        f"<title>crypto-ma-alert · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
         f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
+        f"{theme_switch_html(tab, theme, token)}"
         "<div class='foot'><span class='muted'>手机可用 · 零 JS · "
         "面板只读，不持私钥</span></div></div></body></html>")
 
@@ -846,7 +860,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             body = render_switch(deps, cfg)
         else:
             body = render_records(deps)
-        resp = _page(token, tab, strip, body, msg)
+        resp = _page(token, tab, strip, body, msg,
+                     theme=normalize_theme(request.cookies.get(THEME_COOKIE)))
         # Cookie 必须设在返回的 response 上：Starlette 在函数返回新 Response 时会丢弃
         # 注入的 response 上写的头（所以这里不能用依赖注入的 response）。
         if k:
@@ -944,6 +959,22 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
                                    "但执行器未接线（无动作）")
         return RedirectResponse(_back(token, "switch"), status_code=303)
+
+    # ---------------- 主题切换（零 JS：设 cookie 后跳回） ----------------
+    @router.get("/admin/theme")
+    def admin_theme(request: Request, t: str = DEFAULT_THEME, tab: str = "overview",
+                    k: Optional[str] = None):
+        theme = normalize_theme(t)
+        tab = tab if tab in _TAB_KEYS else "overview"
+        # 未带 k 且 cookie 已登录 → 用 cookie 鉴权（页脚链接只有 admin 页里有，已登录场景）
+        token = _auth(deps, request, k or None)
+        https_ = request.url.scheme == "https" or \
+            str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+        resp = RedirectResponse(f"/admin?tab={tab}&k={quote(str(token))}", status_code=302)
+        # max_age=0 删除；auto 也写死成 cookie（显式「跟随系统」选择）
+        resp.set_cookie(THEME_COOKIE, theme, max_age=365 * 86400,
+                        secure=https_, samesite="lax")
+        return resp
 
     # ---------------- 旧地址兼容（302 到新位置，保持 ?k= 透传） ----------------
     @router.get("/hl", response_class=HTMLResponse)
