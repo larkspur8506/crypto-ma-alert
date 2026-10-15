@@ -18,6 +18,8 @@ import time
 from functools import wraps
 from typing import Any, Dict, List, Optional
 
+from app import posfields
+
 logger = logging.getLogger(__name__)
 
 SCHEMA = """
@@ -246,20 +248,41 @@ class DB:
 
     @_locked
     def confirm_position(self, pid: int, actual_entry: float, actual_contracts: float,
-                         actual_stop: float, stop_placed: bool) -> None:
-        self.conn.execute(
-            "UPDATE positions SET status='open', actual_entry=?, actual_contracts=?, actual_stop=?, "
-            "stop_placed=?, opened_at=? WHERE id=?",
-            (actual_entry, actual_contracts, actual_stop, 1 if stop_placed else 0, now(), pid))
+                         actual_stop: float, stop_placed: bool,
+                         equity_at_entry: Optional[float] = None) -> None:
+        """确认开仓（pending → open）。
+
+        `equity_at_entry`：**可选**的实际生效基数写回（双口径收敛）。引擎建行时写的是
+        配置 equity（如 1000U），HL 执行器按生效基数（如 100U）成交后在确认点覆盖它，
+        这样 review_fill 的「权益的 X%」等读者自然读到真实基数。不传 = 行为不变。
+        """
+        sets = ("UPDATE positions SET status='open', actual_entry=?, actual_contracts=?, "
+                "actual_stop=?, stop_placed=?, opened_at=?")
+        vals: List[Any] = [actual_entry, actual_contracts, actual_stop,
+                           1 if stop_placed else 0, now()]
+        if equity_at_entry is not None:
+            sets += ", equity_at_entry=?"
+            vals.append(float(equity_at_entry))
+        sets += " WHERE id=?"
+        vals.append(pid)
+        self.conn.execute(sets, vals)
         self.conn.commit()
 
     @_locked
     def update_fill(self, pid: int, actual_entry: float, actual_contracts: float,
                     actual_stop: float, stop_placed: bool) -> None:
-        """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。"""
+        """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。
+
+        **只服务 MEXC 人工流**：HL 仓（`hl_status` 非空）的真实成交在交易所侧，
+        本地改正会与 `hl_fills`/交易所持仓脱节（表单里的「张数/成交金额换算」是
+        MEXC 面值口径，写进去就是脏数据）→ 直接拒绝，让用户去面板核对。
+        """
         p = self.position_by_id(pid)
         if not p:
             return
+        if posfields.is_hl(p):
+            raise ValueError("HL 执行器管理的仓位不支持在确认页修改开仓记录，"
+                             "请到面板「记录」页按 hl_fills 核对真实成交")
         risk = abs(actual_entry - actual_stop)
         sets = "actual_entry=?, actual_contracts=?, actual_stop=?, stop_placed=?"
         vals: List[Any] = [actual_entry, actual_contracts, actual_stop, 1 if stop_placed else 0]

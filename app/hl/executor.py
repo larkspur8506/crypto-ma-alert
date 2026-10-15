@@ -669,7 +669,12 @@ class Executor:
         # 4) 落仓位
         self.db.set_pos_hl(position_id, hl_status="open", hl_entry_oid=res.get("oid"),
                            hl_stop_oid=stop_res.get("oid"), hl_sz=filled_sz)
-        self.db.confirm_position(position_id, avg_px, float(filled_sz), stop, True)
+        # 双口径收敛：引擎建行时写的是**配置** equity（1000U），这里成交确认时把
+        # **实际生效基数**（eff_equity，跟随实时权益的档位基数）覆盖回去 ——
+        # positions.equity_at_entry 是唯一字段，读侧（review_fill 的「权益的 X%」等）
+        # 自然读到真实基数，不需要别处再判口径。
+        self.db.confirm_position(position_id, avg_px, float(filled_sz), stop, True,
+                                 equity_at_entry=eff_equity)
         plan2 = hl_sizing.HlOrderPlan(**{**plan.__dict__, "entry_price": avg_px,
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
         self._alert_fill(fmt_entry_alert(

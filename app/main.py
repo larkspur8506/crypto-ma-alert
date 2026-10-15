@@ -21,7 +21,7 @@ from typing import Optional
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
-from app import engine, market, sizing, strategy
+from app import engine, market, posfields, sizing, strategy
 from app.config import Config
 from app.db import DB
 from app.notify import get_notifier
@@ -477,6 +477,11 @@ def confirm_view(pid: int, request: Request, a: str = "view", t: str = ""):
             return _summary(row, pid, request)
         return _close_form(row, request)
     if a == "edit_open":
+        # 双口径收敛：HL 仓的真实开仓数据由执行器写（actual_* / hl_fills），
+        # 本表单是 MEXC 面值口径 → 连表单都不给（按钮在摘要页已隐藏，这里挡住直达 URL）。
+        if posfields.is_hl(row):
+            raise HTTPException(400, "本仓由 HL 执行器管理，不支持在这里修改开仓记录"
+                                     "（真实成交见面板「记录」页的 hl_fills / hl_orders）")
         return _entry_form(row, pid, editing=True, request=request)
     if row["status"] == "pending":
         return _entry_form(row, pid, editing=False, request=request)
@@ -505,26 +510,44 @@ def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLRe
                 f"（当前入场 {row['actual_entry'] or row['entry_price']:,.2f} / "
                 f"止损 {row['actual_stop'] or row['stop_price']:,.2f} / "
                 f"张数 {(row['actual_contracts'] if row['actual_contracts'] is not None else row['contracts']):g}）。</p>")
-    cur_entry = (row["actual_entry"] or row["entry_price"]) if editing else row["entry_price"]
-    cur_stop = (row["actual_stop"] or row["stop_price"]) if editing else row["stop_price"]
-    cur_qty = (row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]) if editing else row["contracts"]
+    cur_entry = posfields.entry_px(row) if editing else row["entry_price"]
+    cur_stop = posfields.stop_px(row) if editing else row["stop_price"]
+    cur_qty = posfields.qty(row) if editing else (posfields.contracts_raw(row)
+                                                  if not _is_hl else posfields.qty(row))
     edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
     title = f"修改开仓数据 #{pid}" if editing else f"确认开仓 #{pid}"
-    # 审计三轮 M1/M5：positions 双口径 —— HL 执行器管的仓 actual_contracts 是币量，
-    # MEXC 人工仓是张数。HL 仓不做 MEXC 面值换算（contracts_from_amount 会把
-    # 成交金额换算成「张」写脏 HL 仓），标签也按口径显示。
-    _is_hl = bool(row.get("hl_status"))
-    qty_label = "数量（币量）" if _is_hl else "张数"
+    # 双口径（app/posfields.py）：HL 执行器管的仓 —— 行里的 contracts/notional/risk_u
+    # 是 MEXC 人工口径（张数 + 按配置 equity 1000U 算的名义），**不能拿来展示**；
+    # 真实值在 actual_*。历史 MEXC 行照旧读原字段。qty_label 也按口径切换。
+    qty_label = posfields.qty_label(row)
     qty_hint = "" if not _is_hl else "（HL 仓按币量填写，忽略成交金额）"
+    if _is_hl:
+        # HL 仓：只展示真实（实际成交）口径；信号建议值单列一行并标明未含滑点。
+        _sz, _ntl, _rk = posfields.qty(row), posfields.notional(row), posfields.risk_u(row)
+        _base = posfields.equity_base(row)
+        real_line = (f"实际成交：入场 <b>{posfields.entry_px(row):,.2f}</b>｜"
+                     f"止损 <b>{posfields.stop_px(row):,.2f}</b>｜"
+                     f"数量 <b>{_sz:g} {posfields.qty_unit(row)}</b>｜"
+                     f"名义 <b>{_ntl:,.2f} U</b>｜风险 <b>{_rk:.2f}U</b>"
+                     + (f"（基数 {_base:,.0f}U）" if _base else "") + "<br>"
+                     if (_sz and posfields.entry_px(row)) else
+                     "<span class='muted'>本行尚无真实成交数据（未成交/已放弃）。</span><br>")
+        suggest_line = (f"信号建议（未含滑点）：入场 {row['entry_price']:,.2f}｜"
+                        f"止损 {row['stop_price']:,.2f}{stop_hint}"
+                        f"（{row['stop_dist'] * 100:.2f}%）\n")
+    else:
+        real_line = ""
+        suggest_line = (
+            f"建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>"
+            f"{stop_hint}（{row['stop_dist'] * 100:.2f}%）<br>\n"
+            f"      建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜\n"
+            f"      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =\n"
+            f"      {cfg.equity * cfg.risk_pct:.1f}U）\n")
     body = f"""
     <h1>{title}</h1>
     <div class='card'>
       <b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}<br>
-      建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>{stop_hint}
-      （{row['stop_dist'] * 100:.2f}%）<br>
-      建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜
-      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =
-      {cfg.equity * cfg.risk_pct:.1f}U）
+      {real_line}{suggest_line}
       {note}
     </div>
     <form method='post'>
@@ -557,11 +580,11 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     """只读摘要页：只显示当前记录 + 显式入口（修改 / 手动平仓）。"""
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
-    entry = row["actual_entry"] or row["entry_price"]
-    stop = row["actual_stop"] or row["stop_price"]
-    qty = row["actual_contracts"] if row["actual_contracts"] is not None else row["contracts"]
-    is_hl = bool(row["hl_status"])
-    qty_unit = "币量" if is_hl else "张"
+    entry = posfields.entry_px(row)
+    stop = posfields.stop_px(row)
+    qty = posfields.qty(row)
+    is_hl = posfields.is_hl(row)
+    qty_unit = posfields.qty_unit(row)
     lines = [
         f"<b>{row['symbol']}</b> {side_txt}｜信号 bar {engine.fmt_ms(row['signal_bar_ms'])} {engine.TZ_LABEL}",
         f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty:g} {qty_unit}",
@@ -569,11 +592,11 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     if row["status"] == "closed":
         lines.append(f"离场 <b>{row['exit_price'] or 0:,.2f}</b>（{row['exit_reason']}）"
                      f"｜本次 <b>{row['r_multiple'] or 0:+.2f}R</b>")
-        if row["auto_closed"]:
+        if row["auto_closed"] and not is_hl:
             lines.append("<span class='muted'>离场价是系统按参考价记录的；"
                          "若与 MEXC 实际成交不同，点下面的修改按钮改正。</span>")
     btns = []
-    if row["status"] in ("open", "closed"):
+    if row["status"] in ("open", "closed") and not is_hl:
         btns.append(f"<a class='btn' href='/c/{pid}?a=edit_open&t={tok('edit_open')}'>修改开仓记录</a>")
     if row["status"] == "open":
         btns.append(f"<a class='btn gray' href='/c/{pid}?a=close&t={tok('close')}'>记录平仓成交价</a>")
@@ -584,6 +607,11 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     if is_hl:
         btns.append("<br><span class='muted'>注：本页操作只修改记录，不会在交易所下单；"
                     "交易所平仓请到 HL 面板/交易所操作。</span>")
+        # 双口径收敛：HL 仓的真实成交在交易所侧且已写进 actual_*/hl_fills，本地
+        # 「修改开仓记录」是 MEXC 面值口径的表单，改了就与交易所脱节 → 入口直接隐藏。
+        btns.append("<br><span class='muted'>本仓由 HL 执行器管理，真实成交见面板"
+                    "「记录」页的成交（hl_fills）与下单记录（hl_orders），"
+                    "不支持在此修改开仓数据。</span>")
     body = (f"<h1>{_status_label(row)} #{pid}</h1>"
             f"<div class='card'>{'<br>'.join(lines)}</div>"
             f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")
@@ -591,8 +619,8 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
 
 
 def _close_form(row, request: Request = None) -> HTMLResponse:
-    entry = row["actual_entry"] or row["entry_price"]
-    stop = row["actual_stop"] or row["stop_price"]
+    entry = posfields.entry_px(row)
+    stop = posfields.stop_px(row)
     side_txt = "多单" if (row["side"] or 1) == 1 else "空单"
     hint = ""
     if row["status"] == "closed":
@@ -664,6 +692,12 @@ async def confirm_post(pid: int, request: Request):
             pass          # 从「修改开仓数据」进来，允许改正
         else:
             raise HTTPException(400, f"该仓位状态是 {row['status']}；如需改正请从确认页点「修改开仓数据」")
+        # 双口径收敛：HL 仓的开仓数据归执行器（actual_* / hl_fills），本地改正会把
+        # MEXC 面值口径的数字写进 HL 行 → 一律 400（与 GET a=edit_open、db.update_fill
+        # 同一守卫，三处一致：路由 400 + 按钮隐藏 + DB 抛错）。
+        if posfields.is_hl(row) and row["status"] != "pending":
+            raise HTTPException(400, "本仓由 HL 执行器管理，不支持修改开仓记录；"
+                                     "真实成交请到面板「记录」页按 hl_fills 核对")
         try:
             entry = float(str(form.get("actual_entry") or row["entry_price"]))
             stop = float(str(form.get("actual_stop") or row["stop_price"]))
@@ -696,9 +730,18 @@ async def confirm_post(pid: int, request: Request):
         if row["status"] == "pending":
             db.confirm_position(pid, entry, qty, stop, placed)
         else:
-            db.update_fill(pid, entry, qty, stop, placed)   # 修改已确认的记录
+            try:
+                db.update_fill(pid, entry, qty, stop, placed)   # 修改已确认的记录
+            except ValueError as e:
+                # DB 层守卫（HL 仓不可本地改开仓数据）→ 双保险，转成 400 而非 500
+                raise HTTPException(400, str(e))
+        # 「权益的 X%」用**这行的下单基数**（HL 仓由执行器写回实际生效基数；
+        # MEXC 行是建行时的配置 equity），不再拿当前配置值硬套 —— 否则 HL 仓
+        # 真实基数 100U 会被按配置 1000U 读成 0.2%。
+        _eq_base = posfields.equity_base(row, current_config().equity)
         rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
-                                 row["contracts"], entry, stop, qty, source)
+                                 row["contracts"], entry, stop, qty, source,
+                                 equity=_eq_base)
         src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"
                    if source == "amount" else "按你填的张数")
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"
