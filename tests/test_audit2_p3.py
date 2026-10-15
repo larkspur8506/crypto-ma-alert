@@ -82,7 +82,12 @@ class TestViewsDisplay(unittest.TestCase):
         src = open(views.__file__, encoding="utf-8").read()
         self.assertIn("可提余额\", f\"{_fmt(avail)} U（提现收 1U 手续费）\"", src)
         self.assertNotIn("可提余额（现货口径，已扣占用，提现固定扣 1U）", src)
-        self.assertIn("资金都在现货（统一账户）", src)
+        # 2026-10-15 用户反馈：口径名「永续口径」是黑话、且与「已用保证金」重复 →
+        # 改成一行「资金分布（统一账户）现货 X · 合约占用 Y」，统一账户下不再单列保证金
+        self.assertIn("资金分布（统一账户）", src)
+        # 源码里 JSON payload 的注释仍会提到「永续口径」，这里只钉死**展示层**不再用这个口径名
+        self.assertNotIn("永续口径 {_fmt", src)
+        self.assertNotIn('_kv("永续口径', src)
 
     def test_fills_render_capped(self):
         from app.hl import views

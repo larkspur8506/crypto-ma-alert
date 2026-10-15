@@ -243,8 +243,10 @@ class Executor:
             return {"ok": False, "problems": ["读不到账户状态（info 失败）"], "unknown": True}
         ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
         # 挂单列表可信才允许判断「止损有无」：回落老接口时读不到 isTrigger，会把有止损读成没止损，
-        # 据此自动补挂/平仓 = 误平仓。缺字段按可信（唯一生产来源 info.snapshot 会显式设置）。
-        trusted = bool(snap.get("orders_trusted", True))
+        # 据此自动补挂/平仓 = 误平仓。缺字段按**不可信**处理 —— 与面板（views）和看护
+        # （watchdog）同口径（fail-closed）：唯一生产来源 info.snapshot 总会显式写这个键，
+        # 缺键只可能出现在桩/半成品数据里，那种情况宁可只告警、不自动动仓。
+        trusted = bool(snap.get("orders_trusted", False))
         problems: List[str] = []
         missing_stop: List[dict] = []
         unconfirmed: List[str] = []

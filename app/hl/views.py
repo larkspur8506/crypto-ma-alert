@@ -800,10 +800,13 @@ def _render_body(p: dict) -> str:
         # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
         o.append(_kv("⚠️ 现货余额读取失败", "上方的总值/可提不可信（只剩浮盈），不是没钱", "neg"))
     if acc.get("unified"):
-        # 统一账户：钱在现货状态里，永续口径恒为 0 —— 精简为一行说明，不单列两行 0
-        o.append(_kv("资金都在现货（统一账户）",
-                     f"抵押品 {_fmt(acc.get('spot_usdc'))} U · 永续口径 {_fmt(acc.get('perp_equity'))} U",
-                     "muted"))
+        # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
+        # 合约侧占用的就是下面原来单列的「已用保证金」（同一个数，实测该仓保证金
+        # 13.7~14U 与 perp 口径一致），所以合并成一行；「永续口径」这种口径名
+        # 对用户是黑话、且与保证金重复，去掉。
+        o.append(_kv("资金分布（统一账户）",
+                     f"现货 {_fmt(acc.get('spot_usdc'))} U · 合约占用 {_fmt(acc.get('margin_used'))} U",
+                     "muted", title="统一账户下资金分在现货与合约两侧；合约侧占用 = 已用保证金"))
     wd = _num(acc.get("withdrawable"))
     if acc.get("unified") and wd <= 0:
         # 统一账户：真实可提 = 现货 USDC − 占用（仓位/挂单锁定）；HL 提现固定收 1 USDC。
@@ -813,7 +816,9 @@ def _render_body(p: dict) -> str:
                      title="统一账户下的实际可提：现货余额扣除仓位/挂单占用的保证金"))
     else:
         o.append(_kv("可提余额", f"{_fmt(wd)} U"))
-    o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
+    if not acc.get("unified"):
+        # 统一账户已在「资金分布」那行给出合约占用，这里不再重复一列
+        o.append(_kv("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
     o.append(_kv("持仓名义", f"{_fmt(acc.get('notional'))} U"))
     o.append(_kv("浮盈浮亏", unreal_txt, unreal_cls))
     o.append(_kv("今日已实现", today_txt, today_cls))
