@@ -256,6 +256,11 @@ class Executor:
                       # 审计三轮 M4：status='pending' 也纳入 —— on_entry 在「交易所成交
                       # → confirm_position」之间崩溃时行还是 pending，真实裸仓以前只会被
                       # 打成「人工单」kill+告警，永不补挂止损。
+                      # 审计四轮 P1：pending 行**必须真的发过入场单**才算真实仓位。
+                      # on_entry 在读数据阶段就退出（快照/规格/mid 失败 → entry 行记成
+                      # skipped）时交易所什么都没有，无条件纳入会让下一轮对账报
+                      # 「本地有仓但交易所无仓位」→ 误置 kill + 误标 mismatch。
+                      and (r["status"] == "open" or self._entry_issued(r))
                       and (r["hl_status"] or "") in ("open", "mismatch", "")]
         seen = set()
         for r in local_open:
@@ -316,7 +321,7 @@ class Executor:
         try:
             res = self.ex.place_order(coin, side != 1, sz, px, reduce_only=True,
                                       trigger_px=px,
-                                      cloid=self.ex._cloid(symbol, bar_ms, PURPOSE_STOP + ":fix"))
+                                      cloid=self._attempt_cloid(symbol, bar_ms, PURPOSE_STOP + ":fix"))
         except Exception as ex:                                     # noqa: BLE001
             res = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
         if res.get("ok") and res.get("status") in (STATUS_RESTING, STATUS_FILLED):
@@ -414,6 +419,37 @@ class Executor:
         except Exception:                                        # noqa: BLE001
             return 0
 
+    def _attempt_cloid(self, symbol: str, bar_ms: int, purpose: str) -> str:
+        """重试类下单的 cloid：在 (symbol, bar, purpose) 之外再掺一个**尝试时刻**。
+
+        HL 的 cloid 账户级唯一（重复 cloid 直接被拒，官方文档亦然）。只按
+        (symbol, bar, purpose) 推导时，同一个 4h 内第二次尝试会拿到与第一次**完全
+        相同**的 cloid：平仓重试被拒 → 而重试的第一步已经撤掉了止损 = 裸仓
+        （审计四轮 P2，复现见 tests/test_audit4_p1.py）。这里掺进当前秒数：
+        - 两次真实尝试至少隔一个引擎 tick（30 分钟），秒数必不同 → 永不撞号；
+        - 同一秒内的「同一次尝试重放」（崩溃后立刻重跑）会拿到同一个值，
+          保留幂等语义（且每次尝试含多次网络往返 + _op_lock 串行，撞秒实际不可达）。
+        DB 里记的 cloid 与发给交易所的严格同源（都用这个函数）。
+        """
+        return make_cloid(symbol, bar_ms, f"{purpose}@{int(time.time())}")
+
+    def _entry_issued(self, row) -> bool:
+        """该 pending 行是否**真的向交易所发过**入场单。
+
+        只有「已发出/在场/已成交」三种状态才算真实仓位（成交后崩溃的那种裸仓
+        正是 sent/resting/filled）；没发过（intent/skipped/无记录）的 pending 行
+        是「信号到了但本轮没能下单」，交易所侧什么都没有，不该当仓位对账。
+        读不到记录时按真实仓位处理（fail-closed：宁可多对一次账，不漏保护）。
+        """
+        try:
+            o = self.db.hl_order(str(row["symbol"]), int(row["signal_bar_ms"] or 0),
+                                 PURPOSE_ENTRY)
+        except Exception:                                        # noqa: BLE001
+            return True
+        if o is None:
+            return False
+        return (o["status"] or "") in (ST_SENT, ST_RESTING, ST_FILLED)
+
     def on_entry(self, position_id: int) -> bool:
         """接管一次开仓。返回 True = 已接管（调用方不要再走人工确认流）。"""
         with self._op_lock:
@@ -443,8 +479,8 @@ class Executor:
                 # live 下不能回落人工卡：人工卡按配置 equity（1000U）算金额，与
                 # 真实账户差一个数量级，照着下单就是风险放大（审计三轮 P1-H5）。
                 # 已接管 → 引擎只补推这条告警（有 alert_logs 补推兜底）。
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到账户快照，本轮未下单。"
-                            f"下一轮 tick 会重试。")
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到账户快照，本轮**未下单**。"
+                            f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
 
@@ -454,7 +490,8 @@ class Executor:
         except HlInfoError as e:
             self._event(EV_ERROR, f"读不到合约规格，放弃开仓：{e}", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到合约规格，本轮未下单。")
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但读不到合约规格，本轮**未下单**。"
+                            f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
 
@@ -464,13 +501,15 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             self._event(EV_ERROR, f"取不到 {coin} mid，放弃开仓：{e}", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但取不到行情，本轮未下单。")
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但取不到行情，本轮**未下单**。"
+                            f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
         if mid <= 0:
             self._event(EV_ERROR, f"{coin} mid 非法（{mid}），放弃开仓", symbol=symbol)
             if self.p.live:
-                self._alert(f"【HL执行】⚠️ {coin} 信号到达但行情非法，本轮未下单。")
+                self._alert(f"【HL执行】⚠️ {coin} 信号到达但行情非法，本轮**未下单**。"
+                            f"这笔信号不会自动重试（占用的仓位槽约 8 小时后自动释放）。")
                 return True
             return False
 
@@ -683,11 +722,14 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             limit_px = ref_price
             self._event(EV_ERROR, f"平仓限价计算失败（用参考价）：{e}", symbol=symbol)
+        # cloid 按「尝试时刻」区分：同一 4h 内第二次离场尝试不能再复用同一个值
+        # （HL 拒重复 cloid，而重试第一步已撤掉止损 → 撞号就是裸仓，见 _attempt_cloid）
+        exit_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT)
         self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT, side, sz, px=limit_px,
                                  reduce_only=True, status=ST_SENT,
-                                 cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT))
+                                 cloid=exit_cloid)
         res = self.ex.place_order(coin, side != 1, sz, limit_px, reduce_only=True,
-                                  cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT))
+                                  cloid=exit_cloid)
         if not res["ok"]:
             self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error=str(res.get("error"))[:300])
@@ -706,15 +748,16 @@ class Executor:
             # 事后补挂（stop:fix）都不同源 —— HL 的 cloid 账户级永久唯一，
             # 复用任何一个都会被拒单，重挂失败=仓位裸奔。
             re_stop_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
+            rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
             re_stop = self.ex.place_order(
                 coin, side != 1, sz, re_stop_px,
                 reduce_only=True, trigger_px=re_stop_px,
-                cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG))
+                cloid=rehang_cloid)
             re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
             self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
                                      px=re_stop_px, reduce_only=True,
                                      status=(re_stop.get("status") if re_ok else ST_FAILED),
-                                     cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG),
+                                     cloid=rehang_cloid,
                                      error=None if re_ok else str(re_stop.get("error"))[:300])
             if re_ok:
                 self._event(EV_ERROR, f"{symbol} 平仓未成交（resting），已撤单并重挂止损"
@@ -752,6 +795,17 @@ class Executor:
             # 留 open 让下一轮 on_exit / 对账继续跟进。
             filled = float(res["filled_sz"] or 0)
             remain = sz - filled
+            # 审计四轮 P2：这张 IOC 已经结束了（成交一半），必须把 exit 行改成 filled。
+            # 旧代码不更新它 → hl_orders 里永久停在 sent，看护把它当「卡住的意图单」
+            # 每轮告警、面板对账判 mismatch（复现见 tests/test_audit4_p1.py）。
+            # 本地仓**不**关账（剩余量还在交易所，由下面重挂止损 + 下一轮继续离场）。
+            try:
+                self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FILLED,
+                                        oid=res.get("oid"), filled_sz=filled,
+                                        avg_px=res.get("avg_px"),
+                                        raw=str(res.get("raw"))[:2000])
+            except Exception as ex:                                  # noqa: BLE001
+                logger.warning("[hl-exec] 部分成交更新 exit 行失败（忽略）：%s", ex)
             self._event(EV_ORDER, f"{symbol} 平仓部分成交 {filled}/{sz}，剩余 {remain} 重挂止损",
                         symbol=symbol, data={"filled": filled, "remain": remain})
             try:
@@ -759,10 +813,11 @@ class Executor:
             except HlInfoError:
                 sz_dec = 5
             re_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
+            rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
             try:
                 re_stop = self.ex.place_order(
                     coin, side != 1, remain, re_px, reduce_only=True, trigger_px=re_px,
-                    cloid=self.ex._cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG))
+                    cloid=rehang_cloid)
             except Exception as ex:                                   # noqa: BLE001
                 re_stop = {"ok": False, "error": f"{type(ex).__name__}: {ex}", "status": "error"}
             re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
@@ -770,7 +825,7 @@ class Executor:
                 self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side,
                                          remain, px=re_px, reduce_only=True,
                                          status=(re_stop.get("status") if re_ok else ST_FAILED),
-                                         cloid=make_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG),
+                                         cloid=rehang_cloid,
                                          error=None if re_ok else str(re_stop.get("error"))[:300])
             except Exception as ex:                                   # noqa: BLE001
                 logger.warning("[hl-exec] 部分成交重挂记录失败（忽略）：%s", ex)
