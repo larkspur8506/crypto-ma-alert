@@ -134,23 +134,38 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         return format_missed(cfg, sig)
     long = sig.is_long
     stop_note = f"距离 {sig.stop_dist * 100:.2f}%" + ("" if long else "，在价格上方")
-    return "\n".join([
+    lines = [
         f"{cfg.alert_prefix}{sig.symbol} {sig.action}信号（4h 收盘 {fmt_bar_close(sig.bar_open_ms)} {TZ_LABEL}）",
         f"入场：市价（当前 {fmt_money(sig.entry_price)}）",
         f"止损触发价：{fmt_money(sig.stop_price)}（{stop_note}）",
-        f"下单：逐仓 {cfg.leverage:.0f}x / 市价 / 单位选 USDT / 输入 {fmt_money(order.notional)} USDT"
-        f" → 点【{sig.open_button}】",
-        f"      （核对持仓价值 ≈ {fmt_money(order.notional)}U，约 {order.contracts} 张）",
+    ]
+    if order is None:
+        # 场所规格缺失（registry 里没有该标的的 MEXC 段）：**信号与提醒照常产出**，
+        # 只把张数段换成一句显式说明。旧版这里会 KeyError，被 tick 的 per-symbol
+        # except 吞成「处理异常」，整个标的的信号一个都出不来（静默坏）。
+        lines.append("      （该场所规格未配置，已跳过张数建议）")
+    else:
+        lines += [
+            f"下单：逐仓 {cfg.leverage:.0f}x / 市价 / 单位选 USDT / 输入 {fmt_money(order.notional)} USDT"
+            f" → 点【{sig.open_button}】",
+            f"      （核对持仓价值 ≈ {fmt_money(order.notional)}U，约 {order.contracts} 张）",
+        ]
+    lines += [
         f"止损单：计划委托，触发价 {fmt_money(sig.stop_price)}，{sig.close_side}，触发参考=最新成交价",
         f"止盈：不设",
-        f"风险：{order.risk_u:.1f}U"
-        + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}% = "
-           f"{cfg.equity * cfg.risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
-           else f"（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%）") + "，"
-        f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U",
+    ]
+    if order is not None:
+        lines.append(
+            f"风险：{order.risk_u:.1f}U"
+            + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}% = "
+               f"{cfg.equity * cfg.risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
+               else f"（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%）") + "，"
+            f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U")
+    lines += [
         f"离场：收到本系统提醒后 4 小时内市价平仓",
         f"确认开仓：{confirm_url(cfg, position_id)}",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
@@ -317,11 +332,14 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
             if sig is not None:
                 order = size_order(symbol, sig.entry_price, sig.stop_price, cfg.equity,
                                    cfg.risk_pct, cfg.leverage, side=sig.side)
+                # order 为 None = 场所规格缺失（该标的未登记 / 无 MEXC 段）：
+                # **照常产出信号事件**（提醒由 format_entry 降级出文案），只是没有张数建议。
                 events.append(Event(kind=("entry" if is_latest else "entry_missed"), symbol=symbol,
                                     bar_ms=sig.bar_open_ms, is_latest=is_latest, sig=sig, order=order))
                 if is_latest:
                     position = PositionState(symbol=symbol, entry_price=sig.entry_price,
-                                             stop_price=sig.stop_price, contracts=order.contracts,
+                                             stop_price=sig.stop_price,
+                                             contracts=(order.contracts if order is not None else 0),
                                              signal_bar_ms=sig.bar_open_ms, side=sig.side)
     return events, position
 
@@ -367,15 +385,56 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
         except Exception as e:                                   # noqa: BLE001
             # 单个标的的任何异常（未知 symbol、非法配置、DB 故障…）都不能
             # 打断其余标的 —— 旧版一个 KeyError 就让所有标的的 tick 静默停摆。
+            # 审计见：这里旧代码把异常压成一句「处理异常」data_error 提醒就过去了，
+            # 规格漏配这类**配置错误**因此长期不可见；现改为显性告警（带异常类型、
+            # 落 alert_logs、按 (symbol, 异常类型) 2h 窗口去重，避免每 30 分钟刷屏）。
             logger.exception("[tick] %s 处理异常: %s", symbol, e)
-            try:
-                _emit(db, notifier, cfg, Alert(
-                    "data_error", symbol, None,
-                    f"{cfg.alert_prefix}{symbol} 处理异常：{type(e).__name__}: {e}（其余标的照常）"),
-                    sent)
-            except Exception:                                    # noqa: BLE001
-                logger.exception("[tick] 异常提醒发送失败: %s", symbol)
+            _emit_symbol_error(db, notifier, cfg, symbol, e, sent)
     return sent
+
+
+# (symbol, 异常类型) → 上次成功推送告警的时间戳；2h 窗口去重，防刷屏。
+TICK_ERROR_WINDOW_S = 7200.0
+_TICK_ERR_SENT_AT: Dict[Tuple[str, str], float] = {}
+
+
+def _brief(msg, limit: int = 120) -> str:
+    """异常摘要截断：压掉换行/多余空白，超长截断加省略号。"""
+    s = " ".join(str(msg).split())
+    return s if len(s) <= limit else s[:limit] + "…"
+
+
+def _emit_symbol_error(db, notifier, cfg, symbol: str, exc: BaseException,
+                       sent: List[str]) -> None:
+    """per-symbol 异常 → 显性告警（推送 + 落 alert_logs），按 (symbol, 异常类型) 去重。
+
+    与 data_error 同一套「窗口去重」思路，但窗口键是 (symbol, 异常类型)：同一标的换成
+    另一类异常会照常告警，同类异常 2h 内只报一次。dry_run 只打印、不推送不落库（与
+    _emit 一致）。
+    """
+    etype = type(exc).__name__
+    key = (symbol, etype)
+    now = time.time()
+    if now - _TICK_ERR_SENT_AT.get(key, 0.0) < TICK_ERROR_WINDOW_S:
+        logger.info("[tick] %s %s 告警窗口内去重，跳过推送", symbol, etype)
+        return
+    text = f"{cfg.alert_prefix}⚠️ {symbol} 处理失败：{etype}: {_brief(exc)}"
+    if getattr(cfg, "dry_run", False):
+        print(f"\n----- DRY-RUN tick_error {symbol} -----")
+        print(text)
+        sent.append(text)
+        return
+    try:
+        ok = bool(notifier and notifier.send_message(text))
+    except Exception:                                            # noqa: BLE001
+        logger.exception("[tick] 异常告警发送失败: %s", symbol)
+        return
+    db.log_alert(symbol, None, "tick_error", text, ok)
+    if ok:
+        _TICK_ERR_SENT_AT[key] = now
+        sent.append(text)
+    else:
+        logger.error("[tick] %s 处理失败告警推送失败（下次重试）", symbol)
 
 
 def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[str]) -> None:
@@ -464,11 +523,18 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 row = None
                 position = None
             elif ev.kind == "entry":
-                pid = db.create_position(symbol=symbol, signal_bar_ms=ev.bar_ms, side=ev.sig.side,
-                                         entry_price=ev.sig.entry_price, stop_price=ev.sig.stop_price,
-                                         stop_dist=ev.sig.stop_dist, contracts=ev.order.contracts,
-                                         coin_qty=ev.order.coin_qty, notional=ev.order.notional,
-                                         risk_u=ev.order.risk_u, equity_at_entry=cfg.equity)
+                # ev.order 为 None = 场所规格缺失：仓位行仍建（信号照常记录/提醒），
+                # 只是量字段留 0；张数建议由 format_entry 降级为「已跳过张数建议」。
+                o = ev.order
+                pid = db.create_position(
+                    symbol=symbol, signal_bar_ms=ev.bar_ms, side=ev.sig.side,
+                    entry_price=ev.sig.entry_price, stop_price=ev.sig.stop_price,
+                    stop_dist=ev.sig.stop_dist,
+                    contracts=(o.contracts if o is not None else 0),
+                    coin_qty=(o.coin_qty if o is not None else 0.0),
+                    notional=(o.notional if o is not None else 0.0),
+                    risk_u=(o.risk_u if o is not None else 0.0),
+                    equity_at_entry=cfg.equity)
                 handled = False
                 if executor is not None:
                     try:

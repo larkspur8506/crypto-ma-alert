@@ -12,16 +12,16 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from typing import Optional
 
-# symbol -> (合约面值, 张数步长, 最小张数, 价格精度)
-SPECS = {
-    "BTC_USDT": (0.0001, 1, 1, 1),
-    "ETH_USDT": (0.01, 1, 1, 2),
-    # SOL_USDT 面值 0.1 SOL/张、价格精度 2（实测 contract.mexc.com/api/v1/contract/detail）。
-    # 缺了它 engine.walk → size_order(symbol) 会 KeyError，SOL 信号整轮被 tick 的
-    # per-symbol try/except 吞成「处理异常」，所以是加标的的必需项。
-    "SOL_USDT": (0.1, 1, 1, 2),
-}
+from app import symbol_registry as registry
+
+# 兼容 shim：SPECS 的**权威来源已迁到 `app.symbol_registry`**，这里保留同形 dict
+# （旧四元组 面值/步长/最小张数/价格精度），供现有调用点（engine.review_fill 的
+# CONTRACT_SPECS、确认页换算、测试）零改动读取。新代码请直接用 registry.mexc_spec()。
+# 仅收录「登记过且带 MEXC 段」的标的；缺段的标的不再进 SPECS（这正是优雅降级的前提）。
+SPECS = {s: spec.as_tuple() for s in registry.known_symbols()
+         if (spec := registry.mexc_spec(s)) is not None}
 MAINTENANCE_MARGIN_RATE = 0.005   # 一档维持保证金率近似值（算强平价用）
 
 
@@ -54,9 +54,18 @@ def max_safe_leverage(stop_dist: float, mmr: float = MAINTENANCE_MARGIN_RATE) ->
 
 
 def size_order(symbol: str, entry_price: float, stop_price: float, equity: float,
-               risk_pct: float, leverage: float = 5.0, side: int = 1) -> Order:
-    """按「单笔风险 = 权益 × risk_pct」倒算 MEXC 合约张数（多空同一套公式）。"""
-    contract_size, step, min_vol, _ = SPECS[symbol]
+               risk_pct: float, leverage: float = 5.0, side: int = 1) -> Optional[Order]:
+    """按「单笔风险 = 权益 × risk_pct」倒算 MEXC 合约张数（多空同一套公式）。
+
+    场所规格缺失时（symbol 未在 registry 登记，或登记了但没有 MEXC 段）**返回 None**，
+    不再抛 `KeyError` —— 旧行为下 `engine.walk → size_order` 的 KeyError 会被 tick 的
+    per-symbol `try/except` 吞成一句「处理异常」，整个标的的信号一个都出不来。调用方
+    （engine.format_entry）遇到 None 应照常出信号、把张数段换成「已跳过张数建议」。
+    """
+    spec = registry.mexc_spec(symbol)
+    if spec is None:
+        return None
+    contract_size, step, min_vol, _ = spec.as_tuple()
     if entry_price <= 0 or equity <= 0 or risk_pct <= 0:
         raise ValueError("entry_price / equity / risk_pct 必须为正")
     risk_unit = (entry_price - stop_price) if side == 1 else (stop_price - entry_price)
