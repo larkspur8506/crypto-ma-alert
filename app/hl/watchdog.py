@@ -143,8 +143,10 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
 
     # 7) 权益（统一账户下余额在现货状态里）—— snap 可能因地址缺失/读取失败为 None
     if snap is not None and snap.get("unified"):
+        # 文案与面板同口径：用人话写「现货 X + 浮动盈亏」，不用行业口径术语
+        # （用户 2026-10-15 明确反馈那类词看不懂）
         add(f"账户总值 {snap.get('equity_total', 0):,.2f} USDC"
-            f"（统一账户：抵押品 {snap.get('spot_usdc', 0):,.2f} 在现货 + 浮动盈亏）", ok=True)
+            f"（统一账户：现货 {snap.get('spot_usdc', 0):,.2f} + 浮动盈亏）", ok=True)
     elif snap is not None:
         add(f"账户权益 {snap.get('equity', 0):,.2f} USDC（可用 {snap.get('withdrawable', 0):,.2f}）",
             ok=True)
