@@ -143,7 +143,12 @@ class TestEntryHook(Base):
             sent = engine.tick(self.db, self.cfg, self.notifier, executor=ex)
         self.assertEqual(len(ex.entries), 1)
         self.assertEqual(len(sent), 1)                   # 原提醒路径完好
-        self.assertIn("下单", sent[0])
+        # feat/p1-copy：执行器**在场**（live/dry）时提醒文案走托管口径 —— 不再给
+        # MEXC 人工下单指引（逐仓/单位选 USDT/张数），因为执行器已接管、这些数字
+        # 按配置 equity 算出来是误导。执行器拒绝接管只影响「谁来开仓」，不影响
+        # 文案分流（文案分流只看 executor 是否为 None）。旧断言 assertIn("下单") 随之失效。
+        self.assertIn("自动在 Hyperliquid 执行", sent[0])
+        self.assertNotIn("单位选 USDT", sent[0])
         self.assertEqual(len(self.notifier.messages), 1)
 
     def test_no_executor_keeps_old_behaviour(self):
