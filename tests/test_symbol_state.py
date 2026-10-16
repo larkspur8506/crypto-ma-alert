@@ -5,7 +5,8 @@ a. 距离公式 views._need_pct：四方向（空离场/多离场/上破/下破�
    缺值 → None（子行不渲染）
 b. 状态词 views._sym_state_word：持仓中（多/空）、密集 0/3/6/9（展示封顶 6/6）
 c. 渲染断言：**断言渲染出的 HTML 字符串**（区块头+时间、密集酝酿 n/6、① ② ③ title 原文、
-   还差 +X.X%、<1% 的 class="warn"、区块位置在仓位表与交易所挂单之间、fail-soft 显示「—」）
+   还差 +X.X%、入场行 <1% 且密集满 6 根才有的 class="warn"、底部可见图例行 sym-legend、
+   区块位置在仓位表与交易所挂单之间、fail-soft 显示「—」）
 d. DB：迁移建表、upsert 幂等、NULL 往返、缺行读取
 e. 引擎计算：engine.symbol_snapshot（现价取未收盘 bar / 线取最后一根已收盘 bar / 持仓留 NULL /
    密集根数复用 strategy 的判定）
@@ -182,8 +183,10 @@ class TestRenderBlock(unittest.TestCase):
                       html)
         if os.environ.get("DISPLAY_TZ_OFFSET", "8").strip() in ("8", "8.0", ""):
             self.assertIn("行情 16:53 ·", html)   # 1760000000 = 2025-10-09 08:53:20 UTC = 北京 16:53
-        # 位置：仓位表之后、交易所挂单之前
-        self.assertLess(html.index("<h2>仓位</h2>"), html.index("三标的动态"))
+        # 位置：总览页最顶部 —— tabs 之后第一个区块，在「账户」卡片之前
+        self.assertLess(html.index("三标的动态"), html.index("账户"))
+        self.assertLess(html.index("<h1>Hyperliquid 执行器监控</h1>"), html.index("三标的动态"))
+        self.assertLess(html.index("三标的动态"), html.index("<h2>仓位</h2>"))
         self.assertLess(html.index("三标的动态"), html.index("<h2>交易所挂单</h2>"))
 
     def test_head_time_takes_newest_of_three(self):
@@ -229,11 +232,58 @@ class TestRenderBlock(unittest.TestCase):
         self.assertIn("还差 <b>+6.0%</b> <span class=\"muted\">线 94,000.00</span>", card)
 
     def test_near_trigger_gets_warn_class_and_title(self):
-        html = self.render([self.row(long_trigger=100_500.0, short_trigger=94_000.0)])
-        card = sym_card(html, "BTC")
+        # 入场行：密集满 6 根（入场前提成立）→ 0.5% 才标 warn
+        card = sym_card(self.render([self.row(dense_cnt=6, long_trigger=100_500.0)]), "BTC")
         self.assertIn('<b class="warn" title="接近触发（按收盘判定）">+0.5%</b>', card)
         # 远的那条不加 warn
         self.assertIn("还差 <b>+6.0%</b>", card)
+
+    def test_entry_row_without_full_squeeze_never_warns(self):
+        # 密集不满 6 根（4/0/NULL）时，即使距离 0.5% 也不加 warn：
+        # 破线也不会开仓（还需密集/MA200 前置），琥珀会误导
+        for dense in (4, 0, None):
+            with self.subTest(dense=dense):
+                card = sym_card(self.render([self.row(dense_cnt=dense,
+                                                     long_trigger=100_500.0,
+                                                     short_trigger=99_600.0)]), "BTC")
+                self.assertIn("还差 <b>+0.5%</b>", card)          # 上破开多 +0.5%
+                self.assertIn("还差 <b>+0.4%</b>", card)          # 下破开空 +0.4%
+                self.assertNotIn('class="warn"', card)
+
+    def test_position_exit_row_warns_without_dense(self):
+        # ① 离场行不受 dense 影响：距自动离场线 0.5% → 仍标 warn（离场只看收盘破线）
+        card = sym_card(self.render([self.row(position_side=1, sma20=99_500.0,
+                                              dense_cnt=None)]), "BTC")
+        self.assertIn('<b class="warn" title="接近触发（按收盘判定）">+0.5%</b>', card)
+        # 同卡片里没有入场行（持仓标的只给离场线）
+        self.assertNotIn("上破开多", card)
+
+    def test_legend_row_rendered_in_block(self):
+        # 手机（iOS Safari 无 title 悬停）唯一能看到 ①②③ 口径的地方 → 必须是可见文字
+        # 注意：CSS 里也有 .sym-legend（在 <head>），所以用 div 标签定位，别用裸类名
+        html = self.render([self.row()])
+        legend = '<div class="sym-legend">① 离场按 4h 收盘判定 · ' \
+                 '② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空</div>'
+        self.assertIn(legend, html)
+        # 图例在 grid 之后、区块 card 收尾之前（即仍在「三标的动态」区块内）
+        mark = '<div class="sym-legend">'
+        self.assertLess(html.index("三标的动态"), html.index(mark))
+        self.assertLess(html.index(mark), html.index("<h2>交易所挂单</h2>"))
+        # 三段口径逐条可见
+        for frag in ("① 离场按 4h 收盘判定", "② 破线+密集满 6 根开多",
+                     "③ 破线+MA200 下方才开空"):
+            self.assertIn(frag, html)
+        # 样式类随页面下发（只用现有 CSS 变量，两主题自动适配）
+        self.assertIn(".sym-legend{margin-top:8px;font-size:11px;color:var(--muted);"
+                      "line-height:1.6}", html)
+        # 桌面端悬停口径保留（title 原文不动）
+        self.assertIn('title="4h 收盘突破该线即入场（需均线密集满 6 根）"', html)
+        self.assertIn('title="收盘跌破该线且在 MA200 下方才开空"', html)
+
+    def test_max_dense_plain_row_still_warns_at_nine(self):
+        # dense_cnt 展示封顶 6/6，但判定用的是真实根数（9 ≥ 6 → 照常允许 warn）
+        card = sym_card(self.render([self.row(dense_cnt=9, long_trigger=100_500.0)]), "BTC")
+        self.assertIn('<b class="warn" title="接近触发（按收盘判定）">+0.5%</b>', card)
 
     def test_need_non_positive_shows_wait_for_close(self):
         # 现价已在触发线上方 → 不能报「还差」，改成待收盘判定（不加粗不琥珀）
@@ -292,6 +342,8 @@ class TestRenderBlock(unittest.TestCase):
     def test_no_rows_no_block(self):
         html = self.render([])
         self.assertNotIn("三标的动态", html)
+        # 无数据时图例也不渲染（图例只在有三标的动态区块时出现；CSS 里的 .sym-legend 不算）
+        self.assertNotIn('<div class="sym-legend">', html)
         self.assertIn("<h2>仓位</h2>", html)
 
 

@@ -803,11 +803,15 @@ a{color:var(--link)}
 
 
 # ---------------------------------------------------------------- 三标的动态区块
-# 总览页在「仓位」表之后、「交易所挂单」之前插入的区块：每标的现价 / 状态词 /
+# 总览页最顶部（tabs 之后第一个区块、在「账户」卡片之前）的区块：每标的现价 / 状态词 /
 # 到触发线的距离。数据全部来自 symbol_state（引擎每轮 tick upsert），面板纯读库；
 # 触发线与密集根数的口径由 app/engine.symbol_snapshot 计算（复用 strategy 的序列）。
 _SQUEEZE_CAP = 6          # 密集根数展示封顶：满 6 根即已满足入场前提
 _NEAR_TITLE = "接近触发（按收盘判定）"
+# 图例行（区块底部，手机看不见 title 悬停，口径必须落在可见文字上）：
+# ① 离场只看收盘破线 → 琥珀（接近）就有意义；②③ 破线还要满足前置条件，琥珀会误导。
+_LEGEND_HTML = ("<div class=\"sym-legend\">① 离场按 4h 收盘判定 · "
+                "② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空</div>")
 _EXIT_TITLE = {1: "按 4h 收盘判定，非盘中触发：收盘跌破该线即自动平仓",
                -1: "按 4h 收盘判定，非盘中触发：收盘站上该线即自动平仓"}
 _LONG_TITLE = "4h 收盘突破该线即入场（需均线密集满 6 根）"
@@ -851,14 +855,22 @@ def _sym_state_word(side: Any, dense: Any) -> tuple:
             f"6 均线已连续 {n} 根密集，满 {_SQUEEZE_CAP} 根后收盘突破即入场")
 
 
-def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any) -> str:
-    """距离行：`还差 +X.X%`（0<need<1% 标 warn + 悬停「接近触发」）/ `待收盘判定`，
-    百分比之后跟触发线价格（价格格式复用面板 _fmt 口径）。"""
+def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any,
+             allow_warn: bool = True) -> str:
+    """距离行：`还差 +X.X%`（0<need<1% 且 allow_warn 时标 warn + 悬停「接近触发」）/
+    `待收盘判定`，百分比之后跟触发线价格（价格格式复用面板 _fmt 口径）。
+
+    allow_warn 的语义 =「距离近 = 今晚可能动作」是否成立：
+      ① 离场行（持仓）只看 4h 收盘破线，距离近确实意味着可能动作 → 恒 True；
+      ②③ 入场行还要满足前置条件（密集满 6 根 / MA200 下方），单看距离近会误导，
+        由调用方传 `dense_cnt >= _SQUEEZE_CAP`（缺 dense_cnt → False）。
+    """
     line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>"
     if need is None or need <= 0:
         val = f"<span class=\"muted\">待收盘判定</span>{line_txt}"
     else:
-        cls = f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if need < 1.0 else ""
+        cls = (f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if allow_warn and need < 1.0
+               else "")
         val = f"还差 <b{cls}>{need:+.1f}%</b>{line_txt}"
     return (f"<div class=\"kv\"><span class=\"k\">{label} "
             f"<span class=\"fn\" title=\"{_esc(title)}\">{mark}</span></span>"
@@ -883,18 +895,24 @@ def _sym_card(r: Dict[str, Any]) -> str:
                 o.append(_sym_row("距自动离场线", "①", _EXIT_TITLE[-1 if side < 0 else 1],
                                   need, r.get("sma20")))
         else:
+            # 入场行（②③）的琥珀门槛：只有密集已满 6 根（入场前提成立）才允许 warn，
+            # 否则「距离近」并不代表会开仓（破线也不会开），琥珀会误导。
+            # 已知简化：dense≥6 时不再校验 ③ 的 MA200 前置（由图例与 title 说明）。
+            allow = (_opt_int(r.get("dense_cnt")) or 0) >= _SQUEEZE_CAP
             need = _need_pct("break_up", price, r.get("long_trigger"))
             if need is not None:
-                o.append(_sym_row("上破开多", "②", _LONG_TITLE, need, r.get("long_trigger")))
+                o.append(_sym_row("上破开多", "②", _LONG_TITLE, need, r.get("long_trigger"),
+                                  allow_warn=allow))
             need = _need_pct("break_down", price, r.get("short_trigger"))
             if need is not None:
-                o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger")))
+                o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger"),
+                                  allow_warn=allow))
     o.append("</div>")
     return "".join(o)
 
 
 def _symbol_dynamics(p: dict) -> str:
-    """「三标的动态」区块（插在仓位表与交易所挂单之间，见 _render_body）。
+    """「三标的动态」区块（总览页最顶部，tabs 之后第一个区块，见 _render_body）。
 
     fail-soft：某标的 symbol_state 行缺失 / 字段 NULL → 该标的价格显示「—」、对应子行
     整体不渲染，其余标的不受影响；整块任何异常都不能弄挂总览页（调用点在 try 里）。
@@ -909,7 +927,11 @@ def _symbol_dynamics(p: dict) -> str:
          "<div class=\"card\"><div class=\"grid\">"]
     for r in rows:
         o.append(_sym_card(r))
-    o.append("</div></div>")
+    # 图例放在 grid 之后、card 收尾之前：手机（iOS Safari 无 title 悬停）唯一能看到
+    # ①②③ 口径的地方；无数据时整块不渲染（上方 rows 为空已 return）。
+    o.append("</div>")
+    o.append(_LEGEND_HTML)
+    o.append("</div>")
     return "".join(o)
 
 
@@ -975,6 +997,15 @@ def _render_body(p: dict) -> str:
     if not reachable:
         o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
                  f"<span class='muted'>交易所侧数据暂不可用；下方仍显示数据库里的信号、下单与成交记录。</span></div>")
+
+    # ---------------- 三标的动态 ----------------
+    # 位置由需求钉死：总览页最顶部、tabs 之后第一个区块（在「账户」卡片之前），
+    # 手机打开面板先看到三个标的的状态。整块自己兜底（缺数据只略去子行），
+    # 万一渲染炸了也不能弄挂总览页 —— 这里再包一层 try。
+    try:
+        o.append(_symbol_dynamics(p))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
 
     # ---------------- 账户卡片 ----------------
     o.append("<div class='card'><div class='sec'>账户</div><div class='grid'>")
@@ -1074,14 +1105,6 @@ def _render_body(p: dict) -> str:
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号见下方「信号」）</td></tr>")
     o.append("</tbody></table></div>")
-
-    # ---------------- 三标的动态 ----------------
-    # 位置由需求钉死：仓位表之后、交易所挂单之前。整块自己兜底（缺数据只略去子行），
-    # 万一渲染炸了也不能弄挂总览页 —— 这里再包一层 try。
-    try:
-        o.append(_symbol_dynamics(p))
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
 
     # ---------------- 挂单 ----------------
     o.append("<h2>交易所挂单</h2>")
