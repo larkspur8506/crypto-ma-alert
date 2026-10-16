@@ -101,7 +101,9 @@ SYMBOL_CSS = """
 .st.hot{color:var(--warn)}
 .px{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
 .fn{font-size:11px;color:var(--muted)}
-.sym-legend{margin-top:8px;font-size:11px;color:var(--muted);line-height:1.6}
+.sym-legend,.legend{margin-top:8px;font-size:11px;color:var(--muted);line-height:1.6}
+.msgdetails summary{cursor:pointer;color:var(--muted)}
+.msgdetails .fullmsg{white-space:pre-wrap;font-size:12px;padding:4px 0;line-height:1.5}
 """
 
 

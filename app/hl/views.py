@@ -1047,7 +1047,12 @@ def _render_body(p: dict) -> str:
                  title="交易所 closedPnl 口径，未扣手续费与资金费"))
     o.append(_kv("资金费（持仓期内，正=收入）", fund_txt, fund_cls))
     o.append(_kv("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
-    o.append("</div></div>")
+    o.append("</div>")
+    # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
+    # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
+    o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
+             '可提 = 现货 − 仓位/挂单占用</div>')
+    o.append("</div>")
 
     # ---------------- 权益曲线 ----------------
     o.append("<h2>权益曲线</h2>")
@@ -1223,6 +1228,9 @@ def _render_body(p: dict) -> str:
     o.append(_kv("环境", "测试网" if net.get("testnet") else "主网"))
     o.append(_kv("熔断", "已触发" if kill else "未触发", "neg" if kill else "pos"))
     o.append("</div>")
+    # 注脚（可见文字）：卡单与 HL 延迟两条口径原先只在两处 title 里，手机上读不到。
+    o.append('<div class="legend">卡单 = 持续 3 分钟未推进才计入 · '
+             'HL 延迟 = 容器请求 /info 耗时（含失败重试），与本机网速无关</div>')
     feed = _as_list(system.get("feed"))
     if feed:
         o.append("<div style='margin-top:10px'><div class='sec'>数据源健康</div>")
@@ -1240,7 +1248,10 @@ def _render_body(p: dict) -> str:
                      + _td(_fmt_dt(fd.get("last_ok_at")), "num")
                      + _td(f"<span class='muted'>{_esc(str(fd.get('last_error') or '—')[:80])}</span>")
                      + "</tr>")
-        o.append("</tbody></table></div></div>")
+        o.append("</tbody></table></div>")
+        # 注脚（可见文字）：表头 title 只作桌面增强，手机看不到 → 口径落成可见行。
+        o.append('<div class="legend">信号源固定 hl-candle'
+                 '（fail-closed：源失败即跳过本轮，不换源）</div></div>')
     last_bar = _as_dict(system.get("last_bar"))
     if last_bar:
         o.append("<div style='margin-top:10px'><div class='sec'>已处理到</div>")
