@@ -386,6 +386,7 @@ def _symbol_state_rows(deps: DashboardDeps, db_rows: List[Any],
             "coin": _disp(sym),                  # 展示用：HL 侧合约名
             "price": _opt_num(d.get("price")),
             "sma20": _opt_num(d.get("sma20")),
+            "sma200": _opt_num(d.get("sma200")),
             "long_trigger": _opt_num(d.get("long_trigger")),
             "short_trigger": _opt_num(d.get("short_trigger")),
             "dense_cnt": _opt_int(d.get("dense_cnt")),
@@ -862,8 +863,10 @@ def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any
 
     allow_warn 的语义 =「距离近 = 今晚可能动作」是否成立：
       ① 离场行（持仓）只看 4h 收盘破线，距离近确实意味着可能动作 → 恒 True；
-      ②③ 入场行还要满足前置条件（密集满 6 根 / MA200 下方），单看距离近会误导，
-        由调用方传 `dense_cnt >= _SQUEEZE_CAP`（缺 dense_cnt → False）。
+      ② 上破开多行只需密集满 6 根（做多无 MA200 过滤），由调用方传
+        `dense_cnt >= _SQUEEZE_CAP`（缺 dense_cnt → False）；
+      ③ 下破开空行是三重的：密集满 6 根 **且** sma200 非 None **且** 现价 < sma200；
+        任一不成立（含 sma200 缺失 = 无法核实过滤条件）都不亮琥珀 → fail-closed。
     """
     line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>"
     if need is None or need <= 0:
@@ -895,18 +898,23 @@ def _sym_card(r: Dict[str, Any]) -> str:
                 o.append(_sym_row("距自动离场线", "①", _EXIT_TITLE[-1 if side < 0 else 1],
                                   need, r.get("sma20")))
         else:
-            # 入场行（②③）的琥珀门槛：只有密集已满 6 根（入场前提成立）才允许 warn，
-            # 否则「距离近」并不代表会开仓（破线也不会开），琥珀会误导。
-            # 已知简化：dense≥6 时不再校验 ③ 的 MA200 前置（由图例与 title 说明）。
-            allow = (_opt_int(r.get("dense_cnt")) or 0) >= _SQUEEZE_CAP
+            # 入场行（②③）的琥珀门槛：
+            #   ② 上破开多：密集满 6 根（做多无 MA200 过滤）。
+            #   ③ 下破开空：密集满 6 根 且 现价 < sma200（严格小于，与
+            #      strategy.evaluate_entry 做空过滤同向）；sma200 缺失 = 无法核实
+            #      过滤条件 → fail-closed 不亮琥珀。只有三重都成立，「距离近」才代表
+            #      「今晚可能开空」。
+            dense_ok = (_opt_int(r.get("dense_cnt")) or 0) >= _SQUEEZE_CAP
+            ma200 = _opt_num(r.get("sma200"))
+            short_ok = dense_ok and ma200 is not None and price < ma200
             need = _need_pct("break_up", price, r.get("long_trigger"))
             if need is not None:
                 o.append(_sym_row("上破开多", "②", _LONG_TITLE, need, r.get("long_trigger"),
-                                  allow_warn=allow))
+                                  allow_warn=dense_ok))
             need = _need_pct("break_down", price, r.get("short_trigger"))
             if need is not None:
                 o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger"),
-                                  allow_warn=allow))
+                                  allow_warn=short_ok))
     o.append("</div>")
     return "".join(o)
 

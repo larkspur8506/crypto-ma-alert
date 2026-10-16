@@ -86,6 +86,7 @@ CREATE TABLE IF NOT EXISTS symbol_state (
     symbol TEXT PRIMARY KEY,
     price REAL,                        -- 最新一根未收盘 bar 的 close
     sma20 REAL,                        -- 最后一根已收盘 bar 的 SMA20（离场判定那条线）
+    sma200 REAL,                       -- 最后一根已收盘 bar 的 SMA200（做空趋势过滤；持仓标的也照存）
     long_trigger REAL,                 -- 6 均线上轨 max（上破开多的线）
     short_trigger REAL,                -- 6 均线下轨 min（下破开空的线）
     dense_cnt INTEGER,                 -- 连续密集根数（展示封顶 6/6，库里存真实值）
@@ -187,6 +188,12 @@ class DB:
             if name not in cols:
                 self.conn.execute(ddl)
                 logger.info("[db] 迁移：positions 新增 %s 列", name)
+        # 面板「三标的动态」：老库的 symbol_state 建表时还没有 sma200 列
+        # （CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
+        sscols = {r["name"] for r in self.conn.execute("PRAGMA table_info(symbol_state)")}
+        if sscols and "sma200" not in sscols:
+            self.conn.execute("ALTER TABLE symbol_state ADD COLUMN sma200 REAL")
+            logger.info("[db] 迁移：symbol_state 新增 sma200 列")
 
     # ---------------- configuration
     @_locked
@@ -429,7 +436,8 @@ class DB:
     def set_symbol_state(self, symbol: str, price: Optional[float] = None,
                          sma20: Optional[float] = None, long_trigger: Optional[float] = None,
                          short_trigger: Optional[float] = None,
-                         dense_cnt: Optional[int] = None) -> None:
+                         dense_cnt: Optional[int] = None,
+                         sma200: Optional[float] = None) -> None:
         """按 symbol upsert（主键即幂等键）：同一标的二次写覆盖旧值，永不产生第二行。
 
         字段允许为 NULL（持仓标的的触发线/密集根数没有意义）—— 面板遇到 NULL 会略去
@@ -437,11 +445,12 @@ class DB:
         """
         self.conn.execute(
             "INSERT INTO symbol_state(symbol, price, sma20, long_trigger, short_trigger,"
-            " dense_cnt, updated_at) VALUES(?,?,?,?,?,?,?) "
+            " dense_cnt, sma200, updated_at) VALUES(?,?,?,?,?,?,?,?) "
             "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price, sma20=excluded.sma20,"
             " long_trigger=excluded.long_trigger, short_trigger=excluded.short_trigger,"
-            " dense_cnt=excluded.dense_cnt, updated_at=excluded.updated_at",
-            (symbol, price, sma20, long_trigger, short_trigger, dense_cnt, now()))
+            " dense_cnt=excluded.dense_cnt, sma200=excluded.sma200,"
+            " updated_at=excluded.updated_at",
+            (symbol, price, sma20, long_trigger, short_trigger, dense_cnt, sma200, now()))
         self.conn.commit()
 
     @_locked
