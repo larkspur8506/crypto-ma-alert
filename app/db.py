@@ -79,6 +79,18 @@ CREATE TABLE IF NOT EXISTS feed_health (
     last_error TEXT,
     error_at REAL
 );
+-- symbol_state：面板「三标的动态」区块的每标的快照（引擎每次 tick 成功后按 symbol upsert）。
+-- 纯展示缓存：面板只读它，**不参与任何信号/执行决策**（触发线与密集根数由 strategy 的
+-- 现成序列算出，见 engine.symbol_snapshot）。
+CREATE TABLE IF NOT EXISTS symbol_state (
+    symbol TEXT PRIMARY KEY,
+    price REAL,                        -- 最新一根未收盘 bar 的 close
+    sma20 REAL,                        -- 最后一根已收盘 bar 的 SMA20（离场判定那条线）
+    long_trigger REAL,                 -- 6 均线上轨 max（上破开多的线）
+    short_trigger REAL,                -- 6 均线下轨 min（下破开空的线）
+    dense_cnt INTEGER,                 -- 连续密集根数（展示封顶 6/6，库里存真实值）
+    updated_at REAL
+);
 -- ---------------- HL 执行器（feat/hl-executor）----------------
 -- hl_orders：所有下单动作的审计与幂等键。**先写 intent 再发请求**，
 -- 这样进程在请求中途崩溃后，重启能看到「有意图但无结果」的单。
@@ -411,6 +423,34 @@ class DB:
     @_locked
     def feed_status(self) -> List[sqlite3.Row]:
         return list(self.conn.execute("SELECT * FROM feed_health ORDER BY symbol"))
+
+    # ---------------- symbol_state（面板「三标的动态」的展示缓存）
+    @_locked
+    def set_symbol_state(self, symbol: str, price: Optional[float] = None,
+                         sma20: Optional[float] = None, long_trigger: Optional[float] = None,
+                         short_trigger: Optional[float] = None,
+                         dense_cnt: Optional[int] = None) -> None:
+        """按 symbol upsert（主键即幂等键）：同一标的二次写覆盖旧值，永不产生第二行。
+
+        字段允许为 NULL（持仓标的的触发线/密集根数没有意义）—— 面板遇到 NULL 会略去
+        对应子行，所以这里不做任何补零/兜底。
+        """
+        self.conn.execute(
+            "INSERT INTO symbol_state(symbol, price, sma20, long_trigger, short_trigger,"
+            " dense_cnt, updated_at) VALUES(?,?,?,?,?,?,?) "
+            "ON CONFLICT(symbol) DO UPDATE SET price=excluded.price, sma20=excluded.sma20,"
+            " long_trigger=excluded.long_trigger, short_trigger=excluded.short_trigger,"
+            " dense_cnt=excluded.dense_cnt, updated_at=excluded.updated_at",
+            (symbol, price, sma20, long_trigger, short_trigger, dense_cnt, now()))
+        self.conn.commit()
+
+    @_locked
+    def symbol_state(self, symbol: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM symbol_state WHERE symbol=?", (symbol,)).fetchone()
+
+    @_locked
+    def symbol_states(self) -> List[sqlite3.Row]:
+        return list(self.conn.execute("SELECT * FROM symbol_state ORDER BY symbol"))
 
     # ---------------- HL 执行器（feat/hl-executor）
     @_locked

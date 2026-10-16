@@ -396,6 +396,74 @@ def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
     return None
 
 
+# ------------------------------------------------- 面板缓存（symbol_state）
+# 「三标的动态」区块的数据源：每根 tick 把每标的的现价/触发线/密集根数 upsert 进
+# symbol_state，面板只读库。**纯展示层，不参与任何信号或执行决策。**
+
+def _dense_run(band: Sequence[Optional[float]], cfg, i: int) -> int:
+    """以第 i 根结尾的「连续密集」根数。
+
+    密集的原始判定就是 strategy.squeeze_flags 的核心条件（band ≤ 回看窗口的 20% 分位）。
+    这里用 `min_bars=1` 调**同一个函数**取原始判定（「连续 ≥1 根」= 单根成立），再往回
+    数连续根数 —— 不复制窗口/分位常数，也不另写一套判定，避免与信号口径分叉
+    （signal 要的是「连续 ≥ cfg.min_squeeze_bars 根」，面板要的是不足 6 根时还差几根）。
+    """
+    if i < 0 or not band:
+        return 0
+    flags = strategy.squeeze_flags(band, cfg.band_window, cfg.band_quantile, 1)
+    n, j = 0, min(i, len(flags) - 1)
+    while j >= 0 and flags[j]:
+        n += 1
+        j -= 1
+    return n
+
+
+def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optional[float]]],
+                    latest_closed_i: int, has_position: bool = False) -> Dict[str, Optional[float]]:
+    """面板区块要的一行快照（纯计算、无 I/O）。
+
+    口径（全部复用 strategy 现成的序列，不重新实现一套常数）：
+    - price = 最新一根**未收盘** bar 的 close（与信号同一份 hl-candle，市场层已给）
+    - sma20 = **最后一根已收盘 bar** 的 SMA20 —— 离场判定看的就是这条线
+    - long_trigger / short_trigger = 最后一根已收盘 bar 的 6均线 max/min（上轨/下轨）；
+      下一次入场判定（evaluate_entry 在第 i 根用的正是 ind[i-1]）比的就是这两个值
+    - dense_cnt = 以最后一根已收盘 bar 结尾的连续密集根数（库里存真实值，展示封顶 6/6）
+    `has_position=True`（有 status='open' 仓位）：walk 不评估入场，触发线与密集根数
+    没有意义 → 留 NULL，面板遇到 NULL 会略去对应子行。
+    """
+    price: Optional[float] = float(bars[-1].close) if bars else None
+    sma20: Optional[float] = None
+    sma_seq = ind.get("sma20") or []
+    cur = sma_seq[latest_closed_i] if 0 <= latest_closed_i < len(sma_seq) else None
+    if cur is not None:
+        sma20 = float(cur)
+    snap: Dict[str, Optional[float]] = {"price": price, "sma20": sma20,
+                                       "long_trigger": None, "short_trigger": None,
+                                       "dense_cnt": None}
+    if has_position:
+        return snap
+    for key, seq in (("long_trigger", ind.get("ma_max") or []),
+                     ("short_trigger", ind.get("ma_min") or [])):
+        cur = seq[latest_closed_i] if 0 <= latest_closed_i < len(seq) else None
+        if cur is not None:
+            snap[key] = float(cur)
+    snap["dense_cnt"] = _dense_run(ind.get("band") or [], cfg, latest_closed_i)
+    return snap
+
+
+def _record_symbol_state(db, cfg, symbol: str, bars: Sequence[strategy.Bar],
+                         ind: Dict[str, List[Optional[float]]], latest_closed_i: int,
+                         has_position: bool) -> None:
+    """把本标的的快照 upsert 进 symbol_state（面板「三标的动态」读它）。
+
+    只在 walk 走通（或被 pending 挡下，压根没走到 walk）之后调用 —— walk 抛异常时
+    不写。调用点排在 set_last_bar 之后：即使这里失败也**不影响 bar 进度与信号推送**，
+    异常照旧由 tick 的 per-symbol try/except 收成一条 tick_error 告警。
+    """
+    db.set_symbol_state(symbol, **symbol_snapshot(cfg, bars, ind, latest_closed_i,
+                                                 has_position=has_position))
+
+
 def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List[str]:
     """一次检查：取数 → 校验 → 判离场/入场 → 推送 → 落库。返回已发送的文案。
 
@@ -487,11 +555,16 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         else:
             idx = _index_of_bar(bars, last_bar)
             from_i = (idx + 1) if idx is not None else latest_closed_i
+        # 仓位行提前读（只读）：下面两条「本轮没有新 bar 要处理」的早退路径也要写面板
+        # 状态 —— 已收盘 bar 每 4h 才换一根，只在 walk 之后写会让面板时间戳 4h 才动一次，
+        # 区块头写的却是「每 30 分钟随信号 tick 更新」。
+        row = db.open_position(symbol)
+        has_open = row is not None and row["status"] == "open"
         if from_i > latest_closed_i:
             db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
+            _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i, has_open)
             return
 
-        row = db.open_position(symbol)
         # pending（用户还没确认）不算真仓：不对它判离场（否则从未开过的仓会被
         # 自动关账、写 r_multiple 污染统计）；但超过 PENDING_BARS_MAX 根 4h 未处理
         # 就作废释放槽位，否则一次漏看提醒会永久堵死该标的的新信号。
@@ -516,6 +589,8 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                 # 往前走，用户晚确认后 from_i 已越过入场根与中间根，这些根的止损
                 # 判定被永久跳过。留在信号 bar，确认后从入场根起重扫（幂等键
                 # was_alerted 保证已推过的离场提醒不会重复推）。
+                # 面板状态照常刷新（pending 不是仓位 → 触发线/密集根数照常算）。
+                _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i, False)
                 return
         position = _row_to_state(row) if row is not None and row["status"] != "pending" else None
         events, new_pos = walk(cfg, symbol, bars, ind, sq, position, from_i, latest_closed_i,
@@ -586,6 +661,10 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
                                                format_missed(cfg, ev.sig,
                                                              executor_managed=(executor is not None))), sent)
         db.set_last_bar(symbol, bars[latest_closed_i].open_ms)
+        # 面板状态（排在 set_last_bar 之后：写失败不影响 bar 进度与信号推送）。
+        # has_position 取 walk 走完之后的真实状态：本轮刚离场 → False（照常给两条入场线）。
+        _record_symbol_state(db, cfg, symbol, bars, ind, latest_closed_i,
+                             has_position=(new_pos is not None))
 
 
 def _emit(db, notifier, cfg, alert: Alert, sent: List[str]) -> None:
