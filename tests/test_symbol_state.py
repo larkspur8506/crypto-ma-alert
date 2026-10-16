@@ -273,9 +273,10 @@ class TestRenderBlock(unittest.TestCase):
         for frag in ("① 离场按 4h 收盘判定", "② 破线+密集满 6 根开多",
                      "③ 破线+MA200 下方才开空"):
             self.assertIn(frag, html)
-        # 样式类随页面下发（只用现有 CSS 变量，两主题自动适配）
-        self.assertIn(".sym-legend{margin-top:8px;font-size:11px;color:var(--muted);"
-                      "line-height:1.6}", html)
+        # 样式类随页面下发（只用现有 CSS 变量，两主题自动适配）；
+        # 本轮起 .legend 与 .sym-legend 合组同规则（账户/系统/数据源三条注脚共用）
+        self.assertIn(".sym-legend,.legend{margin-top:8px;font-size:11px;"
+                      "color:var(--muted);line-height:1.6}", html)
         # 桌面端悬停口径保留（title 原文不动）
         self.assertIn('title="4h 收盘突破该线即入场（需均线密集满 6 根）"', html)
         self.assertIn('title="收盘跌破该线且在 MA200 下方才开空"', html)

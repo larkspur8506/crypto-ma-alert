@@ -251,6 +251,16 @@ def _badge(dot_cls: str, label: str, value: str, title: str = "") -> str:
             f"{label} <b>{value}</b></span>")
 
 
+def _msg_cell(msg: str) -> str:
+    """消息单元格：≤160 字符保持 title 悬停（原样，避免每行都可点的噪音）；
+    超长改用原生 <details> 折叠（零 JS）——iOS Safari 无 title 悬停，超出部分原先永久不可读。"""
+    if len(msg) <= 160:
+        return f"<span title='{_esc(msg)}'>{_esc(msg)}</span>"
+    shown = msg[:160] + "…"
+    return (f"<details class=\"msgdetails\"><summary>{_esc(shown)}</summary>"
+            f"<div class=\"fullmsg\">{_esc(msg)}</div></details>")
+
+
 def _table(thead: str, rows_html: str, empty: str, empty_cols: int) -> str:
     if rows_html:
         return f"<div class='tablewrap'><table><thead><tr>{thead}</tr></thead>" \
@@ -725,14 +735,13 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
     for r in _alert_rows:
         ok = bool(r.get("sent_successfully"))
         msg = str(r.get("message") or "")
-        shown = msg if len(msg) <= 160 else msg[:160] + "&hellip;"
         _kind = str(r.get("kind") or "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
                  f"<td>{_esc(r.get('symbol') or '—')}</td>"
                  f"<td><span class='{'pos' if ok else 'neg'}'>"
                  f"{'已送达' if ok else '失败'}</span></td>"
-                 f"<td><span title='{_esc(msg)}'>{_esc(shown)}</span></td></tr>")
+                 f"<td>{_msg_cell(msg)}</td></tr>")
     o.append(_table("<th>时间</th><th>类型</th><th>标的</th><th>状态</th><th>内容</th>",
                     rows, "暂无提醒日志", 5))
     o.append("</div>")
@@ -743,11 +752,10 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
     for r in _rows(deps, "hl_recent_events", n):
         kind = str(r.get("kind") or "—")
         msg = str(r.get("message") or "")
-        shown = msg if len(msg) <= 160 else msg[:160] + "&hellip;"
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_EV_TXT.get(kind, kind))}</td>"
                  f"<td>{_esc(r.get('symbol') or '—')}</td>"
-                 f"<td><span title='{_esc(msg)}'>{_esc(shown)}</span></td></tr>")
+                 f"<td>{_msg_cell(msg)}</td></tr>")
     o.append(_table("<th>时间</th><th>类型</th><th>标的</th><th>内容</th>",
                     rows, "暂无执行器事件", 4))
     o.append("</div>")
@@ -808,10 +816,15 @@ def _status_strip(p: dict) -> str:
     net = p.get("network") or {}
     mismatch = bool(system.get("mismatch"))
     lat = _opt_num(net.get("latency_ms"))
+    kill_reason = str(p.get("kill_reason") or "").strip()
+    # 熔断触发且原因非空 → 值里带上原因（可见文字）；iOS Safari 无 title 悬停，
+    # 原先原因只在 title 里、手机上读不到。未触发时值不变，title 保留。
+    kill_val = "未触发"
+    if kill:
+        kill_val = f"已触发 · {_esc(kill_reason)}" if kill_reason else "已触发"
     items = [
         _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode]),
-        _badge("neg" if kill else "pos", "熔断", "已触发" if kill else "未触发",
-               str(p.get("kill_reason") or "")),
+        _badge("neg" if kill else "pos", "熔断", kill_val, kill_reason),
         _badge("pos" if not mismatch else "neg", "对账", "一致" if not mismatch else "不一致"),
         _badge("pos" if lat is not None else "muted", "HL 延迟",
                f"{lat:.0f} ms" if lat is not None else "—",
