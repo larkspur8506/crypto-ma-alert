@@ -425,6 +425,8 @@ def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optio
     口径（全部复用 strategy 现成的序列，不重新实现一套常数）：
     - price = 最新一根**未收盘** bar 的 close（与信号同一份 hl-candle，市场层已给）
     - sma20 = **最后一根已收盘 bar** 的 SMA20 —— 离场判定看的就是这条线
+    - sma200 = 同一根已收盘 bar 的 SMA200 —— 做空（③）的趋势过滤线，面板琥珀要用
+      （持仓标的也照存，无副作用）
     - long_trigger / short_trigger = 最后一根已收盘 bar 的 6均线 max/min（上轨/下轨）；
       下一次入场判定（evaluate_entry 在第 i 根用的正是 ind[i-1]）比的就是这两个值
     - dense_cnt = 以最后一根已收盘 bar 结尾的连续密集根数（库里存真实值，展示封顶 6/6）
@@ -437,7 +439,14 @@ def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optio
     cur = sma_seq[latest_closed_i] if 0 <= latest_closed_i < len(sma_seq) else None
     if cur is not None:
         sma20 = float(cur)
-    snap: Dict[str, Optional[float]] = {"price": price, "sma20": sma20,
+    # SMA200 与 SMA20 同源同索引（同一根已收盘 bar）；序列缺失/该位为 None → 留 NULL。
+    # 持仓标的也照存（面板 ③ 行不渲染，无副作用；离场/开仓都不读它）。
+    sma200: Optional[float] = None
+    sma200_seq = ind.get("sma200") or []
+    cur200 = sma200_seq[latest_closed_i] if 0 <= latest_closed_i < len(sma200_seq) else None
+    if cur200 is not None:
+        sma200 = float(cur200)
+    snap: Dict[str, Optional[float]] = {"price": price, "sma20": sma20, "sma200": sma200,
                                        "long_trigger": None, "short_trigger": None,
                                        "dense_cnt": None}
     if has_position:
