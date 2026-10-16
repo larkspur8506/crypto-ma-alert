@@ -91,6 +91,18 @@ html[data-theme='dark']{--bg:#0f1115;--fg:#e6e6e6;--card:#171a21;--card2:#14171e
       --wb-line:#78350f;--wb-bg:#2a1d08;--wb-fg:#fcd34d}
 </style>"""
 
+# 「三标的动态」区块（总览页）的样式：只这六个类，颜色一律引用上面那套变量，
+# 黑白两套主题下自动跟随（**不写死任何色值**）。由 hl/views.DASH_CSS 拼进页面。
+# .st.hot 的琥珀 = 变量 --warn；其余靠 --muted/--fg，与面板其它区块同色系。
+SYMBOL_CSS = """
+.sym-h{display:flex;align-items:baseline;gap:8px;margin-bottom:2px}
+.nm{font-weight:600;color:var(--fg)}
+.st{font-size:12px;color:var(--muted)}
+.st.hot{color:var(--warn)}
+.px{font-weight:600;color:var(--fg);font-variant-numeric:tabular-nums}
+.fn{font-size:11px;color:var(--muted)}
+"""
+
 
 def page_shell(theme: str, title: str, body: str, head_extra: str = "",
                lang: str = "zh-CN") -> str:

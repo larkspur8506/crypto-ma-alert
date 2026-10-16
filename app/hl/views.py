@@ -37,7 +37,8 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app import posfields
-from app.ui_theme import THEME_CSS, normalize_theme, theme_attr, theme_switch_html
+from app.ui_theme import (SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
+                          theme_switch_html)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,12 @@ def _opt_num(v: Any) -> Optional[float]:
 def _fmt(v: Any, dp: int = 2, dash: str = "—") -> str:
     f = _opt_num(v)
     return dash if f is None else f"{f:,.{dp}f}"
+
+
+def _opt_int(v: Any) -> Optional[int]:
+    """安全转 int，保留 None（symbol_state.dense_cnt 这类可空整数）。"""
+    f = _opt_num(v)
+    return None if f is None else int(f)
 
 
 def _utc_day_start(ts: float) -> float:
@@ -349,6 +356,43 @@ def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[di
         if coin not in open_by_coin:
             return True
     return False
+
+
+def _symbol_state_rows(deps: DashboardDeps, db_rows: List[Any],
+                       symbols: List[str]) -> List[dict]:
+    """symbol_state 表 → 「三标的动态」每标的一条（缺行/缺字段一律 None，永不抛异常）。
+
+    顺序与配置的标的顺序一致；`position_side` 只看 status='open' 的仓位行
+    （pending 不算仓位，与「仓位」表同口径）。
+    """
+    cached: Dict[str, dict] = {}
+    for r in (_db_call(deps.db, "symbol_states") or []):
+        d = _rowd(r)
+        sym = str(d.get("symbol") or "")
+        if sym:
+            cached[sym] = d
+    open_side: Dict[str, int] = {}
+    for r in db_rows:
+        d = _rowd(r)
+        if str(d.get("status")) == "open":
+            sym = str(d.get("symbol") or "")
+            if sym:
+                open_side[sym] = int(_num(d.get("side"), 1))
+    out: List[dict] = []
+    for sym in symbols:
+        d = cached.get(sym) or {}
+        out.append({
+            "symbol": sym,                       # 内部键（保留）
+            "coin": _disp(sym),                  # 展示用：HL 侧合约名
+            "price": _opt_num(d.get("price")),
+            "sma20": _opt_num(d.get("sma20")),
+            "long_trigger": _opt_num(d.get("long_trigger")),
+            "short_trigger": _opt_num(d.get("short_trigger")),
+            "dense_cnt": _opt_int(d.get("dense_cnt")),
+            "updated_at": _opt_num(d.get("updated_at")),
+            "position_side": open_side.get(sym),
+        })
+    return out
 
 
 def status_payload(deps: DashboardDeps) -> dict:
@@ -593,6 +637,9 @@ def status_payload(deps: DashboardDeps) -> dict:
         v = _db_call(deps.db, "get_last_bar", s)
         last_bar[s] = int(v) if v else None
 
+    # ---------------- 三标的动态（纯读 symbol_state 缓存）----------------
+    symbol_state_out = _symbol_state_rows(deps, db_rows, symbols)
+
     stuck = _db_call(deps.db, "hl_stuck_orders", 180.0) or []
     executor_last_event_at = _opt_num(_db_call(deps.db, "hl_last_event_at"))
 
@@ -633,6 +680,7 @@ def status_payload(deps: DashboardDeps) -> dict:
         "orders_recent": orders_recent,
         "fills": fills_out[:100],   # JSON 也截断（看守/巡检只看头部；全量会让响应无限膨胀）
         "signals": signals,
+        "symbol_state": symbol_state_out,
         "system": {
             "feed": feed,
             "last_bar": last_bar,
@@ -751,7 +799,118 @@ svg.chart .gdot{fill:var(--link)}
 a{color:var(--link)}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
     .badge{padding:5px 10px;font-size:11px}.grid{grid-template-columns:1fr}}
-</style>"""
+""" + SYMBOL_CSS + "</style>"
+
+
+# ---------------------------------------------------------------- 三标的动态区块
+# 总览页在「仓位」表之后、「交易所挂单」之前插入的区块：每标的现价 / 状态词 /
+# 到触发线的距离。数据全部来自 symbol_state（引擎每轮 tick upsert），面板纯读库；
+# 触发线与密集根数的口径由 app/engine.symbol_snapshot 计算（复用 strategy 的序列）。
+_SQUEEZE_CAP = 6          # 密集根数展示封顶：满 6 根即已满足入场前提
+_NEAR_TITLE = "接近触发（按收盘判定）"
+_EXIT_TITLE = {1: "按 4h 收盘判定，非盘中触发：收盘跌破该线即自动平仓",
+               -1: "按 4h 收盘判定，非盘中触发：收盘站上该线即自动平仓"}
+_LONG_TITLE = "4h 收盘突破该线即入场（需均线密集满 6 根）"
+_SHORT_TITLE = "收盘跌破该线且在 MA200 下方才开空"
+
+
+def _need_pct(kind: str, price: Any, line: Any) -> Optional[float]:
+    """到达触发线所需变动幅度（%，自带方向符号）。四方向：
+
+    exit_short  持仓空：需要**涨**到 SMA20（收盘站上才自动平仓）→ (线 − 现价)/现价
+    exit_long   持仓多：需要**跌**到 SMA20（收盘跌破）        → (现价 − 线)/现价
+    break_up    无仓上破开多：需要涨到 6均线上轨               → (线 − 现价)/现价
+    break_down  无仓下破开空：需要跌到 6均线下轨               → (现价 − 线)/现价
+
+    现价/触发线缺失或非法（<=0）→ None（该子行整体不渲染，fail-soft）。
+    """
+    px, v = _opt_num(price), _opt_num(line)
+    if px is None or px <= 0 or v is None:
+        return None
+    if kind in ("exit_short", "break_up"):
+        return (v - px) / px * 100.0
+    if kind in ("exit_long", "break_down"):
+        return (px - v) / px * 100.0
+    return None
+
+
+def _sym_state_word(side: Any, dense: Any) -> tuple:
+    """状态词 (文本, 颜色 class, 悬停 title)。
+
+    - 有 status='open' 仓位 →「持仓中（多/空）」muted（持仓标的 walk 不评估入场，不谈密集）
+    - 无仓：密集根数 NULL/0 →「均线未密集」muted；1~5 →「密集酝酿 n/6」hot；
+      ≥6 → 封顶显示「密集酝酿 6/6」hot，title 里给真实根数
+    """
+    sd = _opt_int(side)
+    if sd in (1, -1):
+        return f"持仓中（{'多' if sd == 1 else '空'}）", "muted", ""
+    n = _opt_int(dense) or 0
+    if n <= 0:
+        return "均线未密集", "muted", ""
+    return (f"密集酝酿 {min(n, _SQUEEZE_CAP)}/{_SQUEEZE_CAP}", "hot",
+            f"6 均线已连续 {n} 根密集，满 {_SQUEEZE_CAP} 根后收盘突破即入场")
+
+
+def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any) -> str:
+    """距离行：`还差 +X.X%`（0<need<1% 标 warn + 悬停「接近触发」）/ `待收盘判定`，
+    百分比之后跟触发线价格（价格格式复用面板 _fmt 口径）。"""
+    line_txt = f" <span class=\"muted\">线 {_fmt(line)}</span>"
+    if need is None or need <= 0:
+        val = f"<span class=\"muted\">待收盘判定</span>{line_txt}"
+    else:
+        cls = f" class=\"warn\" title=\"{_NEAR_TITLE}\"" if need < 1.0 else ""
+        val = f"还差 <b{cls}>{need:+.1f}%</b>{line_txt}"
+    return (f"<div class=\"kv\"><span class=\"k\">{label} "
+            f"<span class=\"fn\" title=\"{_esc(title)}\">{mark}</span></span>"
+            f"<span class=\"v\">{val}</span></div>")
+
+
+def _sym_card(r: Dict[str, Any]) -> str:
+    """一个标的的卡片：现价 + 状态词 + 距离行（持仓只给离场线；无仓给两条入场线）。"""
+    price = _opt_num(r.get("price"))
+    side = _opt_int(r.get("position_side"))
+    st_txt, st_cls, st_title = _sym_state_word(side, r.get("dense_cnt"))
+    title_attr = f" title=\"{_esc(st_title)}\"" if st_title else ""
+    name = _esc(r.get("coin") or _disp(r.get("symbol")) or "—")
+    o = [("<div class=\"sym\"><div class=\"sym-h\">"
+          f"<span class=\"nm\">{name}</span>"
+          f"<span class=\"st {st_cls}\"{title_attr}>{st_txt}</span>"
+          f"<span class=\"px\">{_fmt(price)}</span></div>")]
+    if price is not None and price > 0:
+        if side in (1, -1):
+            need = _need_pct("exit_short" if side < 0 else "exit_long", price, r.get("sma20"))
+            if need is not None:
+                o.append(_sym_row("距自动离场线", "①", _EXIT_TITLE[-1 if side < 0 else 1],
+                                  need, r.get("sma20")))
+        else:
+            need = _need_pct("break_up", price, r.get("long_trigger"))
+            if need is not None:
+                o.append(_sym_row("上破开多", "②", _LONG_TITLE, need, r.get("long_trigger")))
+            need = _need_pct("break_down", price, r.get("short_trigger"))
+            if need is not None:
+                o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger")))
+    o.append("</div>")
+    return "".join(o)
+
+
+def _symbol_dynamics(p: dict) -> str:
+    """「三标的动态」区块（插在仓位表与交易所挂单之间，见 _render_body）。
+
+    fail-soft：某标的 symbol_state 行缺失 / 字段 NULL → 该标的价格显示「—」、对应子行
+    整体不渲染，其余标的不受影响；整块任何异常都不能弄挂总览页（调用点在 try 里）。
+    区块头时间 = 三个标的里最新的 updated_at（北京时间，与面板其它时间同口径）。
+    """
+    rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
+    if not rows:
+        return ""
+    stamps = [t for t in (_opt_num(r.get("updated_at")) for r in rows) if t]
+    when = _fmt_dt(max(stamps), "%H:%M") if stamps else "—"
+    o = [f"<h2>三标的动态<span class=\"muted\">行情 {when} · 每 30 分钟随信号 tick 更新</span></h2>",
+         "<div class=\"card\"><div class=\"grid\">"]
+    for r in rows:
+        o.append(_sym_card(r))
+    o.append("</div></div>")
+    return "".join(o)
 
 
 def _sign(v: Any, unit: str = " U") -> tuple:
@@ -915,6 +1074,14 @@ def _render_body(p: dict) -> str:
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号见下方「信号」）</td></tr>")
     o.append("</tbody></table></div>")
+
+    # ---------------- 三标的动态 ----------------
+    # 位置由需求钉死：仓位表之后、交易所挂单之前。整块自己兜底（缺数据只略去子行），
+    # 万一渲染炸了也不能弄挂总览页 —— 这里再包一层 try。
+    try:
+        o.append(_symbol_dynamics(p))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
 
     # ---------------- 挂单 ----------------
     o.append("<h2>交易所挂单</h2>")
