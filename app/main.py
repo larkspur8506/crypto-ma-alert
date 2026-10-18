@@ -85,8 +85,22 @@ def hl_mode() -> str:
     return raw if raw in ("off", "dry", "live") else "off"
 
 
+def hl_private_key() -> str:
+    """执行器用的 agent 私钥：**DB（面板「更新 API」写入）优先，其次 env**。
+
+    这是全仓唯一读私钥明文的入口 —— 调用方只许把它交给 HlExchange 的构造函数，
+    绝不许写进日志、事件、alert_logs 或 HTTP 响应。
+    """
+    try:
+        db_key = str(db.get_config_str("hl_private_key", "") or "").strip()
+    except Exception as e:                                           # noqa: BLE001
+        logger.warning("读 DB 私钥失败（回落 env）：%s", type(e).__name__)
+        db_key = ""
+    return db_key or _env("HL_PRIVATE_KEY")
+
+
 def hl_params():
-    """从 env + DB 组装 ExecParams。私钥只从 env 读，绝不落库。"""
+    """从 env + DB 组装 ExecParams。私钥 DB > env（面板可热切换），其余读 env/配置。"""
     from app.hl.executor import DEFAULT_COIN_MAP, ExecParams
     try:
         coin_map = json.loads(_env("HL_COIN_MAP", "")) or dict(DEFAULT_COIN_MAP)
@@ -100,12 +114,11 @@ def hl_params():
             return default
 
     cfg = current_config()
-    base = "https://api.hyperliquid-testnet.xyz" if _env("HL_TESTNET", "0") in ("1", "true") \
-        else _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+    base = hl_info_base()
     return ExecParams(
         mode=hl_mode(),
         account_address=_env("HL_ACCOUNT_ADDRESS"),
-        private_key=_env("HL_PRIVATE_KEY"),
+        private_key=hl_private_key(),
         base_url=base,
         coin_map=coin_map,
         leverage=cfg.leverage,
@@ -135,12 +148,20 @@ def hl_params():
 _hl_info = None
 
 
+def hl_info_base() -> str:
+    """只读客户端的 base_url。独立成函数：hl_params() 装配执行器时也要用它，
+    但私钥/模式的变动不该触发只读客户端重建。"""
+    if _env("HL_TESTNET", "0") in ("1", "true"):
+        return "https://api.hyperliquid-testnet.xyz"
+    return _env("HL_BASE_URL", "https://api.hyperliquid.xyz")
+
+
 def get_hl_info():
     """只读客户端（面板/看护/执行器共用；无凭据也能用）。"""
     global _hl_info
     if _hl_info is None:
         from app.hl.info import HlInfo
-        _hl_info = HlInfo(base_url=hl_params().base_url)
+        _hl_info = HlInfo(base_url=hl_info_base())
     return _hl_info
 
 
@@ -239,15 +260,69 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
         logger.exception("补推失败提醒异常: %s", e)
 
 
-def _job_hl_monitor() -> None:
-    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。"""
-    ex = build_executor()
-    if ex is None:
-        return
+def _run_agent_cleanup(reason: str = "") -> dict:
+    """到期保护清仓（**持 _tick_lock**，与 tick 互斥）。
+
+    互斥设计（M2 修正后的事实）：
+    1. 清仓全程持进程内 ``_tick_lock`` —— 与 tick / /admin/tick / hl_monitor（同锁）
+       串行，进程里不可能有第二个写路径在跑；
+    2. 执行器内部再用**进程级** ``_op_lock``（class 属性，所有 Executor 实例共用）
+       兜底 run/on_entry/on_exit；
+    3. 清仓期间置 `agent.cleanup_session()` 标记，让「有仓没止损 → 自动补挂」
+       这类顺手动交易所的路径主动让路（它同时也不再在 kill 态下动手）。
+    """
+    with _tick_lock:
+        ex = build_executor()
+        if ex is None:
+            # 纯提醒模式（off）或装配失败：没有执行器能平仓。返 ok=False 让上层喊人，
+            # 绝不假装「已清仓」。
+            return {"ok": False, "error": "执行器未启用或装配失败（模式=off？），无法自动清仓",
+                    "closed": [], "dry": False}
+        return ex.flatten_for_expiry(reason or "agent 到期保护")
+
+
+def _agent_check(now_ms=None) -> dict:
+    """跑一轮到期检查（拆出来便于 /admin 触发与单测直接调）。"""
+    from app.hl import agent as agent_mod
+    cfg = current_config()
+    state = agent_mod.check_once(
+        db, cfg, notifier, get_hl_info(),
+        address=_env("HL_ACCOUNT_ADDRESS"),
+        now_ms=now_ms,
+        cleanup=_run_agent_cleanup,
+        prefix=cfg.alert_prefix,
+        log_event=lambda kind, msg, **kw: db.hl_log_event(kind, msg),
+        mode=hl_mode(),
+    )
+    logger.info("[agent] 到期检查：level=%s source=%s 剩余 %s 天",
+                state.get("level"), state.get("source"), state.get("days_left"))
+    return state
+
+
+def _job_agent_expiry() -> None:
+    """每小时第 11 分：检查 API 钱包有效期（≤3 天且开关开 → 清仓）。"""
     try:
-        ex.run(force_snapshot=True)
+        _agent_check()
+        _retry_failed_alerts()
     except Exception as e:                                    # noqa: BLE001
-        logger.exception("HL 执行器监控轮异常: %s", e)
+        logger.exception("agent 到期检查异常: %s", e)
+
+
+def _job_hl_monitor() -> None:
+    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。
+
+    **持 _tick_lock**：与 tick / /admin/tick / 到期清仓串行。以前这里不持锁，清仓
+    （持锁）与 monitor（不持锁、自己新建 Executor、自己的实例锁）能同时跑，
+    「清仓撤完单 → monitor 又补挂回去」来回打架（M2）。
+    """
+    with _tick_lock:
+        ex = build_executor()
+        if ex is None:
+            return
+        try:
+            ex.run(force_snapshot=True)
+        except Exception as e:                                    # noqa: BLE001
+            logger.exception("HL 执行器监控轮异常: %s", e)
 
 
 def _job_heartbeat() -> None:
@@ -302,9 +377,12 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(_job_weekly, CronTrigger(day_of_week="mon", hour=config.heartbeat_hour, minute=5), id="weekly")
         scheduler.add_job(_job_hl_monitor, CronTrigger(minute="*/5"), id="hl_monitor",
                           max_instances=1, coalesce=True)
+        # API 钱包到期检查：每小时第 11 分（错开 tick 的 :03/:33 与 hl_monitor 的 5 分整）
+        scheduler.add_job(_job_agent_expiry, CronTrigger(minute=11), id="agent_expiry",
+                          max_instances=1, coalesce=True)
         scheduler.start()
         logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一；"
-                    "HL 监控每 5 分钟（模式=%s）", config.heartbeat_hour, hl_mode())
+                    "HL 监控每 5 分钟（模式=%s）；API 有效期检查每小时 :11", config.heartbeat_hour, hl_mode())
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
@@ -408,8 +486,36 @@ def _admin_deps():
         address_fn=lambda: hl_params().account_address,
         private_key_fn=lambda: hl_params().private_key,
         mids_fn=lambda: get_hl_info().all_mids(),
+        # 到期检查 + 面板「更新 API」：都走 app.hl.agent（面板卡片只读 state，零网络）
+        agent_state_fn=lambda: _agent_state(),
+        renew_fn=lambda key: _renew_agent_key(key),
+        cleanup_enabled_fn=lambda: _cleanup_on(),
         # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
         price_fallback=0.0,
+    )
+
+
+def _agent_state() -> dict:
+    """面板用：读 ``hl_agent_state`` 缓存（**不**现调 HL API）。"""
+    from app.hl import agent as agent_mod
+    return agent_mod.read_state(db)
+
+
+def _cleanup_on() -> bool:
+    from app.hl import agent as agent_mod
+    return agent_mod.cleanup_switch(db, current_config())
+
+
+def _renew_agent_key(new_key: str) -> tuple:
+    """面板「更新 API」：校验 + 写 DB + 刷新 state + 推送。返回 (ok, 文案)。"""
+    from app.hl import agent as agent_mod
+    cfg = current_config()
+    return agent_mod.renew_key(
+        db, cfg, notifier, get_hl_info(), new_key,
+        address=_env("HL_ACCOUNT_ADDRESS"),
+        current_key=hl_private_key(),
+        prefix=cfg.alert_prefix,
+        log_event=lambda kind, msg, **kw: db.hl_log_event(kind, msg),
     )
 
 
@@ -439,6 +545,7 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
                      enable_long: Optional[str] = Form(None),
                      enable_shorts: Optional[str] = Form(None),
                      heartbeat_push: Optional[str] = Form(None),
+                     agent_expiry_cleanup: Optional[str] = Form(None),
                      short_regime_ma: str = Form("200"), k: str = Form("")):
     _require_admin(request, k or None)
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
@@ -453,6 +560,11 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
     db.set_config("enable_long", 1 if enable_long else 0)
     db.set_config("enable_shorts", 1 if enable_shorts else 0)
     db.set_config("heartbeat_push", 1 if heartbeat_push else 0)
+    # 老书签的表单里没有这个复选框：**不传 = 保持原值**（不能按「未勾选」清成 0，
+    # 否则老页面一提交就把到期保护静默关掉）。显式传 0 才关。
+    if agent_expiry_cleanup is not None:
+        from app.hl.agent import cleanup_enabled
+        db.set_config("agent_expiry_cleanup", 1 if cleanup_enabled(agent_expiry_cleanup) else 0)
     try:
         int(float(short_regime_ma))
     except ValueError:

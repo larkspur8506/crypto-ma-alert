@@ -41,6 +41,39 @@ class TestAppAssembly(unittest.TestCase):
         # HL 监控面板（feat/hl-executor）也要在
         for p in ("/hl", "/api/hl/status"):
             self.assertIn(p, paths, f"HL 路由 {p} 未注册")
+        # 到期保护：清空手工兜底的显式入口
+        self.assertIn("/admin/hl/agent/fallback/clear", paths)
+
+    def test_agent_check_passes_mode_and_handles_off(self):
+        """装配级：_agent_check 必须把当前模式传下去，off 下不喊「清仓失败」。"""
+        try:
+            import fastapi                                            # noqa: F401
+        except ImportError:
+            self.skipTest("fastapi 未安装")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        seen = {}
+
+        class Info:
+            def extra_agents(self, address):
+                return [{"name": "Hermes", "address": "0xabc",
+                         "validUntil": int(__import__("time").time() * 1000) + 86_400_000}]
+        mod.get_hl_info = lambda: Info()
+        mod.db.set_config("hl_exec_mode", "off")
+
+        def fake_check(db, cfg, notifier, info, **kw):
+            seen.update(kw)
+            return {"level": "cleanup", "source": "api"}
+
+        from app.hl import agent as agent_mod
+        orig = agent_mod.check_once
+        agent_mod.check_once = fake_check
+        try:
+            mod._agent_check()
+        finally:
+            agent_mod.check_once = orig
+        self.assertEqual(seen.get("mode"), "off", "_agent_check 必须把实际模式传下去")
+        self.assertTrue(callable(seen.get("cleanup")), "清仓器必须接线")
 
     @staticmethod
     def _route_paths(app) -> set:

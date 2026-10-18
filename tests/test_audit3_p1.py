@@ -299,14 +299,21 @@ class TestH3PartialFill(P3Base):
 
 
 class TestH4OpLock(P3Base):
-    """H4：Executor 有 _op_lock，run/on_entry/on_exit 串行化。"""
+    """H4：Executor 有 _op_lock，run/on_entry/on_exit 串行化。
+
+    锁从实例属性提升为**类属性**（进程级）：build_executor() 每轮新建 Executor，
+    实例级锁只能串行同一对象内的调用，跨 job（tick / hl_monitor / 到期清仓）无效。
+    """
 
     def test_lock_exists_and_wraps(self):
         import inspect
         from app.hl import executor as E
         self.assertTrue(hasattr(Executor, "__init__"))
-        src_init = inspect.getsource(E.Executor.__init__)
-        self.assertIn("_op_lock", src_init)
+        # 锁必须在类上（所有实例共用一把）
+        self.assertIn("_op_lock", vars(E.Executor))
+        e1 = E.Executor(db=None, params=None, info=None, exchange=None)
+        e2 = E.Executor(db=None, params=None, info=None, exchange=None)
+        self.assertIs(e1._op_lock, e2._op_lock, "_op_lock 必须是进程级（类属性）")
         for m in ("run", "on_entry", "on_exit"):
             src = inspect.getsource(getattr(E.Executor, m))
             self.assertIn("self._op_lock", src, f"{m} 应包锁")

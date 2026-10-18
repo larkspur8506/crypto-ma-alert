@@ -112,6 +112,19 @@ class HlInfo:
         untils = [a["valid_until"] for a in agents if a.get("valid_until")]
         return {"agents": agents, "max_valid_until": max(untils) if untils else None}
 
+    def extra_agents(self, address: str) -> List[dict]:
+        """原始 extraAgents 列表（API 钱包授权）。
+
+        与 `agent_status` 分开：后者做归一化并回落 webData2，适合「有没有授权」的展示；
+        到期监控要的是**原始行**（按 name 精确匹配、拿 validUntil 毫秒），不能掺回落值
+        —— webData2 只反映「主」agent，混进来会读成别人的到期时间。
+
+        `validUntil` 为 null/0 = 该授权不过期（老账户）。接口异常照常抛 HlInfoError，
+        由调用方走「查不到 → 手工兜底」的回落路径。
+        """
+        data = self.post({"type": "extraAgents", "user": address})
+        return data if isinstance(data, list) else []
+
     def open_orders(self, address: str) -> List[dict]:
         """挂单列表（旧接口，只要列表）。需要「是否可信」请用 open_orders_checked。"""
         return self.open_orders_checked(address)[0]
