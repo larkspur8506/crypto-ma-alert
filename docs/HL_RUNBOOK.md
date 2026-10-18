@@ -18,7 +18,9 @@
 | --- | --- | --- |
 | `HL_EXEC_MODE` | off/dry/live（DB 值优先） | `off` |
 | `HL_ACCOUNT_ADDRESS` | 主钱包地址（只读也用） | — |
-| `HL_PRIVATE_KEY` | **agent 钱包**私钥（不能提币）。永不落库、永不进日志 | — |
+| `HL_PRIVATE_KEY` | **agent 钱包**私钥（不能提币）。永不进日志；面板「更新 API」写入的值存在 DB `hl_private_key`，**DB 优先于 env** | — |
+| `AGENT_EXPIRY_CLEANUP` | 到期前自动清仓（DB `agent_expiry_cleanup` 优先） | `1`（开） |
+| `HL_AGENT_VALID_UNTIL_MS` | 手工兜底的有效期（毫秒；接口查不到时用，DB 优先） | 空 |
 | `HL_BASE_URL` / `HL_TESTNET` | 主网/测试网 | 主网 |
 | `HL_COIN_MAP` | `{"BTC_USDT":"BTC","ETH_USDT":"ETH"}` | 同左 |
 | `HL_MAX_SLIPPAGE_PCT` | IOC 限价偏离上限 | 0.003 |
@@ -133,6 +135,15 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 ### F. 私钥疑似泄露
 ① 立刻在 HL 网页 → Settings → API 删除该 agent wallet（不需要主钱包私钥即可撤销）；② 新建 agent wallet、更新 `.env`、`docker compose up -d`；③ 检查 `hl_orders`/`hl_fills` 有无非本系统的动作（执行器会记录自己发的每一单，对不上就是别人下的）。
 
+### G. API 钱包（agent）快到期 / 已失效
+有效期最长 180 天、默认 90 天，到期那一刻执行器**开仓、平仓、撤单全部被拒**（而本地记录看着一切正常）。
+- 系统行为：每小时 :11 检查一次，剩余 ≤14 天开始提醒（≤7 天升级文案）；≤3 天且开关开 → **先置 kill → 撤全部挂单 → 逐仓市价平 → 复查无仓**；已过期 → 置 kill + 每 24h 提醒。面板总览最下方「API 有效期」卡片可看状态（数据来自 DB 缓存，不现调接口）。
+- 续期（唯一正确姿势）：**HL 网页 → More → API**，用**同名 `Hermes`** 生成新 API 钱包（有效期选 180 天）→ 复制新私钥 → 面板「API 有效期」卡片里展开「更新 API」→ 粘贴 → 校验并保存。保存后下一轮 tick 自动用新私钥（`hl_params()` 每轮重建执行器），**无需重启**。
+- 校验失败的原因都在 400 文案里：格式不对 / 名字不是刚好 `Hermes` / 地址与粘贴的不一致（说明网页上还没授权成功）/ 授权已过期 / 就是当前这把。
+- 手工兜底：接口查不到同名授权时，到「参数」页「API 有效期」组填毫秒时间戳（`hl_agent_valid_until_ms`），留空表示不兜底。
+- 关掉自动清仓：「参数」页把「到期前自动清仓」取消勾选（识别不了的值一律按「开」——漏清仓的代价比提前平仓大）。
+- 清完仓后恢复交易：先续期并更新 API，再到「开关」页解除 kill（清仓本身不清 kill，这是故意的）。
+
 ## 7. 备份 / 恢复
 
 - 沿用现有每日备份（`/opt/backups/crypto-ma-alert/backup.sh`，容器内 sqlite3 backup → 保留 14 天）；`hl_*` 表在同一 DB 内，自动包含。
@@ -145,6 +156,8 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 /opt/data/cache/scratch/cma-venv/bin/python -m unittest discover -s tests -t .
 # 装配冒烟（路由 + 面板挂载）
 /opt/data/cache/scratch/cma-venv/bin/python -m unittest tests.test_app_smoke
+# API 到期监控 / 自动清仓 / 面板更新 API
+/opt/data/cache/scratch/cma-venv/bin/python -m unittest tests.test_agent_expiry tests.test_agent_renew
 # 只读客户端（不需要凭据）
 /opt/data/cache/scratch/cma-venv/bin/python -c "from app.hl.info import HlInfo; print(len(HlInfo().specs()))"
 ```

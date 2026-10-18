@@ -56,6 +56,13 @@ class Config:
     equity_mode: str = _env("HL_EQUITY_MODE", "follow").lower() or "follow"
     equity_min: float = _env_f("HL_EQUITY_MIN", 20.0)
 
+    # API 钱包（agent）到期保护：≤3 天时自动清仓。默认**开** —— 到期后执行器彻底
+    # 失去下单能力，仓位想平也平不了；这个开关存在的意义是让用户能主动关掉。
+    # 语义与推送开关一致：识别不了一律按「开」（见 app.hl.agent.cleanup_enabled）。
+    agent_expiry_cleanup: bool = _env("AGENT_EXPIRY_CLEANUP", "1").lower() in ("1", "true", "yes", "on")
+    # extraAgents 查不到有效期时的手工兜底（毫秒时间戳字符串；空=没有）
+    hl_agent_valid_until_ms: str = _env("HL_AGENT_VALID_UNTIL_MS", "")
+
     # 服务
     base_url: str = _env("BASE_URL", "https://ma.222677.xyz")
     admin_token: str = _env("ADMIN_TOKEN")
@@ -84,7 +91,8 @@ class Config:
     # ---- DB 可覆盖项 ----
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
-                   "equity_mode", "equity_min")
+                   "equity_mode", "equity_min", "agent_expiry_cleanup",
+                   "hl_agent_valid_until_ms")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
@@ -102,10 +110,20 @@ class Config:
         "short_regime_ma": (0, 1000),
     }
 
+    # 字符串配置允许「显式清空」的键：`set_config` 存的是 '""'，而 apply_db 对空串
+    # 一律当作「没传」（那本来是为了别让面板的空输入覆盖默认值）。这两个语义在这个键上
+    # 冲突 —— 手工兜底的有效期就是要能被清掉，所以单独放行。
+    _CLEARABLE_STR = ("hl_agent_valid_until_ms",)
+
     def apply_db(self, values: dict) -> "Config":
         # 先解析成 dict，统一做范围/一致性校验后再 setattr
         parsed: dict = {}
         for k in self.OVERRIDABLE:
+            if k in values and k in self._CLEARABLE_STR:
+                raw0 = str(values[k]).strip().strip('"').strip("'")
+                if raw0 == "":
+                    parsed[k] = ""
+                    continue
             if k not in values or values[k] in (None, ""):
                 continue
             # 去掉 JSON 引号：set_config 走 json.dumps，字符串值会存成 '"100"'，

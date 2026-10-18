@@ -1093,6 +1093,26 @@ class Executor:
             break
         return px, mine[:8]
 
+    # ------------------------------------------------------------ 到期保护清仓
+    def flatten_for_expiry(self, reason: str = "agent 到期保护") -> dict:
+        """API 钱包到期前的保护性清仓（撤全部挂单 → 逐仓市价平 → 复查无仓）。
+
+        互斥：持 ``_op_lock``（与 run/on_entry/on_exit 同一把）—— 清仓期间不可能有
+        新的下单序列插进来；调用方（app.main）另持进程内 ``_tick_lock`` 与 tick 互斥。
+        kill 置位由调用方在**调本方法之前**完成（见 app.hl.agent.check_once）。
+
+        返回 app.hl.agent.flatten_all 的结果字典；本方法不抛异常。
+        """
+        from app.hl import agent as agent_mod
+        with self._op_lock:
+            self._event(EV_DECISION, f"到期保护清仓开始：{reason}")
+            res = agent_mod.flatten_all(self.db, self.p, self.info, self.ex, self.notifier,
+                                        log_event=self._event)
+            self._event(EV_ORDER if res.get("ok") else EV_ERROR,
+                        f"到期保护清仓{'完成' if res.get('ok') else '失败'}："
+                        f"{res.get('error') or f'{len(res.get('closed') or [])} 个标的已平'}")
+            return res
+
     # ------------------------------------------------------------ 每轮
     def run(self, force_snapshot: bool = False) -> List[str]:
         """每轮 tick 调用：快照 → 对账 → 熔断 → 死手开关 → 心跳。返回告警文案。"""
