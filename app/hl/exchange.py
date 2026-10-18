@@ -20,7 +20,7 @@ import hashlib
 import logging
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from app.hl.info import MAINNET, TESTNET, HlInfo, HlInfoError
 
@@ -243,14 +243,22 @@ class HlExchange:
         到期保护清仓用：`cancel_all(coin)` 只清一个标的，而到期时不知道该有哪些仓，
         所以先一次性把挂单清空（止损单不撤就会和新平仓单互相打架）。
 
-        - 挂单列表读不到 → **不撤任何单**并返回 ok=False（宁可整轮重试，也不要
-          「以为撤完了其实没撤」）。
-        - 单个撤单失败（已被成交/已撤掉）只记录、不整体失败 —— 那张单已经不在场上了。
+        - **挂单列表读不到/不可信 → 不撤任何单并返回 ok=False**（`reason=orders_untrusted`）。
+          `open_orders()` 在接口异常时返回空列表（info 层不抛异常），「空列表」
+          与「读不到」在调用方看来一模一样 —— 把后者当「没有挂单」会让清仓照常
+          平仓，留下一堆孤儿 reduce-only 单（平了仓、止损单还挂着）。宁可整轮重试。
+        - 单个撤单失败（已被成交/已撤掉）只记录、不整体失败 —— 那张单已经不在场上了；
+          明细放在 raw.failed 里，由调用方决定要不要喊人。
         """
         try:
-            orders = self.info.open_orders(self.account_address) or []
+            orders, trusted = self._open_orders_checked()
         except Exception as e:                                       # noqa: BLE001
             return _err(f"读取挂单失败，未撤任何单：{type(e).__name__}")
+        if not trusted:
+            return {"ok": False, "status": STATUS_ERROR, "oid": None, "avg_px": None,
+                    "filled_sz": None, "reason": "orders_untrusted",
+                    "error": "读不到可信的挂单列表（接口异常/回落老接口），为免留孤儿单未撤单",
+                    "raw": {"oids": [], "failed": []}}
         if self.dry_run:
             return {"ok": True, "status": STATUS_DRY, "oid": None, "avg_px": None,
                     "filled_sz": None, "error": None,
@@ -276,6 +284,18 @@ class HlExchange:
                         {"oids": oids, "failed": failed})
         return {"ok": True, "status": STATUS_RESTING, "oid": None, "avg_px": None,
                 "filled_sz": None, "error": None, "raw": {"oids": oids, "failed": failed}}
+
+    def _open_orders_checked(self) -> Tuple[List[dict], bool]:
+        """(挂单列表, 是否可信)。优先用 info 的可信接口，老接口退化成「不可信」。"""
+        checked = getattr(self.info, "open_orders_checked", None)
+        if callable(checked):
+            orders, trusted = checked(self.account_address)
+            return list(orders or []), bool(trusted)
+        # 只有老接口（测试桩/旧版 info）：无法区分「没挂单」与「读不到」。
+        # 生产用的 HlInfo 始终有 open_orders_checked，走到这里只可能是桩 —— 按可信处理。
+        orders = list(self.info.open_orders(self.account_address) or [])
+        logger.debug("[hl-exchange] info 无 open_orders_checked（旧版/桩），按可信处理：%d 张", len(orders))
+        return orders, True
 
     def schedule_cancel(self, time_ms: Optional[int] = None, minutes: int = 30) -> dict:
         """dead man's switch：到点自动撤所有挂单。"""

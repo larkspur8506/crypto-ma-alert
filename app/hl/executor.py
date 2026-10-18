@@ -167,17 +167,18 @@ def _today_start_ts(now: Optional[float] = None) -> float:
 
 
 class Executor:
+    # **进程级**写路径互斥：build_executor() 每轮 tick 都新建 Executor（main.py:168），
+    # 实例级锁只能串行同一对象内的 run/on_entry/on_exit —— 跨 job（tick vs
+    # hl_monitor vs 到期清仓）完全无效。用类属性 + 一把全局锁，让「撤单→下单→落库」
+    # 的序列在整个进程里串行。
+    _op_lock = threading.Lock()
+
     def __init__(self, db, params: ExecParams, info, exchange, notifier=None):
         self.db = db
         self.p = params
         self.info = info
         self.ex = exchange
         self.notifier = notifier
-        # 进程内互斥：run()/on_entry/on_exit 会做「撤单→下单→落库」多步序列，
-        # 两个线程并发跑同一段（_job_hl_monitor 与 tick 的 run、或两轮 tick）会
-        # 重放同一确定性 cloid → 被交易所拒单 → 误判失败 → 走「兜底平仓」误平仓。
-        # APScheduler 的 max_instances 只约束各自的 job，管不了跨 job 并发。
-        self._op_lock = threading.Lock()
 
     # ------------------------------------------------------------ 工具
     def _coin_or_none(self, symbol: str) -> Optional[str]:
@@ -320,13 +321,30 @@ class Executor:
         return {"ok": not problems, "problems": problems, "unknown": False,
                 "missing_stop": missing_stop, "unconfirmed": unconfirmed}
 
-    def _repair_missing_stop(self, row: dict, snap: dict) -> None:
+    def _repair_missing_stop(self, row: dict, snap: dict,
+                             kill_before: Optional[bool] = None) -> None:
         """**确认**有仓却没有止损挂单 → 先自动补挂原止损价；补不上就市价平掉。
 
         与开仓路径同一口径：不允许无保护持仓存在。用独立 cloid（stop:fix）避免与原单撞号。
         补挂成功也不解锁 kill —— 异常已经发生，由人工核对后决定是否恢复自动交易。
         """
         symbol = str(row.get("symbol"))
+        # 清仓进行中（agent 到期保护）→ 绝不补挂/平仓：清仓刚撤完单，这里再挂回去
+        # 就是「一边清一边补」，最后清仓复查会一直看到有仓，来回打。
+        from app.hl import agent as _agent_mod
+        if _agent_mod.cleanup_in_progress():
+            self._event(EV_DECISION, f"到期清仓进行中：{symbol} 暂不补挂止损", symbol=symbol)
+            return
+        # 本轮开始前 kill 就已经置位（人工触发/熔断/上次对账异常）→ 不动交易所：
+        # 此时人工正在核对，自动补挂/市价平会与人的操作打架。
+        # 注意判据是「**本轮开始前**」而不是「现在」—— 本轮对账发现「有仓没止损」
+        # 会先把 kill 拉起来，再走这个补挂修复；拿现在的值判会把修复彻底堵死
+        # （那就成了「有裸仓也不修」）。见 _run_locked 传入的 kill_before。
+        if kill_before is None:
+            kill_before = bool(self.db.hl_kill())
+        if kill_before:
+            self._event(EV_DECISION, f"kill 已触发：{symbol} 暂不自动补挂止损", symbol=symbol)
+            return
         # 映射缺失 → 不知道交易所上的标的，**绝不动交易所**（补挂/平仓都不做），只提示
         coin = self._coin_or_none(symbol)
         if coin is None:
@@ -1095,23 +1113,26 @@ class Executor:
 
     # ------------------------------------------------------------ 到期保护清仓
     def flatten_for_expiry(self, reason: str = "agent 到期保护") -> dict:
-        """API 钱包到期前的保护性清仓（撤全部挂单 → 逐仓市价平 → 复查无仓）。
+        """API 钱包到期前的保护性清仓（撤全部挂单 → 逐仓市价平 → 复查 → 本地关账）。
 
-        互斥：持 ``_op_lock``（与 run/on_entry/on_exit 同一把）—— 清仓期间不可能有
-        新的下单序列插进来；调用方（app.main）另持进程内 ``_tick_lock`` 与 tick 互斥。
+        互斥：持**进程级** ``_op_lock``（与 run/on_entry/on_exit 同一把，所有 Executor
+        实例共用）—— 清仓期间不可能有新的下单序列插进来；调用方（app.main）另持
+        进程内 ``_tick_lock`` 与 tick 互斥。同时置 `agent.cleanup_session()` 标记，
+        让 `_repair_missing_stop` 这类「顺手动交易所」的路径主动让路。
         kill 置位由调用方在**调本方法之前**完成（见 app.hl.agent.check_once）。
 
         返回 app.hl.agent.flatten_all 的结果字典；本方法不抛异常。
         """
         from app.hl import agent as agent_mod
         with self._op_lock:
-            self._event(EV_DECISION, f"到期保护清仓开始：{reason}")
-            res = agent_mod.flatten_all(self.db, self.p, self.info, self.ex, self.notifier,
-                                        log_event=self._event)
-            self._event(EV_ORDER if res.get("ok") else EV_ERROR,
-                        f"到期保护清仓{'完成' if res.get('ok') else '失败'}："
-                        f"{res.get('error') or f'{len(res.get('closed') or [])} 个标的已平'}")
-            return res
+            with agent_mod.cleanup_session():
+                self._event(EV_DECISION, f"到期保护清仓开始：{reason}")
+                res = agent_mod.flatten_all(self.db, self.p, self.info, self.ex, self.notifier,
+                                            log_event=self._event)
+                self._event(EV_ORDER if res.get("ok") else EV_ERROR,
+                            f"到期保护清仓{'完成' if res.get('ok') else '失败'}："
+                            f"{res.get('error') or f'{len(res.get('closed') or [])} 个标的已平'}")
+                return res
 
     # ------------------------------------------------------------ 每轮
     def run(self, force_snapshot: bool = False) -> List[str]:
@@ -1123,6 +1144,9 @@ class Executor:
         alerts: List[str] = []
         if self.p.mode == MODE_OFF:
             return alerts
+        # 本轮开始时的 kill 状态：下面「对账异常 → 自动 kill」会把它拉起来，
+        # 之后判断「要不要自动补挂止损」必须用这个**进来时**的值（否则修复永远被自己挡）。
+        kill_before = bool(self.db.hl_kill())
         snap = self._snapshot(force=force_snapshot)
         if snap is None:
             # 读不到快照也要写心跳（带 degraded 标记）：
@@ -1156,7 +1180,7 @@ class Executor:
                                "【HL执行】⚠️ 对账异常（已暂停自动交易）：\n- " + "\n- ".join(problems)))
             # 确认「有仓但没止损」→ 不允许无保护持仓存在：先补挂，补不上就市价平掉
             for row in rec.get("missing_stop") or []:
-                self._repair_missing_stop(row, snap)
+                self._repair_missing_stop(row, snap, kill_before=kill_before)
         elif rec.get("unconfirmed"):
             # 读不到触发单：只提示、绝不动作（否则会误平仓）；同一状态只喊一次
             items = rec["unconfirmed"]

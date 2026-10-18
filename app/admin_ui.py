@@ -51,9 +51,16 @@ _ALERT_KIND_TXT = {
     "exec_alert": "执行器告警",
     "exec_alert_fills": "执行器成交回报",
     "tick_error": "处理异常告警",
-    "agent_expiry_alert": "API 有效期提醒",
-    "agent_expiry_cleanup": "API 到期自动清仓",
+    "agent_expiry_near": "API 有效期提醒",
+    "agent_expiry_urgent": "API 有效期紧急",
+    "agent_expiry_expired": "API 已失效",
+    "agent_expiry_cleanup_ok": "API 到期清仓成功",
+    "agent_expiry_cleanup_fail": "API 到期清仓失败",
+    "agent_expiry_cleanup_off": "API 到期未自动清仓",
     "agent_renew": "API 已更新",
+    # 旧 kind（历史行）：保留映射，历史记录照样显示中文
+    "agent_expiry_alert": "API 有效期提醒（旧）",
+    "agent_expiry_cleanup": "API 到期自动清仓（旧）",
 }
 
 # 回填标记：2026-10-15 之前执行器推送不落 alert_logs，历史推送由 hl_events 回填，
@@ -464,7 +471,7 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
                 else "关 = 只提醒不清仓（到期后执行器无法平仓，需要自己盯）")
     if key == "hl_agent_valid_until_ms":
         return ("仅当 HL 授权接口查不到同名 Hermes 时用：填毫秒时间戳"
-                "（如 1830000000000）；留空 = 不兜底")
+                "（如 1830000000000）。留空 = 不改动当前值（要清空点下面的「清除兜底」）")
     return ""
 
 
@@ -480,6 +487,18 @@ def _flag(val: Any) -> int:
     return 1 if str(val if val is not None else "").strip().lower() in _TRUTHY else 0
 
 
+def _cleanup_on(val: Any) -> int:
+    """「到期前自动清仓」的取值：**识别不了按「开」**（fail-open）。
+
+    与推送开关相反：漏清仓的代价是「到期后仓位想平也平不了」，误清仓只是提前
+    平掉一笔仓（还能再开）。所以只有明确的假值才判关。
+    """
+    if isinstance(val, bool):
+        return 1 if val else 0
+    raw = str(val if val is not None else "").strip().lower()
+    return 0 if raw in ("0", "false", "no", "off") else 1
+
+
 def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "") -> str:
     st = f" step='{step}'" if step else ""
     return (f"<div class='field'><div class='lbl'>{_esc(label)}"
@@ -490,8 +509,21 @@ def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str 
 
 
 def _bool_field(key: str, label: str, on: bool, hint: str, src: str) -> str:
+    """复选框 + **hidden 兜底**（H3）。
+
+    裸 checkbox 在「未勾选」时**什么都不提交** —— 后端拿不到字段，任何
+    「缺省=开」的逻辑都会让这个开关永远关不掉（原来就是这样：取消勾选、保存、
+    刷新，还是开）。
+
+    在 checkbox 之前放一个同名的 `<input type=hidden value='0'>`：
+      - 未勾选 → 只提交 hidden 的 0 → 关
+      - 勾选   → 先提交 0 再提交 1 → 后端取**最后一个**值 = 1 → 开
+    （浏览器按文档顺序提交；FastAPI/Starlette 的 Form 取值也是「后出现的覆盖」，
+    见 tests/test_agent_expiry.py 的同名多值用例。）
+    """
     return (f"<div class='field'><div class='lbl'>{_esc(label)}"
             f"<span class='src'>&nbsp;来源 {src} · 当前 {'开' if on else '关'}</span></div>"
+            f"<input type='hidden' name='{_esc(key)}' value='0'>"
             f"<label class='chk'><input type='checkbox' name='{_esc(key)}' value='1' "
             f"{'checked' if on else ''}></label><div class='hint'>{hint}</div></div>")
 
@@ -546,6 +578,15 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
         o.append("</div>")
 
     o.append("<button type='submit'>保存全部参数</button></form>")
+    # 手工兜底现在「留空 = 不改动」（M3），所以清空必须有独立按钮（不能嵌在上面的
+    # form 里 —— HTML 不允许表单嵌套）。只在填了值时才显示，避免噪音。
+    cur_until = str(_cur_val(cfg, "hl_agent_valid_until_ms", "", "text") or "").strip()
+    if cur_until:
+        o.append("<form method='post' action='/admin/hl/agent/fallback/clear' class='inline'>"
+                 f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+                 f"<span class='hint'>手工兜底有效期当前为 {_esc(cur_until)}（毫秒）。"
+                 "留空保存 = 保持原值。</span>"
+                 "<button class='gray' type='submit'>清除兜底</button></form>")
     return "".join(o)
 
 
@@ -619,25 +660,32 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     out["enable_long"] = _flag(form.get("enable_long"))
     out["enable_shorts"] = _flag(form.get("enable_shorts"))
     out["heartbeat_push"] = _flag(form.get("heartbeat_push"))
-    # 到期前自动清仓：**识别不了按「开」**（fail-open：漏清仓 = 到期后仓位关不掉，
-    # 比提前平掉一笔仓的代价大得多）。所以这里不能走 _flag（认不出会落 0 = 关）。
-    _cleanup_raw = str(form.get("agent_expiry_cleanup") or "").strip().lower()
-    out["agent_expiry_cleanup"] = 0 if _cleanup_raw in ("0", "false", "no", "off") else 1
-    # 手工兜底的有效期：可留空（= 不兜底）；填了必须是正的整数毫秒，否则拒收整张表单，
-    # 免得「看起来保存成功、其实 apply_db 静默丢掉」。
-    _until_raw = str(form.get("hl_agent_valid_until_ms") or "").strip().replace(",", "")
-    if _until_raw:
+    # 到期前自动清仓（H3 + fail-open）：
+    #   字段缺失（老书签的表单/脚本没带这个键）→ **保持原值**，不写库；
+    #   有值（面板现在用 hidden+checkbox 双字段，必然是 0 或 1；脚本可能发别的）
+    #   → 识别不了按「开」。漏清仓的代价（到期后仓位关不掉）远大于提前平一笔。
+    _raw_cleanup = form.get("agent_expiry_cleanup")
+    if isinstance(_raw_cleanup, (list, tuple)):          # 同名多值：取最后一个
+        _raw_cleanup = _raw_cleanup[-1] if _raw_cleanup else None
+    if _raw_cleanup is not None and str(_raw_cleanup).strip() != "":
+        out["agent_expiry_cleanup"] = 1 if _cleanup_on(_raw_cleanup) else 0
+    # 手工兜底的有效期（M3）：**空 = 不传 = 保持原值**，与同页其它数字字段一致。
+    # 以前空串会落库把兜底值抹掉 —— 用户只想改个风险率，手工兜底就没了。
+    # 要清空兜底走「API 有效期」卡片里的「清除兜底」按钮（显式操作）。
+    _until_raw = form.get("hl_agent_valid_until_ms")
+    if isinstance(_until_raw, (list, tuple)):
+        _until_raw = _until_raw[-1] if _until_raw else None
+    _until_txt = str(_until_raw if _until_raw is not None else "").strip().replace(",", "")
+    if _until_txt:
         try:
-            _until_v = int(float(_until_raw))
+            _until_v = int(float(_until_txt))
         except ValueError:
-            errs.append("手工兜底的有效期不是数字（毫秒时间戳，可留空）")
+            errs.append("手工兜底的有效期不是数字（毫秒时间戳，可留空 = 不改动）")
             _until_v = 0
         if _until_v < 0:
             errs.append("手工兜底的有效期不能是负数")
         elif _until_v:
             out["hl_agent_valid_until_ms"] = str(_until_v)
-    else:
-        out["hl_agent_valid_until_ms"] = ""
     if eq is not None:
         out["equity"] = eq
     if rp is not None:
@@ -915,7 +963,7 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
 
 # ---------------------------------------------------------------- API 有效期卡片
 _LEVEL_CLS = {"ok": "pos", "near": "warn", "urgent": "neg", "cleanup": "neg",
-              "expired": "neg", "unknown": "muted"}
+              "expired": "neg", "unknown": "muted", "no_expiry": "pos"}
 
 
 def _agent_source_txt(src: str) -> str:
@@ -953,14 +1001,22 @@ def render_agent_card(deps: AdminDeps) -> str:
         days_i = int(days) if days not in (None, "") else None
     except (TypeError, ValueError):
         days_i = None
-    level = str(state.get("level") or "") or (agent_mod.level(days_i) if until else "unknown")
-    if state.get("cleanup") == "done":
-        level = "expired" if (days_i is not None and days_i <= 0) else level
+    level = str(state.get("level") or "")
+    if not level:
+        # 老 state / 手写 state 没有 level 字段时的兜底（有 until 就按毫秒重算）
+        level = agent_mod.level_ms(until, state.get("checked_ms")) if until else "unknown"
+    if level not in agent_mod.LEVEL_TXT:
+        level = "unknown"
+    cleanup_state = str(state.get("cleanup") or "none")
     state_word = agent_mod.LEVEL_TXT.get(level, "未知")
-    if str(state.get("cleanup") or "") == "done":
+    if cleanup_state == "done" and level != "expired":
         state_word = "已清仓"
-    elif str(state.get("cleanup") or "") == "failed":
+    elif cleanup_state == "failed":
         state_word = "清仓失败（待重试）"
+    elif cleanup_state == "skipped":
+        state_word = "未自动清仓（执行器 off）"
+    elif level == "no_expiry":
+        state_word = "不限期"
     elif level == "cleanup":
         # 「临界」这个词手机上读不出多重：明确写清楚 ≤3 天会做什么
         state_word = "临界（3 天内自动清仓）" if on else "临界（不会自动清仓）"
@@ -968,11 +1024,20 @@ def render_agent_card(deps: AdminDeps) -> str:
 
     addr = agent_mod.mask_addr(state.get("address"))
     src = _agent_source_txt(str(state.get("source") or ""))
-    if until:
+    if level == "no_expiry":
+        until_txt = "不限期（HL 授权没设到期）"
+        left_txt = "不会到期"
+    elif until:
         until_txt = agent_mod.fmt_bj(until)
         # 白话、不重复数字：剩余天数只在「还剩」一句出现一次
-        left_txt = f"还剩 {days_i} 天" if days_i is not None and days_i > 0 else (
-            "已过期" if days_i is not None else "不限期限")
+        if level == "expired":
+            left_txt = "已过期"
+        elif days_i is not None and days_i <= 0:
+            left_txt = "不到 1 天"
+        elif days_i is not None:
+            left_txt = f"还剩 {days_i} 天"
+        else:
+            left_txt = "—"
     else:
         until_txt = "未知（还没查到授权有效期）"
         left_txt = "下一个整点自动检查"
@@ -1193,6 +1258,22 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
                                    "但执行器未接线（无动作）")
         return RedirectResponse(_back(token, "switch"), status_code=303)
+
+    # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
+    @router.post("/admin/hl/agent/fallback/clear")
+    def admin_agent_fallback_clear(request: Request, k: str = Form("")):
+        """清掉「参数」页的手工兜底有效期（把空串写进 DB）。
+
+        「参数」页的空输入现在是「不改动」（与同页其它字段一致），所以清空必须
+        有独立入口 —— 否则用户永远删不掉填错的兜底值。
+        """
+        token = _auth(deps, request, k or None)
+        err = deps.put("hl_agent_valid_until_ms", "")
+        if err:
+            raise HTTPException(400, f"清除失败：{err}")
+        deps.log_event("decision", "面板清除手工兜底有效期（hl_agent_valid_until_ms）")
+        return RedirectResponse(_back(token, "params", "已清除手工兜底有效期"),
+                                status_code=303)
 
     # ---------------- 更新 API（到期续期后热切换私钥） ----------------
     @router.post("/admin/hl/agent/renew")

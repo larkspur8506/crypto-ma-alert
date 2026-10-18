@@ -224,6 +224,58 @@ class TestRenewRejects(Base):
         self.assertFalse(ok)
         self.assertIn("当前", msg)
 
+    def test_first_time_config_allowed(self):
+        """L6 回归：库里/参数都没有「当前私钥」= 首次配置 → 跳过「同地址」检查。
+
+        以前拿 `state.address`（= HL 授权列表里的地址）当「当前」：首次配置时
+        它恰好就是新 key 的地址，于是被自己挡住 —— 「这就是当前正在用的那把」。
+        """
+        key, addr = new_key()
+        A.write_state(self.db, {"address": addr, "valid_until_ms": NOW_MS + 100 * DAY_MS,
+                                "days_left": 100, "checked_ms": NOW_MS,
+                                "cleanup": "none", "source": "api", "level": "ok"})
+        self.assertIsNone(self.db.get_config_str(CFG_PRIVATE_KEY) or None)
+        ok, msg = self.renew(key, agents=self.authorized(addr), current_key="")
+        self.assertTrue(ok, f"首次配置被自己挡住了：{msg}")
+        self.assertEqual(str(self.db.get_config_str(CFG_PRIVATE_KEY)), key)
+        self.assertEqual(A.read_state(self.db)["address"], addr)
+
+    def test_same_address_detected_via_db_key(self):
+        """当前私钥存在 DB 里（面板更新过）→ 提交同一把必须被识别成「未变」。"""
+        key, addr = new_key()
+        self.db.set_config(CFG_PRIVATE_KEY, key)
+        ok, msg = self.renew(key, agents=self.authorized(addr), current_key="")
+        self.assertFalse(ok)
+        self.assertIn("未变", msg)
+
+    def test_duplicate_names_accepts_new_key(self):
+        """M6 回归：同名多行（旧行已过期 + 新行有效）→ renew 必须接受新私钥。
+
+        pick_agent 取「有效里最大」，但若同名的旧行排在前面、且旧行恰好就是
+        当前私钥，以前会把续期误判成「填了同一把」或「地址不匹配」。
+        """
+        old_key, old_addr = new_key()
+        new_k, new_addr = new_key()
+        # 库里当前用的是旧 key；HL 上同名两行：旧行（地址=旧 key，已过期）+ 新行（有效）
+        self.db.set_config(CFG_PRIVATE_KEY, old_key)
+        agents = [{"name": "Hermes", "address": old_addr, "validUntil": NOW_MS - DAY_MS},
+                  {"name": "Hermes", "address": new_addr,
+                   "validUntil": NOW_MS + 170 * DAY_MS}]
+        ok, msg = self.renew(new_k, agents=agents, current_key="")
+        self.assertTrue(ok, f"同名多行时续期被拒：{msg}")
+        self.assertEqual(str(self.db.get_config_str(CFG_PRIVATE_KEY)), new_k)
+        st = A.read_state(self.db)
+        self.assertEqual(st["address"], new_addr)
+        self.assertEqual(st["level"], "ok", "续期后状态必须是正常（不能读到旧行的过期时间）")
+
+    def test_duplicate_names_expired_row_still_rejected(self):
+        """同名旧行 + 新地址但新行已过期 → 仍要拒收（别为了「能存」放宽有效期检查）。"""
+        new_k, new_addr = new_key()
+        agents = [{"name": "Hermes", "address": new_addr, "validUntil": NOW_MS - DAY_MS}]
+        ok, msg = self.renew(new_k, agents=agents)
+        self.assertFalse(ok)
+        self.assertIn("失效", msg)
+
     def test_api_failure_rejects_instead_of_writing(self):
         key, _addr = new_key()
         ok, msg = self.renew(key, raise_agents="boom")
@@ -417,6 +469,8 @@ class TestRenewPanel(Base):
             self.assertLess(html.index("三标的动态"), html.index("账户</div>"))
 
     def test_state_word_mapping(self):
+        """L4：用精确锚点断言（「状态」那一行的 `<span class='v'>`），不再用恒真的 assertIn。"""
+        pat = "<span class='k'>状态</span><span class='v[^']*'>%s</span>"
         for level, word in (("ok", "正常"), ("near", "临期"), ("urgent", "临界"),
                             ("expired", "已失效"), ("unknown", "未知")):
             A.write_state(self.db, {"address": "0xabc",
@@ -424,7 +478,27 @@ class TestRenewPanel(Base):
                                     "days_left": 5, "checked_ms": NOW_MS,
                                     "cleanup": "none", "source": "api", "level": level})
             html = self._client().get("/admin", params={"k": "tk"}).text
-            self.assertIn(f"<span class='v'>{word}</span>" if False else word, html, level)
+            self.assertRegex(html, pat % word,
+                             f"level={level} 时状态词应精确渲染成 {word}")
+
+    def test_no_expiry_card_shows_unlimited(self):
+        """H4：不限期授权 → 面板显示「不限期」，剩余写「不会到期」。"""
+        A.write_state(self.db, {"address": "0xabc", "valid_until_ms": None,
+                                "days_left": None, "checked_ms": NOW_MS,
+                                "cleanup": "none", "source": "api", "level": "no_expiry"})
+        html = self._client().get("/admin", params={"k": "tk"}).text
+        self.assertRegex(html, "<span class='k'>状态</span><span class='v[^']*'>不限期</span>")
+        self.assertIn("不会到期", html)
+        self.assertIn("不限期（HL 授权没设到期）", html)
+
+    def test_skipped_state_shown(self):
+        """M5：off 模式清仓 skipped → 面板明确写「未自动清仓（执行器 off）」。"""
+        A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,
+                                "days_left": 2, "checked_ms": NOW_MS,
+                                "cleanup": "skipped", "source": "api", "level": "cleanup"})
+        html = self._client().get("/admin", params={"k": "tk"}).text
+        self.assertIn("未自动清仓（执行器 off）", html)
+        self.assertNotIn("清仓失败", html)
 
     def test_cleanup_done_shows_cleared(self):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,

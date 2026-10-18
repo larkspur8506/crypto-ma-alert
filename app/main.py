@@ -263,10 +263,13 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
 def _run_agent_cleanup(reason: str = "") -> dict:
     """到期保护清仓（**持 _tick_lock**，与 tick 互斥）。
 
-    互斥设计：清仓要「撤全部挂单 + 逐仓市价平 + 复查」，与 tick 的下单/重挂止损是
-    互斥序列 —— 两边同时跑会出现「清仓撤完单，tick 又挂回止损」或「tick 正在开会
-    清仓却在平」的打架。所以清仓全程持进程内 _tick_lock（tick 与 /admin/tick 用的是
-    同一把），再加上执行器内部 _op_lock（约束 run/on_entry/on_exit），两层都不放。
+    互斥设计（M2 修正后的事实）：
+    1. 清仓全程持进程内 ``_tick_lock`` —— 与 tick / /admin/tick / hl_monitor（同锁）
+       串行，进程里不可能有第二个写路径在跑；
+    2. 执行器内部再用**进程级** ``_op_lock``（class 属性，所有 Executor 实例共用）
+       兜底 run/on_entry/on_exit；
+    3. 清仓期间置 `agent.cleanup_session()` 标记，让「有仓没止损 → 自动补挂」
+       这类顺手动交易所的路径主动让路（它同时也不再在 kill 态下动手）。
     """
     with _tick_lock:
         ex = build_executor()
@@ -289,6 +292,7 @@ def _agent_check(now_ms=None) -> dict:
         cleanup=_run_agent_cleanup,
         prefix=cfg.alert_prefix,
         log_event=lambda kind, msg, **kw: db.hl_log_event(kind, msg),
+        mode=hl_mode(),
     )
     logger.info("[agent] 到期检查：level=%s source=%s 剩余 %s 天",
                 state.get("level"), state.get("source"), state.get("days_left"))
@@ -305,14 +309,20 @@ def _job_agent_expiry() -> None:
 
 
 def _job_hl_monitor() -> None:
-    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。"""
-    ex = build_executor()
-    if ex is None:
-        return
-    try:
-        ex.run(force_snapshot=True)
-    except Exception as e:                                    # noqa: BLE001
-        logger.exception("HL 执行器监控轮异常: %s", e)
+    """每 5 分钟：快照 + 对账 + 死手开关 + 心跳（与信号 tick 解耦，便于看守判活）。
+
+    **持 _tick_lock**：与 tick / /admin/tick / 到期清仓串行。以前这里不持锁，清仓
+    （持锁）与 monitor（不持锁、自己新建 Executor、自己的实例锁）能同时跑，
+    「清仓撤完单 → monitor 又补挂回去」来回打架（M2）。
+    """
+    with _tick_lock:
+        ex = build_executor()
+        if ex is None:
+            return
+        try:
+            ex.run(force_snapshot=True)
+        except Exception as e:                                    # noqa: BLE001
+            logger.exception("HL 执行器监控轮异常: %s", e)
 
 
 def _job_heartbeat() -> None:

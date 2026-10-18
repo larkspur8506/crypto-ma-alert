@@ -110,10 +110,12 @@ class Config:
         "short_regime_ma": (0, 1000),
     }
 
-    # 字符串配置允许「显式清空」的键：`set_config` 存的是 '""'，而 apply_db 对空串
-    # 一律当作「没传」（那本来是为了别让面板的空输入覆盖默认值）。这两个语义在这个键上
-    # 冲突 —— 手工兜底的有效期就是要能被清掉，所以单独放行。
-    _CLEARABLE_STR = ("hl_agent_valid_until_ms",)
+    # 字符串配置允许「显式清空」的键。
+    # 目前**为空**：`set_config` 存的是 '""'，而 apply_db 对空串一律当「没传」——
+    # 那正是我们想要的语义（面板留空 = 不改动）。曾经把 hl_agent_valid_until_ms
+    # 放进来，结果「保存其它参数」的空输入把手工兜底值抹掉了（M3）；要清空兜底
+    # 走「API 有效期」卡片里的「清除兜底」按钮（显式、单字段、可见）。
+    _CLEARABLE_STR: tuple = ()
 
     def apply_db(self, values: dict) -> "Config":
         # 先解析成 dict，统一做范围/一致性校验后再 setattr
