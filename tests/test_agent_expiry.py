@@ -557,6 +557,10 @@ class TestCheckOnce(Base):
         self.assertNotIn("已撤单", msg)
         self.assertNotIn("已撤掉", msg)
         self.assertEqual(st["cleanup"], "none", "dry 不写 done")
+        # dry 提示不许占用「清仓失败」的 kind（否则真实失败告警会被挤出 24h 窗口）
+        kinds = [r["kind"] for r in self.db.recent_alerts(5)]
+        self.assertIn("agent_expiry_cleanup_off", kinds)
+        self.assertNotIn("agent_expiry_cleanup_fail", kinds)
 
     def test_cleanup_failure_marks_failed_and_next_round_retries(self):
         results = [{"ok": False, "error": "撤单全部失败：签名错误", "closed": []},

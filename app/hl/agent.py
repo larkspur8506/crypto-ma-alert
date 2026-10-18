@@ -855,9 +855,10 @@ def _do_cleanup(db: Any, cfg: Any, notifier: Any, cleanup: Optional[Callable[...
         _alert(db, notifier, KIND_CLEANUP_OK, _text_cleanup_ok(until, n, prefix),
                dedup=False)
     elif res.get("ok"):
-        # 影子模式：一张单都没发，文案如实说「未发送任何指令」，不写 done
-        _alert(db, notifier, KIND_CLEANUP_FAIL,
-               _text_cleanup_dry(until, n, prefix))
+        # 影子模式：一张单都没发，文案如实说「未发送任何指令」，不写 done。
+        # 用 cleanup_off 这个 kind（「未自动清仓」），**不能**用 cleanup_fail：
+        # 否则一条 dry 提示会把同 kind 的真实失败告警挤出 24h 窗口。
+        _alert(db, notifier, KIND_CLEANUP_OFF, _text_cleanup_dry(until, n, prefix))
     else:
         state["cleanup"] = "failed"
         _alert(db, notifier, KIND_CLEANUP_FAIL,
