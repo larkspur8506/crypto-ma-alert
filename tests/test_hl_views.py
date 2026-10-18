@@ -140,9 +140,13 @@ class TestHtmlPage(BaseCase):
         self.db.mark_feed("BTC_USDT", "binance", True)
         r = self.client.get("/hl")
         self.assertEqual(r.status_code, 200)
-        for text in ("账户", "权益曲线", "仓位", "交易所挂单", "下单记录",
-                     "最近成交", "信号", "系统"):
+        for text in ("账户", "权益曲线", "仓位", "交易所挂单", "系统"):
             self.assertIn(text, r.text, f"缺少区块：{text}")
+        # 2026-10-18：下单记录 / 最近成交 / 信号 三张历史表已从总览（含 /hl 这张
+        # 独立页，同一份 _render_body）迁到 /admin?tab=records → 这里断言"不再出现"。
+        # 用 <h2> 锚点：「信号源固定 hl-candle」这类正文里也有「信号」二字
+        for gone in ("<h2>下单记录", "<h2>最近成交", "<h2>信号</h2>"):
+            self.assertNotIn(gone, r.text, f"总览不该再有历史表：{gone}")
         # 数据真的渲染进去了
         self.assertIn("BTC", r.text)
         self.assertIn("多", r.text)
@@ -219,7 +223,8 @@ class TestHtmlPage(BaseCase):
         html = self.client.get("/hl").text
         self.assertIn("+42.00 U", html)      # 今日已实现
         self.assertIn("-0.25 U", html)       # 累计手续费（负号）
-        self.assertIn(">0.2500<", html)      # 成交表里手续费列 4 位小数
+        # 成交表（含手续费 4 位小数）2026-10-18 已迁到 /admin?tab=records，
+        # 那条断言在 tests/test_admin_ui.py TestRecordsTab 里覆盖。
         # 资金费按收付视角渲染（正=收入）：快照里 sinceOpen=-1.5 = 收 1.5U
         self.assertIn("+1.50 U", html)
 
@@ -652,8 +657,7 @@ class TestRenderOnly(BaseCase):
     def test_render_dashboard_contains_chinese_titles(self):
         from app.hl.views import render_dashboard
         html = render_dashboard(self.payload())
-        for text in ("Hyperliquid 执行器监控", "账户", "仓位", "权益曲线",
-                     "最近成交", "系统"):
+        for text in ("Hyperliquid 执行器监控", "账户", "仓位", "权益曲线", "系统"):
             self.assertIn(text, html)
 
     def test_render_dashboard_stop_marks(self):

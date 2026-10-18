@@ -5,7 +5,8 @@
 - ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/权益曲线区块）
 - ``params``   参数 —— 策略 / 执行与推送 / 资金 三组，显示来源（DB·env·默认）与影响预览
 - ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）、推送开关、kill switch
-- ``records``  记录 —— hl_orders / hl_fills / alert_logs / hl_events 四张表
+- ``records``  记录 —— hl_orders / hl_fills / signals / alert_logs / hl_events 五块
+  （「信号」2026-10-18 从总览迁入，复用 hl/views._signals_html）
 
 兼容（见 docs/ADMIN_MERGE_PLAN.md 第 2 节「保留」）：
 - ``/hl``、``/admin/rules``、``/admin/logs`` 三个旧 GET → 302 到新位置（书签/已发消息里的链接不断）
@@ -31,8 +32,8 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
-from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _kv,
-                        _render_body, normalize_rows, status_payload)
+from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
+                        _kv, _render_body, _signals_html, normalize_rows, status_payload)
 from app.ui_theme import (THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
 
@@ -77,7 +78,7 @@ def rows_switch_html(tab: str, current: int, k: str = "") -> str:
         cls = "btn" if n == cur else "btn gray"
         links.append(f"<a class='{cls}' href='/admin/rows?n={n}&tab={_esc(tab)}&k={q}'>{n}</a>")
     return ("<div class='foot'><span class='muted'>每页行数：</span>" + " ".join(links)
-            + "<span class='muted'>&nbsp;（历史类长表；信号与曲线不受影响）</span></div>")
+            + "<span class='muted'>&nbsp;（历史类长表；权益曲线不受影响）</span></div>")
 
 
 TABS: Tuple[Tuple[str, str], ...] = (
@@ -762,7 +763,14 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
 
 
 # ---------------------------------------------------------------- 记录 Tab
-def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
+def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
+                   signals: Optional[List[Dict[str, Any]]] = None) -> str:
+    """记录页五块：下单记录 → 成交 → 信号 → 提醒日志 → 执行器事件。
+
+    ``signals`` 来自 ``payload["signals"]``（hl/views.status_payload 构造）；缺省
+    None 时按空表渲染「暂无信号」（直接调 render_records 的老调用点不会炸）。
+    信号块与总览原来是同一份渲染代码 —— 这里直接复用 ``views._signals_html``。
+    """
     n = normalize_rows(rows_n)
     o: List[str] = []
     o.append("<h2>记录</h2>")
@@ -795,16 +803,11 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
     # ---- 成交 ----
     o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）</div>")
     rows = ""
-    # 买卖方向由 dir 推导（2026-10-15 修）：side 是多空方向不是买卖方向，
-    # 以前 side>=0→买 把「平多（卖出）」也标成买。四向口径：
-    # Open Long / Close Short = 买；Close Long / Open Short = 卖。
-    _BS = {"Open Long": "买", "Close Short": "买",
-           "Close Long": "卖", "Open Short": "卖"}
     for r in _rows(deps, "hl_recent_fills", n):
         cp = _opt_num(r.get("closed_pnl"))
         cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
         d = str(r.get("dir") or "")
-        bs = _BS.get(d, "—")
+        bs = _FILL_BS.get(d, "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('ts') or r.get('created_at'))}</td>"
                  f"<td>{_esc(r.get('coin') or _coin('', r.get('symbol')))}</td>"
                  f"<td>{bs}</td>"
@@ -818,6 +821,12 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS) -> str:
                     "<th class='num'>平仓盈亏</th><th>减仓</th>",   # 列名「减仓」= 这笔是不是平仓性质
                     rows, "暂无成交记录", 8))
     o.append("</div>")
+
+    # ---- 信号 ----（2026-10-18 从总览迁入；顺序与总览原顺序一致：成交之后）
+    # 用 _signals_html 渲染（自带 <h2>信号</h2> + 表格，与总览那一块逐字相同），
+    # 外面只套 card 边框、不再加 sec 标题 —— 否则「信号」会出现两次。
+    # 切片用 n：以前总览整表渲染，仓位历史一长页面就无限变长（顺手按每页行数收口）。
+    o.append("<div class='card'>" + _signals_html(list(signals or [])[:n]) + "</div>")
 
     # ---- 提醒日志 ----
     o.append(f"<div class='card'><div class='sec'>提醒日志（alert_logs · 最近 {n} 条）</div>")
@@ -1144,7 +1153,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         rows_n = normalize_rows(request.query_params.get("n")
                                 or request.cookies.get(ROWS_COOKIE))
         payload = get_payload(deps)
-        payload["rows"] = rows_n          # 总览的两张长表按这个切片（views._render_body）
+        # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
+        # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
         strip = _status_strip(payload)
         if tab == "overview":
             body = _overview_body(deps, payload)
@@ -1153,7 +1163,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         elif tab == "switch":
             body = render_switch(deps, cfg)
         else:
-            body = render_records(deps, rows_n)
+            body = render_records(deps, rows_n, payload.get("signals"))
         resp = _page(token, tab, strip, body, msg,
                      theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
                      rows_n=rows_n)
