@@ -5,7 +5,7 @@
 2. 可提余额精简文案 + title 悬停。
 3. views 时间为北京时间（无 " UTC" 后缀）。
 4. 数量精度 _fmt_sz（0.00095 不显示 0.00）。
-5. 下单记录标的列用 HL 名（页面不出现 _USDT）。
+5. 下单记录/成交/信号三张表（2026-10-18 起只在记录页）标的列用 HL 名。
 6. 成交方向列翻译 Open Long/Close Short。
 7. keyform 成功页不再拼「已存在/拒绝覆盖」矛盾文案。
 8. main.py 重定向 k= 已 urlencode。
@@ -67,15 +67,25 @@ class TestViewsDisplay(unittest.TestCase):
         self.assertEqual(views._fmt_sz(12.3), "12.30")
         self.assertEqual(views._fmt_sz(None), "—")
 
-    def test_dir_txt(self):
-        from app.hl import views
-        self.assertEqual(views._DIR_TXT["Open Long"], "开多")
-        self.assertEqual(views._DIR_TXT["Close Short"], "平空")
+    def test_fill_buy_sell_mapping(self):
+        """成交「买卖」列四向推导（原 _DIR_TXT 只给总览那张 9 列表的「方向」列用，
+        表迁走后随之删除；记录页只显示买卖，口径仍是同一份映射）。"""
+        from app.hl.views import _FILL_BS
+        self.assertEqual(_FILL_BS["Open Long"], "买")
+        self.assertEqual(_FILL_BS["Close Short"], "买")
+        self.assertEqual(_FILL_BS["Close Long"], "卖")
+        self.assertEqual(_FILL_BS["Open Short"], "卖")
 
     def test_orders_symbol_disp(self):
-        from app.hl import views
-        src = open(views.__file__, encoding="utf-8").read()
-        self.assertIn('_td(_esc(_disp(od.get("symbol")) or "—"))', src)
+        """记录页「下单记录」标的列不渲染 MEXC 名（_USDT）。
+
+        原来钉的是总览那段源码字符串；2026-10-18 该表迁到记录页（admin_ui.render_records，
+        取数走 _rows + _coin 归一），所以改钉记录页的行为而不是总览的源码文本。
+        """
+        from app.admin_ui import _coin
+        self.assertEqual(_coin("BTC", "BTC_USDT"), "BTC")     # coin 优先
+        self.assertEqual(_coin("", "BTC_USDT"), "BTC")         # 缺 coin → 从 symbol 截
+        self.assertEqual(_coin(None, None), "—")
 
     def test_withdrawable_copy(self):
         from app.hl import views
@@ -90,14 +100,23 @@ class TestViewsDisplay(unittest.TestCase):
         self.assertNotIn('_kv("永续口径', src)
 
     def test_fills_render_capped(self):
-        """成交表渲染必须截断（不能全量渲染）：2026-10-15 起改成按「每页行数」设置
-        （默认 20，可切 10/20/50）；下拉数据的取数上限仍在。"""
+        """成交/下单/信号三表渲染必须截断（不能全量渲染）。
+
+        2026-10-15 起按「每页行数」设置（默认 20，可切 10/20/50）；2026-10-18 三表从
+        总览迁到记录页 —— 切片改由 render_records 的 n 做（_signal 块显式 [:n]），
+        下拉数据的取数上限（fills_out[:100]）仍在 views.status_payload。
+        """
         from app.hl import views
-        src = open(views.__file__, encoding="utf-8").read()
-        self.assertIn("DEFAULT_ROWS = 20", src)
-        self.assertIn("rows_n = rows_of(p)", src)
-        self.assertIn("[:rows_n]", src)
-        self.assertIn('fills_out[:100]', src)
+        import app.admin_ui as A
+        vsrc = open(views.__file__, encoding="utf-8").read()
+        asrc = open(A.__file__, encoding="utf-8").read()
+        self.assertIn("DEFAULT_ROWS = 20", vsrc)
+        self.assertIn('fills_out[:100]', vsrc)             # JSON 侧仍截断
+        self.assertIn("def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS",
+                      asrc)
+        self.assertIn('_rows(deps, "hl_recent_fills", n)', asrc)
+        self.assertIn('_rows(deps, "hl_recent_orders", n)', asrc)
+        self.assertIn("_signals_html(list(signals or [])[:n])", asrc)
 
 
 class TestKeyformSuccessPage(unittest.TestCase):

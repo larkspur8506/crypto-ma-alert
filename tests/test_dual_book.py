@@ -82,10 +82,13 @@ class TestPanelSignalTable(unittest.TestCase):
         self.assertAlmostEqual(sig["stop"], 97_000.0)
 
     def test_mexc_row_panel_html_unchanged(self):
-        """渲染层钉住：MEXC 行的数量格仍是原来的 6.00。"""
-        from app.hl.views import _render_body
+        """渲染层钉住：MEXC 行的数量格仍是原来的 6.00。
+
+        2026-10-18：信号表从总览迁到记录页 → 渲染入口改 _signals_html（记录页直接调它）。
+        """
+        from app.hl.views import _signals_html
         self.mexc_row()
-        html = _render_body(self.payload())
+        html = _signals_html(self.payload()["signals"])
         self.assertIn("<h2>信号</h2>", html)
         seg = html.split("<h2>信号</h2>", 1)[1].split("<h2>", 1)[0]
         self.assertIn(">6.00<", seg, "MEXC 行的数量列应仍显示 6.00")
@@ -102,9 +105,9 @@ class TestPanelSignalTable(unittest.TestCase):
         self.assertAlmostEqual(sig["stop"], 83_945.0, msg="HL 仓止损读 actual_stop")
 
     def test_hl_row_panel_html_shows_coin_qty(self):
-        from app.hl.views import _render_body
+        from app.hl.views import _signals_html
         self.hl_row()
-        html = _render_body(self.payload())
+        html = _signals_html(self.payload()["signals"])
         seg = html.split("<h2>信号</h2>", 1)[1].split("<h2>", 1)[0]
         self.assertIn(">0.00084<", seg, "HL 仓数量列应显示真实币量")
         self.assertNotIn(">85.00<", seg, "HL 仓不能显示 MEXC 口径张数")

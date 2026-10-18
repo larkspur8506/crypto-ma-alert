@@ -47,11 +47,11 @@ __all__ = [
     "SCHEMA_VERSION", "MAINNET_DEFAULT", "DashboardDeps",
     "status_payload", "render_dashboard", "build_router",
     "DASH_CSS", "_render_body", "THEME_CSS",
-    "ROW_CHOICES", "DEFAULT_ROWS", "ROWS_COOKIE", "normalize_rows", "rows_of",
+    "ROW_CHOICES", "DEFAULT_ROWS", "ROWS_COOKIE", "normalize_rows", "_signals_html",
 ]
 
 # 长表每页行数（手机优先）：默认 20，面板上可切 10/20/50，选择存 cookie `cma_rows`。
-# 只作用于「记录/历史」类长表；「信号」表（仓位历史）与权益曲线不受它影响。
+# 只作用于「记录/历史」类长表（记录页的下单/成交/信号/提醒/事件五块）；权益曲线不受影响。
 ROW_CHOICES = (10, 20, 50)
 DEFAULT_ROWS = 20
 ROWS_COOKIE = "cma_rows"
@@ -62,12 +62,14 @@ MAINNET_DEFAULT = "https://api.hyperliquid.xyz"
 
 _MODE_TXT = {"off": "只提醒", "dry": "影子", "live": "实盘"}
 _MODE_CLS = {"off": "muted", "dry": "warn", "live": "neg"}
-_PURPOSE_TXT = {"entry": "开仓", "stop": "止损", "exit": "平仓"}
-_ORDER_ST_TXT = {"intent": "待发", "planned": "计划", "sent": "已发", "resting": "挂单",
-                 "filled": "成交", "cancelled": "撤单", "failed": "失败", "skipped": "跳过"}
+# 信号表状态 → 中文（_signals_html 用；记录页复用同一映射）
 _ST_TXT = {"pending": "待确认", "open": "持仓中", "closed": "已平仓", "ignored": "已忽略"}
-_EV_TXT = {"decision": "决策", "order": "下单", "reconcile": "对账", "kill": "熔断",
-           "error": "错误", "heartbeat": "心跳"}
+
+# 成交「买卖」列的四向推导（side 是多空方向不是买卖方向 —— 平多其实是卖出）。
+# 总览的成交表 2026-10-18 迁到记录页后，这里是唯一口径源，记录页 import 复用
+# （别在 admin_ui 里再抄一份）。
+_FILL_BS = {"Open Long": "买", "Close Short": "买",
+            "Close Long": "卖", "Open Short": "卖"}
 
 
 # ---------------------------------------------------------------- 依赖注入
@@ -168,18 +170,6 @@ def normalize_rows(v: Any) -> int:
     except (TypeError, ValueError):
         return DEFAULT_ROWS
     return n if n in ROW_CHOICES else DEFAULT_ROWS
-
-
-def rows_of(payload: Any) -> int:
-    """本次渲染要用的行数（admin_ui 读 cookie 后注入 payload['rows']）。"""
-    return normalize_rows((payload or {}).get("rows"))
-
-
-_DIR_TXT = {
-    "Open Long": "开多", "Close Long": "平多",
-    "Open Short": "开空", "Close Short": "平空",
-    "Short > Long": "翻多", "Long > Short": "翻空",
-}
 
 
 def _fmt_sz(v: Any) -> str:
@@ -952,19 +942,45 @@ def _sign(v: Any, unit: str = " U") -> tuple:
     return f"{f:+,.2f}{unit}", cls
 
 
+def _signals_html(signals: list) -> str:
+    """「信号」表（仓位历史）的 HTML 片段：标题 + 表格，仅此一块。
+
+    2026-10-18 从总览迁到 /admin?tab=records（用户要求：总览只看当下，历史表格归记录页）。
+    渲染逻辑原样保留：状态文案走 _ST_TXT，open=pos / pending=warn 着色，
+    数量用 _fmt_sz（HL 仓是真实币量 0.00084，不能显示成 0.00）。
+    """
+    o: List[str] = []
+    o.append("<h2>信号</h2>")
+    o.append("<div class='tablewrap'><table><thead><tr>"
+             "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
+             "<th class='num'>止损</th><th class='num'>数量</th><th>信号 bar</th>"
+             "</tr></thead><tbody>")
+    rows = _as_list(signals)
+    for sg in (_as_dict(x) for x in rows):
+        st = str(sg.get("status") or "—")
+        st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
+        o.append("<tr>"
+                 + _td(_esc(sg.get("coin") or _disp(sg.get("symbol")) or "—"))
+                 + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>")
+                 + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
+                 + _td(_fmt(sg.get("entry")), "num")
+                 + _td(_fmt(sg.get("stop")), "num")
+                 + _td(_fmt_sz(sg.get("qty")), "num")
+                 + _td(_fmt_dt(sg.get("bar_ms")), "num")
+                 + "</tr>")
+    if not rows:
+        o.append("<tr><td colspan='7' class='muted'>暂无信号</td></tr>")
+    o.append("</tbody></table></div>")
+    return "".join(o)
+
+
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
-    # 长表每页行数（面板可切 10/20/50，默认 20）：只影响历史类长表
-    rows_n = rows_of(p)
     net = _as_dict(p.get("network"))
     acc = _as_dict(p.get("account"))
     system = _as_dict(p.get("system"))
     positions = _as_list(p.get("positions"))
     orders_open = _as_list(p.get("orders_open"))
-    orders_recent = _as_list(p.get("orders_recent"))
-    fills = _as_list(p.get("fills"))
-    signals = _as_list(p.get("signals"))
-    events = _as_list(p.get("events"))
     curve = _as_dict(p.get("equity_curve"))
     kill = bool(p.get("kill"))
     kill_reason = p.get("kill_reason") or ""
@@ -1004,7 +1020,7 @@ def _render_body(p: dict) -> str:
 
     if not reachable:
         o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
-                 f"<span class='muted'>交易所侧数据暂不可用；下方仍显示数据库里的信号、下单与成交记录。</span></div>")
+                 f"<span class='muted'>交易所侧数据暂不可用；信号 / 下单 / 成交记录见「记录」页。</span></div>")
 
     # ---------------- 三标的动态 ----------------
     # 位置由需求钉死：总览页最顶部、tabs 之后第一个区块（在「账户」卡片之前），
@@ -1116,7 +1132,7 @@ def _render_body(p: dict) -> str:
     if not positions:
         o.append(f"<tr><td colspan='12' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
-                 f"（信号见下方「信号」）</td></tr>")
+                 f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
     o.append("</tbody></table></div>")
 
     # ---------------- 挂单 ----------------
@@ -1142,89 +1158,11 @@ def _render_body(p: dict) -> str:
         o.append("<tr><td colspan='7' class='muted'>交易所无挂单</td></tr>")
     o.append("</tbody></table></div>")
 
-    # ---------------- 下单记录 ----------------
-    o.append(f"<h2>下单记录（最近 {rows_n} 条）</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>时间</th><th>标的</th><th>用途</th><th>状态</th><th class='num'>数量</th>"
-             "<th class='num'>下单价</th><th class='num'>成交量</th><th class='num'>均价</th>"
-             "<th>错误</th></tr></thead><tbody>")
-    for od in list(_as_dict(x) for x in orders_recent)[:rows_n]:
-        st = str(od.get("status") or "—")
-        st_cls = "neg" if st == "failed" else ("warn" if st in ("intent", "sent") else "")
-        err = str(od.get("error") or "")
-        o.append("<tr>"
-                 + _td(_fmt_dt(od.get("updated_at")), "num")
-                 + _td(_esc(_disp(od.get("symbol")) or "—"))
-                 + _td(_esc(_PURPOSE_TXT.get(str(od.get("purpose")), od.get("purpose") or "—")))
-                 + _td(f"<span class='{st_cls}'>{_esc(_ORDER_ST_TXT.get(st, st))}</span>")
-                 + _td(_fmt_sz(od.get("sz")), "num")
-                 + _td(_fmt(od.get("px")), "num")
-                 + _td(_fmt(od.get("filled_sz")), "num")
-                 + _td(_fmt(od.get("avg_px")), "num")
-                 + _td(f"<span class='muted'>{_esc(err[:60] or '—')}</span>")
-                 + "</tr>")
-    if not orders_recent:
-        o.append("<tr><td colspan='9' class='muted'>暂无下单记录</td></tr>")
-    o.append("</tbody></table></div>")
-
-    # ---------------- 最近成交 ----------------
-    o.append(f"<h2>最近成交（最近 {rows_n} 条）</h2>")
-    # 表头 9 列（2026-10-15 修）：上一版加了「买/卖」列但没改表头，8 列表头配 9 格数据行，
-    # 从「数量」起整行左移一格 —— 数量列显示买/卖、价格列显示数量、手续费列显示价格。
-    o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
-             "<th class='num'>价格</th><th class='num'>手续费</th><th>方向</th>"
-             "<th class='num'>平仓盈亏</th><th>减仓</th></tr></thead><tbody>")
-    # 只渲染最近 rows_n 条（fills_out 本身就按新→旧排）；全量渲染会让页面随成交数无限变长
-    for f in list(_as_dict(x) for x in fills)[:rows_n]:
-        cp_txt, cp_cls = _sign(f.get("closed_pnl"))
-        d = str(f.get("dir") or "")
-        # 买卖方向由 dir 推导（审计三轮 M9）：side 是多空方向，Close Long 实为卖出、
-        # Close Short 实为买入 —— 以前拿 side 反推会把平仓方向显示反。
-        # 推导口径（开仓=按方向，平仓=反方向）：Open Long/Close Short=买、
-        # Close Long/Open Short=卖。此前 startswith("Close")→卖 会把 Close Short（买入平空）标成卖。
-        _bs = "买" if d in ("Open Long", "Close Short") else (
-            "卖" if d in ("Close Long", "Open Short") else "—")
-        o.append("<tr>"
-                 + _td(_fmt_dt(f.get("ts")), "num")
-                 + _td(_esc(f.get("coin") or "—"))
-                 + _td(_bs)
-                 + _td(_fmt_sz(f.get("sz")), "num")
-                 + _td(_fmt(f.get("px")), "num")
-                 + _td(_fmt(f.get("fee"), 4), "num")
-                 + _td(_esc(_DIR_TXT.get(d, d or "—")))
-                 + _td(cp_txt, f"num {cp_cls}".strip())
-                 + _td("是" if f.get("reduce_only") else "—")
-                 + "</tr>")
-    if not fills:
-        o.append("<tr><td colspan='9' class='muted'>暂无成交记录</td></tr>")
-    o.append("</tbody></table></div>")
-
-    # ---------------- 信号 ----------------
-    o.append("<h2>信号</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
-             "<th class='num'>止损</th><th class='num'>数量</th><th>信号 bar</th>"
-             "</tr></thead><tbody>")
-    for sg in (_as_dict(x) for x in signals):
-        st = str(sg.get("status") or "—")
-        st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
-        o.append("<tr>"
-                 + _td(_esc(sg.get("coin") or _disp(sg.get("symbol")) or "—"))
-                 + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>")
-                 + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
-                 + _td(_fmt(sg.get("entry")), "num")
-                 + _td(_fmt(sg.get("stop")), "num")
-                 + _td(_fmt_sz(sg.get("qty")), "num")
-                 + _td(_fmt_dt(sg.get("bar_ms")), "num")
-                 + "</tr>")
-    if not signals:
-        o.append("<tr><td colspan='7' class='muted'>暂无信号</td></tr>")
-    o.append("</tbody></table></div>")
-
     # ---------------- 系统卡片 ----------------
-    # 注：原来的「执行器事件」表已从总览移除（2026-10-15 用户反馈：与「记录」页
-    # 的 hl_events 表完全重复）。要事件去 /admin?tab=records。
+    # 注：「下单记录」「最近成交」两张表已从总览移除（2026-10-18 用户要求：与「记录」页
+    # 的 hl_orders / hl_fills 完全重复 → 去 /admin?tab=records 看）。
+    # 更早的「执行器事件」表同理（2026-10-15 移除）。「信号」表也在本次迁到记录页，
+    # 渲染函数保留为 _signals_html（记录页复用它，两边长得一样）。
     o.append("<h2>系统</h2>")
     o.append("<div class='card'><div class='grid'>")
     o.append(_kv("执行器最后事件", _fmt_dt(system.get("executor_last_event_at"))))

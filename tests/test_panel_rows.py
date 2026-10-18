@@ -3,7 +3,7 @@
 验收点：
 - 默认每页 20 行；?n=10 / ?n=50 可切；非法值一律回落默认（展示层，不影响任何写路径）
 - 页脚「每页行数」链接 → /admin/rows 设 cookie 后 302 回原 tab，cookie 记住选择
-- 总览的「下单记录 / 最近成交」跟随同一设置，且标题写明「最近 N 条」
+- 记录页「成交」跟随同一设置（总览的「下单记录 / 最近成交」2026-10-18 已迁到记录页）
 - 总览不再有「执行器事件」（与记录页重复）；记录页仍有
 - 提醒日志「类型」列显示中文（exec_alert_fills → 执行器成交回报）
 - 回填历史（message 以「[回填] 」开头）出现时，区块上方给出口径说明
@@ -104,7 +104,13 @@ class TestRecordsRows(BaseCase):
         self.assertNotIn("REC-039", html)
 
 
-class TestOverviewRows(BaseCase):
+class TestRecordsTableRows(BaseCase):
+    """成交表跟随「每页行数」，且标题写明「最近 N 条」。
+
+    2026-10-18：这张表原来在总览（h2 标题），现在只在记录页（卡片 sec 标题）——
+    断言位置跟着搬，行数口径不变。
+    """
+
     @staticmethod
     def _count_rows(html: str, title: str) -> int:
         m = re.search(re.escape(title) + r".*?</thead><tbody>(.*?)</tbody>", html, re.S)
@@ -114,17 +120,40 @@ class TestOverviewRows(BaseCase):
     def test_recent_fills_follows_setting(self):
         for i in range(30):
             _fill(self.db, i)
-        html = self.body(tab="overview")
-        self.assertEqual(self._count_rows(html, "最近成交（最近 20 条）"), 20)
-        html = self.body(tab="overview", n=50)
-        self.assertEqual(self._count_rows(html, "最近成交（最近 50 条）"), 30)
-        html = self.body(tab="overview", n=10)
-        self.assertEqual(self._count_rows(html, "最近成交（最近 10 条）"), 10)
+        html = self.body(tab="records")
+        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 20 条）"), 20)
+        html = self.body(tab="records", n=50)
+        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 50 条）"), 30)
+        html = self.body(tab="records", n=10)
+        self.assertEqual(self._count_rows(html, "成交（hl_fills · 最近 10 条）"), 10)
 
     def test_orders_title_shows_count(self):
         self.db.hl_record_intent("BTC_USDT", "BTC", BAR, "entry", 1, 0.005, px=100_000.0)
+        html = self.body(tab="records")
+        self.assertIn("下单记录（hl_orders · 最近 20 条）", html)
+
+    def test_signals_follow_setting(self):
+        """信号块也用同一 n 切片（迁入记录页时就按这个口径做）。"""
+        for i in range(30):
+            self.db.create_position(
+                symbol="BTC_USDT", signal_bar_ms=BAR + i, status="open", side=1,
+                entry_price=100_000.0 + i, stop_price=97_000.0, stop_dist=0.03,
+                contracts=6, coin_qty=0.0006, notional=60.0, risk_u=18.0,
+                equity_at_entry=1000.0)
+        for n, want in ((20, 20), (50, 30), (10, 10)):
+            html = self.body(tab="records", n=n)
+            seg = html.split("<h2>信号</h2>", 1)[1].split("</table>", 1)[0]
+            got = len(re.findall(r"<tr>", seg.split("</thead><tbody>", 1)[1]))
+            self.assertEqual(got, want, f"n={n} 时信号行数不对")
+
+    def test_overview_has_no_long_tables(self):
+        """总览不再有长表 → 「每页行数」在那里只是页脚设置，不影响任何表。"""
+        for i in range(30):
+            _fill(self.db, i)
         html = self.body(tab="overview")
-        self.assertIn("下单记录（最近 20 条）", html)
+        self.assertNotIn("最近成交（最近", html)
+        self.assertNotIn("下单记录（最近", html)
+        self.assertNotIn("<h2>信号</h2>", html)
 
 
 class TestEventsNotOnOverview(BaseCase):

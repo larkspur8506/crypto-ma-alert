@@ -208,17 +208,33 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "权益曲线", "下单记录", "仓位", "交易所挂单"):
+        for s in ("账户总值", "权益曲线", "仓位", "交易所挂单", "API 有效期"):
             self.assertIn(s, html)
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
+        # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
+        # （前两张记录页本来就有；信号是本次新增）。总览只剩"当下"信息。
+        for gone in ("<h2>下单记录", "<h2>最近成交", "<h2>信号</h2>", "最近成交（最近"):
+            self.assertNotIn(gone, html, f"总览不该再有历史表：{gone}")
+
+    def test_overview_keeps_current_state_blocks(self):
+        """迁走三张表后，总览的当下块必须还在（仓位/挂单/系统/API 有效期）。"""
+        html = self.body(tab="overview")
+        for keep in ("<h2>仓位</h2>", "<h2>交易所挂单</h2>", "<h2>系统</h2>",
+                     "<h2>权益曲线</h2>", "<h2>API 有效期</h2>"):
+            self.assertIn(keep, html, f"总览缺少当下块：{keep}")
+        # 三标的动态（用户钉死在 tabs 之后第一块）仍在
+        self.assertIn("三标的动态", html)
 
     def test_overview_reuses_hl_body_without_duplicate_title(self):
         html = self.body(tab="overview")
         self.assertEqual(html.count("<h1>"), 1, "整页只能有一个 <h1>（hl 自带标题已剥掉）")
         # <h2> 区块是 hl/views._render_body 的产物，admin_ui 自己一个 <h2> 都不渲染
-        for h2 in ("<h2>仓位</h2>", "<h2>权益曲线</h2>", "<h2>下单记录（最近 20 条）</h2>"):
+        # （记录页的五块用 <div class='sec'> 标题，不用 <h2>）
+        for h2 in ("<h2>仓位</h2>", "<h2>权益曲线</h2>", "<h2>交易所挂单</h2>"):
             self.assertIn(h2, html, f"总览应内嵌 _render_body 的 {h2}")
+        # 下单记录已迁走 → 总览的 <h2> 计数也随之减少（防"删了又长回来"）
+        self.assertNotIn("<h2>下单记录", html)
 
     def test_status_strip_is_always_present(self):
         for tab in ("overview", "params", "switch", "records"):
@@ -440,8 +456,38 @@ class TestRecordsTab(BaseCase):
 
     def test_records_200_with_key_blocks(self):
         html = self.body(tab="records")
-        for s in ("下单记录", "成交", "提醒日志", "执行器事件", "hl_orders", "hl_fills"):
+        for s in ("下单记录", "成交", "信号", "提醒日志", "执行器事件",
+                  "hl_orders", "hl_fills"):
             self.assertIn(s, html)
+
+    def test_records_signal_block_after_fills(self):
+        """信号块必须在「成交」之后、提醒日志之前（与总览原顺序一致）。"""
+        html = self.body(tab="records")
+        i_orders = html.index("下单记录（hl_orders")
+        i_fills = html.index("成交（hl_fills")
+        i_signals = html.index("<h2>信号</h2>")
+        i_alerts = html.index("提醒日志（alert_logs")
+        i_events = html.index("执行器事件（hl_events")
+        self.assertLess(i_orders, i_fills)
+        self.assertLess(i_fills, i_signals, "信号块应紧跟「成交」之后")
+        self.assertLess(i_signals, i_alerts)
+        self.assertLess(i_alerts, i_events)
+        # 信号块用 _signals_html 渲染（与总览同一函数），标题只出现一次
+        self.assertEqual(html.count("<h2>信号</h2>"), 1, "信号标题重复渲染了")
+
+    def test_records_signal_block_renders_rows(self):
+        # 信号数据源是 positions 表（payload["signals"]），不是 hl_orders
+        self.db.create_position(symbol="BTC_USDT", signal_bar_ms=1_700_000_000_000,
+                                status="open", side=1, entry_price=100_000.0,
+                                stop_price=97_000.0, stop_dist=0.03, contracts=6,
+                                coin_qty=0.0006, notional=60.0, risk_u=18.0,
+                                equity_at_entry=1000.0)
+        html = self.body(tab="records")
+        seg = html.split("<h2>信号</h2>", 1)[1].split("<h2>", 1)[0]
+        self.assertIn("<th>信号 bar</th>", seg)
+        self.assertIn("BTC", seg)
+        self.assertIn("持仓中", seg)                    # status=open → _ST_TXT
+        self.assertNotIn("暂无信号", seg)
 
     def test_records_shows_rows(self):
         html = self.body(tab="records")
@@ -485,7 +531,8 @@ class TestRecordsTab(BaseCase):
                 raise RuntimeError("boom: db 挂了")
         self.deps.db = FakeBroken()
         html = self.body(tab="records")
-        for s in ("暂无下单记录", "暂无成交记录", "暂无提醒日志", "暂无执行器事件"):
+        for s in ("暂无下单记录", "暂无成交记录", "暂无信号",
+                  "暂无提醒日志", "暂无执行器事件"):
             self.assertIn(s, html)
 
 

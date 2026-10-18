@@ -1,9 +1,12 @@
-"""2026-10-15 面板修复回归：最近成交表列对齐 + 买卖方向四向映射 + 主题三态开关。
+"""2026-10-15 面板修复回归：成交表列对齐 + 买卖方向四向映射 + 主题三态开关。
 
-背景：第三轮审计 P2 给总览「最近成交」加了买/卖列但没改表头（8 列表头配 9 格数据行，
+背景：第三轮审计 P2 给「最近成交」加了买/卖列但没改表头（8 列表头配 9 格数据行，
 从「数量」起整行左移一格）；两处「买/卖」的方向推导也不对（记录 Tab 用 side 反推
 把平多标成买；总览把 Close Short 标成卖）。主题则是硬编码深色，用户要求
 黑 / 白 / 跟随系统 三态可切换。
+
+2026-10-18：总览的「最近成交」整表迁到记录页 → 本文件里原来断言总览那张 9 列表的
+用例改成断言记录页 8 列的成交表（口径不变：买卖四向、价格/数量各归各位）。
 """
 import os
 import re
@@ -129,52 +132,55 @@ if FastAPI is not None:
         """表头 9 列 + 数据 9 格 + 列序对齐（回归本 bug）。"""
 
         def _rows(self, html):
-            m = re.search(r"最近成交（最近 \d+ 条）</h2>.*?<tbody>(.*?)</tbody>", html, re.S)
-            self.assertIsNotNone(m, "找不到最近成交表")
+            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<tbody>(.*?)</tbody>", html, re.S)
+            self.assertIsNotNone(m, "找不到记录页成交表")
             out = []
             for tr in re.findall(r"<tr>(.*?)</tr>", m.group(1), re.S):
                 cells = [re.sub(r"<[^>]+>", "", c).strip()
                          for c in re.findall(r"<td[^>]*>(.*?)</td>", tr, re.S)]
-                self.assertEqual(len(cells), 9, f"数据行必须 9 格，实际 {len(cells)}")
+                self.assertEqual(len(cells), 8, f"数据行必须 8 格，实际 {len(cells)}")
                 out.append(cells)
             return out
 
-        def test_overview_header_has_9_columns_in_order(self):
-            html = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
-            m = re.search(r"最近成交（最近 \d+ 条）</h2>.*?<thead><tr>(.*?)</tr></thead>", html, re.S)
+        def test_records_header_has_8_columns_in_order(self):
+            html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
+            m = re.search(r"成交（hl_fills · 最近 \d+ 条）.*?<thead><tr>(.*?)</tr></thead>",
+                          html, re.S)
             self.assertIsNotNone(m)
             heads = [re.sub(r"<[^>]+>", "", h).strip()
                      for h in re.findall(r"<th[^>]*>(.*?)</th>", m.group(1), re.S)]
             self.assertEqual(heads, ["时间", "币种", "买卖", "数量", "价格",
-                                     "手续费", "方向", "平仓盈亏", "减仓"])
+                                     "手续费", "平仓盈亏", "减仓"])
 
-        def test_overview_row_cells_match_columns(self):
+        def test_records_row_cells_match_columns(self):
             self.ins_fill("f1", "Open Short", 0.00084, 81621.0, pnl=0.0)
-            html = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
+            html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
             rows = self._rows(html)
             self.assertEqual(len(rows), 1)
             r = rows[0]
             self.assertEqual(r[1], "BTC")
             self.assertEqual(r[2], "卖")                       # 开空=卖出
-            self.assertEqual(r[3], "0.00084")                   # 数量列是数量（不再是买卖）
-            self.assertEqual(r[4], "81,621.00")                 # 价格列是价格（不再是数量）
-            self.assertEqual(r[6], "开空")                       # 方向列是方向文字
+            self.assertEqual(r[3], "0.0008")                   # 数量列是数量（不再是买卖）
+            self.assertEqual(r[4], "81,621.00")                # 价格列是价格（不再是数量）
+            self.assertEqual(r[7], "—")                        # 减仓列 = 非平仓
+            # 总览不再有这张表（迁走了，不是删了）
+            ov = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
+            self.assertNotIn("成交（hl_fills", ov)
+            self.assertNotIn("最近成交（最近", ov)
 
-        def test_buy_sell_four_directions_overview(self):
+        def test_buy_sell_four_directions_on_records(self):
+            """四向买卖映射：记录页成交表的「买卖」列逐行核对。"""
             cases = {"Open Long": "买", "Close Short": "买",
                      "Close Long": "卖", "Open Short": "卖"}
-            for i, (d, want) in enumerate(cases.items()):
-                self.ins_fill(f"f{i}", d, 0.001, 100_000.0,
-                              reduce="Close" in d)
-            html = self.client.get("/admin", params={"k": TOKEN, "tab": "overview"}).text
+            for i, d in enumerate(cases):
+                self.ins_fill(f"f{i}", d, 0.001, 100_000.0 + i, reduce="Close" in d)
+            html = self.client.get("/admin", params={"k": TOKEN, "tab": "records"}).text
             rows = self._rows(html)
-            # 方向列（第 7 格）是 dir 的中文翻译 → 用它反查每行的买卖是否正确
-            dir_txt = {"Open Long": "开多", "Close Short": "平空",
-                       "Close Long": "平多", "Open Short": "开空"}
+            # id DESC → 最后插入的排最前；用价格列（插入时递增）反查每行是哪个方向
+            by_px = {f"{100_000.0 + i:,.2f}": d for i, d in enumerate(cases)}
             got = {}
             for r in rows:
-                d = next(k for k, v in dir_txt.items() if v == r[6])
-                got[d] = r[2]
+                got[by_px[r[4]]] = r[2]
             self.assertEqual(len(got), 4)
             for d, want in cases.items():
                 self.assertEqual(got[d], want, f"{d} 应显示 {want}")
