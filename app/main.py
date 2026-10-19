@@ -546,30 +546,49 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
                      enable_shorts: Optional[str] = Form(None),
                      heartbeat_push: Optional[str] = Form(None),
                      agent_expiry_cleanup: Optional[str] = Form(None),
-                     short_regime_ma: str = Form("200"), k: str = Form("")):
+                     short_regime_ma: Optional[str] = Form(None), k: str = Form("")):
     _require_admin(request, k or None)
+    # 2026-10-19 审查中危回归：**先全部校验、后统一写库**。旧实现边校验边写，
+    # short_regime_ma 非法时 400 返回，但前面的数字和方向开关已经落库（半截写）。
+    nums: dict = {}
     for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
                      ("stop_min", stop_min), ("stop_max", stop_max)]:
         try:
-            num = float(val)
+            nums[key] = float(val)
         except ValueError:
             raise HTTPException(400, f"{key} 不是数字")
+    ma = None
+    if short_regime_ma is not None:            # 缺字段 = 保持原值（与下方开关同口径）
+        try:
+            ma = int(float(short_regime_ma))
+        except ValueError:
+            raise HTTPException(400, "short_regime_ma 不是数字")
+    # ---- 校验全部通过，开始写库 ----
+    for key, num in nums.items():
         # 存成 JSON 数字（不是字符串），避免 json.dumps 加引号让 apply_db 解析失败
         db.set_config(key, num)
-    # 复选框：勾选=1，未勾选=不传 → 0
-    db.set_config("enable_long", 1 if enable_long else 0)
-    db.set_config("enable_shorts", 1 if enable_shorts else 0)
-    db.set_config("heartbeat_push", 1 if heartbeat_push else 0)
+    if ma is not None:
+        db.set_config("short_regime_ma", ma)
+    # 复选框（2026-10-19 事故回归）：**缺字段 = 保持原值**，显式传 0 才关。
+    # 旧语义「不传 = 0」就是那次把线上方向开关静默关掉的向量 —— 老书签/curl
+    # 只想改数字时，方向开关绝不能被顺手清掉。显式值与 app.admin_ui._TRUTHY
+    # 同口径解析：字符串 "0" 是真值，绝不能写 `1 if v else 0`（把「关」写成「开」）。
+    from app.admin_ui import _TRUTHY
+
+    def _flag_like(v: Optional[str]) -> int:
+        return 1 if str(v if v is not None else "").strip().lower() in _TRUTHY else 0
+
+    if enable_long is not None:
+        db.set_config("enable_long", _flag_like(enable_long))
+    if enable_shorts is not None:
+        db.set_config("enable_shorts", _flag_like(enable_shorts))
+    if heartbeat_push is not None:
+        db.set_config("heartbeat_push", _flag_like(heartbeat_push))
     # 老书签的表单里没有这个复选框：**不传 = 保持原值**（不能按「未勾选」清成 0，
     # 否则老页面一提交就把到期保护静默关掉）。显式传 0 才关。
     if agent_expiry_cleanup is not None:
         from app.hl.agent import cleanup_enabled
         db.set_config("agent_expiry_cleanup", 1 if cleanup_enabled(agent_expiry_cleanup) else 0)
-    try:
-        int(float(short_regime_ma))
-    except ValueError:
-        raise HTTPException(400, "short_regime_ma 不是数字")
-    db.set_config("short_regime_ma", int(float(short_regime_ma)))
     return RedirectResponse(f"/admin?tab=params&k={_urlquote(str(k))}", status_code=303)
 
 
