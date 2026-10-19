@@ -235,9 +235,13 @@ def _fmt(v: Any, dp: int = 2) -> str:
 
 
 def _b(v: Any) -> bool:
-    """DB 里 set_config 走 json.dumps，字符串值会带引号，先剥掉再判。"""
+    """DB 里 set_config 走 json.dumps，字符串值会带引号，先剥掉再判。
+
+    truthy 集合与 :func:`_flag` 逐字一致（含 'y'/'t'）——渲染与写入两套口径
+    不一致时，DB 存 'y' 的开关会显示「关」但实际生效为开（审查抓过的偏差）。
+    """
     return str(v if v is not None else "").strip().strip('"\'').lower() in (
-        "1", "true", "yes", "on")
+        "1", "true", "yes", "on", "y", "t")
 
 
 def _ts(v: Any) -> str:
@@ -430,8 +434,6 @@ def _source(db_raw: Dict[str, Any], key: str, env_key: str) -> str:
 
 def _cur_val(cfg: Any, key: str, default: Any, kind: str) -> str:
     raw = getattr(cfg, key, default)
-    if kind == "bool":
-        return "开" if bool(raw) else "关"
     if kind == "int":
         return f"{int(_num(raw, _num(default)))}"
     if kind in ("str", "mode"):
@@ -522,8 +524,11 @@ def _equity_mode_js() -> str:
     """参数页资金组：按「资金口径」单选钮显隐 equity / equity_min（原生 JS，无框架）。
 
     约定：``data-mode`` 标出字段**只属于**哪个模式；选中值不同就 display:none。
-    脚本没跑起来（禁用 JS / 老浏览器）时两个字段都可见 —— 每个字段的 hint 里
-    已写明它属于哪个模式，因此无 JS 的回退是可用的，只是少了一层视觉过滤。
+    同时把隐藏字段的 input 设 ``disabled``（不随表单提交 → 服务端按「缺字段 =
+    保持原值」处理）并同步 ``required`` —— 只 display:none 不够：required 留在
+    隐藏字段上时，浏览器无法聚焦报错，整张表单会**静默提交失败**（审查高危）。
+    脚本没跑起来（禁用 JS / 老浏览器）时两个字段都可见可提交 —— 每个字段的
+    hint 里已写明它属于哪个模式，无 JS 的回退是可用的，只是少一层视觉过滤。
     """
     return (
         "<script>(function(){var f=function(){"
@@ -531,7 +536,10 @@ def _equity_mode_js() -> str:
         "if(!r)return;var m=r.value;"
         "var e=document.querySelectorAll('[data-mode]');"
         "for(var i=0;i<e.length;i++){"
-        "e[i].style.display=(e[i].getAttribute('data-mode')===m)?'':'none';}};"
+        "var on=(e[i].getAttribute('data-mode')===m);"
+        "e[i].style.display=on?'':'none';"
+        "var inp=e[i].querySelector('input');"
+        "if(inp){inp.disabled=!on;inp.required=on;}}};"
         "var g=document.querySelectorAll(\"input[name='equity_mode']\");"
         "for(var j=0;j<g.length;j++){g[j].addEventListener('change',f);}f();})();</script>")
 
@@ -581,9 +589,7 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                 continue
             src = _source(raw, key, env_key)
             hint = _preview_hint(key, cfg, base, live, imp, imp_max)
-            if kind == "bool":
-                o.append(_bool_field(key, label, bool(getattr(cfg, key, default)), hint, src))
-            elif kind == "text":
+            if kind == "text":
                 # 自由文本（可留空）：手工兜底时间戳这类，不能 required
                 cur = _cur_val(cfg, key, default, kind)
                 o.append(f"<div class='field'><div class='lbl'>{_esc(label)}"
@@ -632,7 +638,15 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
 
     def take_float(key: str, name: str, lo: float, hi: Optional[float],
                    strict: bool = True) -> Optional[float]:
-        """strict=True 要求 v > lo（权益/风险率必须为正）；False 允许 v == lo（资金下限可为 0）。"""
+        """strict=True 要求 v > lo（权益/风险率必须为正）；False 允许 v == lo（资金下限可为 0）。
+
+        **键缺失或空值 = 保持原值**（2026-10-19 审查高危回归）：资金组两个字段会随
+        模式被 JS disabled（disabled 的 input 不提交）；且 Starlette 对 Optional[str]
+        的空串同样给 None —— 「空 = 不改动」与手工兜底字段同口径，无法区分
+        「用户清空」与「没提交」，所以两者都不写库、不报错。
+        """
+        if form.get(key) is None:
+            return None
         s = str(form.get(key) or "").strip().replace(",", "")
         if not s:
             errs.append(f"{name} 为空")
@@ -682,11 +696,17 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
             else:
                 out["short_regime_ma"] = n
 
-    mode = str(form.get("equity_mode") or "").strip().lower()
-    if mode not in ("follow", "fixed"):
-        errs.append("资金口径只能是 follow / fixed")
+    # 资金口径：**缺字段 = 保持原值**（2026-10-19 审查高危回归）。旧实现 Form("follow")
+    # 会把老书签/curl 的缺字段请求静默刷成 follow，直接改变下单基数口径。
+    mode_raw = form.get("equity_mode")
+    if mode_raw is None:
+        pass                                   # 缺字段：不写库
     else:
-        out["equity_mode"] = mode
+        mode = str(mode_raw).strip().lower()
+        if mode not in ("follow", "fixed"):
+            errs.append("资金口径只能是 follow / fixed")
+        else:
+            out["equity_mode"] = mode
 
     if sm is not None and sx is not None and sm > sx:
         errs.append(f"止损下限 {sm:g} 不能大于上限 {sx:g}")
@@ -1102,7 +1122,7 @@ def render_agent_card(deps: AdminDeps) -> str:
     o.append("</div>")
     if not src:
         o.append("<div class='hint'>还没读到授信信息：系统每个整点检查一次；"
-                 "也可以在本页下方「API 有效期」参数区填手工兜底的有效期。</div>")
+                 "也可以在本页上方「API 有效期」参数区填手工兜底的有效期。</div>")
     elif src == "manual":
         o.append("<div class='hint'>有效期来自本页参数区的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
@@ -1215,10 +1235,12 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
 
     # ---------------- 参数 ----------------
     @router.post("/admin/params")
-    def admin_params(request: Request, equity: str = Form(""), risk_pct: str = Form(""),
+    def admin_params(request: Request, equity: Optional[str] = Form(None),
+                     risk_pct: str = Form(""),
                      leverage: str = Form(""), stop_min: str = Form(""),
                      stop_max: str = Form(""), short_regime_ma: str = Form(""),
-                     equity_mode: str = Form("follow"), equity_min: str = Form(""),
+                     equity_mode: Optional[str] = Form(None),
+                     equity_min: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
                      k: str = Form("")):
         token = _auth(deps, request, k or None)
@@ -1302,8 +1324,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         if put_errs:
             raise HTTPException(400, "策略与保护保存失败：" + "；".join(put_errs))
         if not vals:
-            # 什么都没带：不写库、不记事件（避免假「已修改」）
-            return RedirectResponse(_back(token, "switch"), status_code=303)
+            # 什么都没带：不写库、不记事件，也不报「已保存」（审查中危：假横幅）
+            return RedirectResponse(_back(token, "switch", "无改动（未提交任何开关）"),
+                                    status_code=303)
         word = {1: "开", 0: "关"}
         deps.log_event("decision",
                        "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s）"
@@ -1321,7 +1344,12 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         raw_vals = {"heartbeat_push": heartbeat_push, "report_push": report_push,
                     "fill_push": fill_push}
-        vals = {key: _flag(val) for key, val in raw_vals.items()}
+        # 缺字段 = 保持原值（2026-10-19 审查中危回归：旧实现缺键 → _flag(None)=0，
+        # 半截表单/curl 会把没带的推送静默关掉）。显式 0 仍照常生效。
+        vals = {key: _flag(val) for key, val in raw_vals.items() if val is not None}
+        if not vals:
+            return RedirectResponse(_back(token, "switch", "无改动（未提交任何开关）"),
+                                    status_code=303)
         put_errs = [e for e in (deps.put(key, val) for key, val in vals.items()) if e]
         if put_errs:
             raise HTTPException(400, "开关保存失败：" + "；".join(put_errs))

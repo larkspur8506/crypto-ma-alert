@@ -26,6 +26,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from urllib.parse import unquote
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -326,9 +327,38 @@ class TestParamsTab(BaseCase):
     def test_params_equity_min_zero_now_rejected(self):
         """审计三轮 M6：面板校验与 Config._RANGES 对齐 —— equity_min=0 直接 400，
         不再「入库成功 + apply_db 静默忽略 + 页面显示已保存」。"""
+        snap = self.db.get_config()
         r = self.post("/admin/params", **self.params_form(equity_min="0"))
         self.assertEqual(r.status_code, 400)
-        self.assertNotIn("equity_min", self._db_vals() if hasattr(self, "_db_vals") else {} or {})
+        self.assertEqual(self.db.get_config(), snap, "校验失败时绝不能写库")
+
+    def test_params_missing_equity_mode_keeps_current(self):
+        """审查高危回归：equity_mode 缺字段/空值（Form(\"follow\") 旧语义）不得静默刷成 follow。"""
+        self.db.set_config("equity_mode", "fixed")
+        form = {k: v for k, v in self.params_form().items() if k != "equity_mode"}
+        r = self.post("/admin/params", **form)
+        self.assertIn(r.status_code, (200, 303))
+        self.assertEqual(self._cfg().equity_mode, "fixed")
+        # 空串经 Starlette 变 None，与缺字段同口径：保持原值
+        r = self.post("/admin/params", **self.params_form(equity_mode=""))
+        self.assertIn(r.status_code, (200, 303))
+        self.assertEqual(self._cfg().equity_mode, "fixed")
+
+    def test_params_missing_funds_field_keeps_current(self):
+        """审查高危回归：被 JS disabled 的资金字段不随表单提交 → 缺键 = 保持原值。"""
+        self.db.set_config("equity", 250.0)
+        self.db.set_config("equity_min", 33.0)
+        # 表单只带 equity（equity_min 被 JS disabled 的形态）：equity 更新、equity_min 不动
+        form = {k: v for k, v in self.params_form().items() if k != "equity_min"}
+        r = self.post("/admin/params", **form)
+        self.assertIn(r.status_code, (200, 303))
+        self.assertEqual(self._cfg().equity_min, 33.0)
+        self.assertEqual(self._cfg().equity, 100.0)
+        # 反过来只带 equity_min：equity 保持上一笔的 100
+        form = {k: v for k, v in self.params_form().items() if k != "equity"}
+        r = self.post("/admin/params", **form)
+        self.assertIn(r.status_code, (200, 303))
+        self.assertEqual(self._cfg().equity, 100.0)
 
     def test_params_saves_modes_and_booleans(self):
         """参数页只管数字/口径：方向与保护类开关**逐键不变**（2026-10-19 事故回归）。
@@ -454,14 +484,17 @@ class TestSwitchTab(BaseCase):
         self.assertTrue(any(e["kind"] == "kill" for e in self.db.hl_recent_events(5)))
 
     def test_notify_switches_persist_new_keys(self):
+        # 2026-10-19 审查中危回归：缺字段 = 保持原值。旧断言「没勾的键落 0」
+        # 钉的正是会静默关推送的危险语义，随本次口径更新。
+        self.db.set_config("fill_push", 1)
         self.post("/admin/switch/notify", heartbeat_push="1", report_push="1")
         self.assertEqual(self.db.get_config_str("heartbeat_push"), "1")
         self.assertEqual(self.db.get_config_str("report_push"), "1")
-        # 没勾的键落 0（成交回报这次没勾）
-        self.assertEqual(self.db.get_config_str("fill_push"), "0")
+        # 没带的键保持原值（此前预置 1）
+        self.assertEqual(self.db.get_config_str("fill_push"), "1")
         self.post("/admin/switch/notify", fill_push="1")
-        self.assertEqual(self.db.get_config_str("heartbeat_push"), "0")
-        self.assertEqual(self.db.get_config_str("report_push"), "0")
+        self.assertEqual(self.db.get_config_str("heartbeat_push"), "1")
+        self.assertEqual(self.db.get_config_str("report_push"), "1")
         self.assertEqual(self.db.get_config_str("fill_push"), "1")
         html = self.body(tab="switch")
         for s in ("每日心跳推送", "日报 / 周报推送", "成交回报推送"):
@@ -762,6 +795,28 @@ class TestFullAppWiring(unittest.TestCase):
             self.assertFalse(mod.current_config().enable_shorts)
             self.assertFalse(mod.current_config().enable_long)
 
+    def test_legacy_rules_validates_before_writing(self):
+        """审查中危回归：先全部校验、后统一写库 —— 非法值 400 时不能有半截落库；
+        short_regime_ma 缺字段 = 保持原值（旧缺省 200 会静默重置做空均线）。"""
+        mod = self._mod()
+        with TestClient(mod.app) as c:
+            keys = ("equity", "enable_long", "short_regime_ma")
+            before = {k: mod.db.get_config().get(k) for k in keys}
+            r = c.post("/admin/rules", data={
+                "equity": "888", "risk_pct": "0.03", "leverage": "4",
+                "stop_min": "0.02", "stop_max": "0.09", "short_regime_ma": "abc",
+                "enable_long": "0", "k": TOKEN}, follow_redirects=False)
+            self.assertEqual(r.status_code, 400)
+            self.assertEqual({k: mod.db.get_config().get(k) for k in keys}, before,
+                             "400 时不能有半截写库")
+            r = c.post("/admin/rules", data={
+                "equity": "777", "risk_pct": "0.03", "leverage": "4",
+                "stop_min": "0.02", "stop_max": "0.09", "k": TOKEN},
+                follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
+            self.assertEqual(mod.db.get_config().get("short_regime_ma"),
+                             before["short_regime_ma"], "缺 ma 字段不许重置为 200")
+
     def test_legacy_hl_mode_and_kill_curl_compat(self):
         mod = self._mod()
         with TestClient(mod.app) as c:
@@ -813,10 +868,6 @@ class TestFullAppWiring(unittest.TestCase):
             self.assertIn("hl_kill", j2)
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestSwitchFlagParsing(BaseCase):
     """开关的取值解析：字符串 '0' 必须落 0。
 
@@ -856,7 +907,7 @@ class TestSwitchFlagParsing(BaseCase):
         self.db.set_config("enable_long", 1)
         r = self.post("/admin/switch/strategy", enable_long="weird")
         self.assertIn(r.status_code, (200, 303))
-        self.assertIn("0", str(self.db.get_config_str("enable_long")))
+        self.assertEqual("0", str(self.db.get_config_str("enable_long")))
 
     def test_strategy_weird_value_cleanup_is_fail_open(self):
         """到期自动清仓：识别不了的值按「开」（沿用旧 _cleanup_on 的 H3 取舍）。
@@ -867,12 +918,29 @@ class TestSwitchFlagParsing(BaseCase):
         self.db.set_config("agent_expiry_cleanup", 0)
         r = self.post("/admin/switch/strategy", agent_expiry_cleanup="weird")
         self.assertIn(r.status_code, (200, 303))
-        self.assertIn("1", str(self.db.get_config_str("agent_expiry_cleanup")))
+        self.assertEqual("1", str(self.db.get_config_str("agent_expiry_cleanup")))
 
     def test_strategy_explicit_zero_still_turns_cleanup_off(self):
         self.db.set_config("agent_expiry_cleanup", 1)
         self.post("/admin/switch/strategy", agent_expiry_cleanup="0")
-        self.assertIn("0", str(self.db.get_config_str("agent_expiry_cleanup")))
+        self.assertEqual("0", str(self.db.get_config_str("agent_expiry_cleanup")))
+
+    def test_strategy_empty_post_redirects_without_saved_msg(self):
+        """审查中危：什么都没带 → 不写库、不记事件，也不能弹「已保存」假横幅。"""
+        r = self.post("/admin/switch/strategy", k=TOKEN)
+        self.assertIn(r.status_code, (200, 303))
+        loc = unquote(r.headers["location"])
+        self.assertIn("无改动", loc)
+        self.assertNotIn("已保存", loc)
+
+    def test_notify_partial_post_keeps_missing_keys(self):
+        """审查中危回归：推送开关缺字段 = 保持原值（旧行为缺键 → 0）。"""
+        for key in ("heartbeat_push", "report_push", "fill_push"):
+            self.db.set_config(key, 1)
+        self.post("/admin/switch/notify", fill_push="0")
+        self.assertEqual("0", str(self.db.get_config_str("fill_push")))
+        self.assertEqual("1", str(self.db.get_config_str("heartbeat_push")))
+        self.assertEqual("1", str(self.db.get_config_str("report_push")))
 
 
 class TestStrategyCard(BaseCase):
@@ -973,3 +1041,7 @@ class TestStrategyCard(BaseCase):
         r = self.client.post("/admin/switch/strategy", data={"enable_long": "0"},
                              follow_redirects=False)
         self.assertEqual(r.status_code, 401)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
