@@ -18,6 +18,19 @@ THEMES = ("auto", "dark", "light")
 THEME_COOKIE = "cma_theme"
 DEFAULT_THEME = "auto"
 
+# 手机「添加到主屏」用的 <head> 片段（apple-touch-icon / favicon / manifest / 主题色）。
+# 三个自包含页面（管理面板、/c 确认页、/hl 监控页）共用同一份，避免各处抄一遍走形。
+# 全用**绝对路径**：这些页面都挂在站点根下，反代换域名后天然同源，不依赖当前路径层级。
+ICON_THEME_COLOR = "#0d1117"
+ICON_LINKS = (
+    "<link rel='apple-touch-icon' sizes='180x180' href='/apple-touch-icon.png'>"
+    "<link rel='icon' type='image/png' sizes='192x192' href='/icon-192.png'>"
+    "<link rel='icon' type='image/png' sizes='512x512' href='/icon-512.png'>"
+    "<link rel='shortcut icon' href='/favicon.ico'>"
+    "<link rel='manifest' href='/site.webmanifest'>"
+    f"<meta name='theme-color' content='{ICON_THEME_COLOR}'>"
+)
+
 # 主题选择行（面板页脚用）：三个链接，当前项高亮。零 JS，纯 <a>。
 # tab 参数由调用方传入，保证切主题后回到原来的 Tab。
 _THEME_LABELS = {"auto": "跟随系统", "dark": "黑", "light": "白"}
@@ -118,6 +131,7 @@ def page_shell(theme: str, title: str, body: str, head_extra: str = "",
     attr_html = f" data-theme='{attr}'" if attr else ""
     return (f"<!doctype html><html lang='{lang}'{attr_html}><head><meta charset='utf-8'>"
             f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            f"{ICON_LINKS}"
             f"<title>{_esc_text(title)}</title>{THEME_CSS}{head_extra}</head>"
             f"<body>{body}</body></html>")
 

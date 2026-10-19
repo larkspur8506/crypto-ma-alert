@@ -626,10 +626,20 @@ class TestMobileNoJs(BaseCase):
         self.assertNotIn("import ", html.lower())
 
     def test_no_external_resources(self):
+        """页面必须零外部资源：只允许根相对的自家 <link>（图标/manifest 就是这套）。
+
+        口径：<link> 不是禁用，**跨域**的 <link> 才是。所以先剔除 href 以 / 开头的
+        同源链接，剩下的（http://、//cdn…、相对路径）任一条出现都算外部资源。
+        """
+        import re
         for tab in ("overview", "params", "switch", "records"):
             html = self.body(tab=tab).lower()
-            for bad in ("<link ", " src=", "<img", "cdn.", "<iframe"):
+            for bad in (" src=", "<img", "cdn.", "<iframe"):
                 self.assertNotIn(bad, html, f"{tab} 含外部资源 {bad}")
+            links = re.findall(r"<link [^>]*>", html)
+            for tag in links:
+                self.assertIn("href='/", tag, f"{tab} 的 <link> 必须根相对（同源）：{tag}")
+                self.assertNotIn("http", tag, f"{tab} 的 <link> 不许带协议/域名：{tag}")
 
     def test_font_size_at_least_13px(self):
         html = self.body(tab="params")
@@ -641,6 +651,26 @@ class TestMobileNoJs(BaseCase):
         html = self.body(tab="records")
         self.assertIn("width=device-width,initial-scale=1", html)
         self.assertIn("overflow-x:auto", html)
+
+    def test_head_has_home_screen_icon_links(self):
+        """手机「添加到主屏」：面板 <head> 必须带 apple-touch-icon / icon / manifest / theme-color。"""
+        html = self.body(tab="overview")
+        self.assertIn("<link rel='apple-touch-icon' sizes='180x180' href='/apple-touch-icon.png'>", html)
+        self.assertIn("<link rel='manifest' href='/site.webmanifest'>", html)
+        self.assertIn("<meta name='theme-color' content='#0d1117'>", html)
+        # 路径是根相对的（反代换域名后照样同源），不能是写死域名或 ../ 相对
+        self.assertNotIn("apple-touch-icon.png' href='http", html)
+        # 必须落在 <head> 里，不能跑到 body
+        self.assertLess(html.index("apple-touch-icon"), html.index("</head>"))
+
+    def test_page_renders_home_screen_icons(self):
+        """_page() 本身（不经 HTTP）也要带 icon 链接 —— 确认页/HL 页共用同一份常量。"""
+        import app.admin_ui as admin_mod
+        html = bytes(admin_mod._page("tk", "overview", "", "<div>x</div>").body).decode()
+        self.assertIn("rel='apple-touch-icon'", html)
+        self.assertIn("href='/icon-192.png'", html)
+        self.assertIn("href='/icon-512.png'", html)
+        self.assertIn("href='/favicon.ico'", html)
 
     def test_dark_theme_matches_existing_panel(self):
         html = self.body(tab="overview")

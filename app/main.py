@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
 
 from app import engine, market, posfields, sizing, strategy
 from app.config import Config
@@ -417,6 +417,48 @@ def health(k: Optional[str] = None):
 @app.get("/")
 def root():
     return RedirectResponse("/admin")
+
+
+# ---------------------------------------------------------------- 主屏图标 / favicon
+# 手机「添加到主屏」用的静态资源。路径从模块位置推导（app/static/），
+# 不写死部署目录 —— CI 与容器里 app 包位置不同，写死会在测试/构建时炸。
+STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
+
+# 图标一周内不会变；带 immutable 的 ETag 交给浏览器缓存，反代不参与。
+_ICON_CACHE = "public, max-age=604800"
+
+
+def _static_response(name: str, media_type: str) -> FileResponse:
+    """返回 app/static/ 下的文件。存在性在**请求时**才看（import 时不碰磁盘）。"""
+    path = os.path.join(STATIC_DIR, name)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"静态资源缺失：{name}")
+    return FileResponse(path, media_type=media_type, headers={"Cache-Control": _ICON_CACHE})
+
+
+@app.get("/apple-touch-icon.png")
+def apple_touch_icon():
+    return _static_response("apple-touch-icon.png", "image/png")
+
+
+@app.get("/icon-192.png")
+def icon_192():
+    return _static_response("icon-192.png", "image/png")
+
+
+@app.get("/icon-512.png")
+def icon_512():
+    return _static_response("icon-512.png", "image/png")
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return _static_response("favicon.ico", "image/x-icon")
+
+
+@app.get("/site.webmanifest")
+def site_webmanifest():
+    return _static_response("site.webmanifest", "application/manifest+json")
 
 
 # ---------------------------------------------------------------- HL 面板与控制

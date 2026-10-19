@@ -44,6 +44,43 @@ class TestAppAssembly(unittest.TestCase):
         # 到期保护：清空手工兜底的显式入口
         self.assertIn("/admin/hl/agent/fallback/clear", paths)
 
+    def test_home_screen_icon_routes(self):
+        """主屏图标 / favicon / manifest：五条路由注册 + 真的能取到字节。"""
+        try:
+            import fastapi                                            # noqa: F401
+            from fastapi.testclient import TestClient
+        except ImportError:
+            self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
+        mod = importlib.import_module("app.main")
+        importlib.reload(mod)
+        paths = self._route_paths(mod.app)
+        for p in ("/apple-touch-icon.png", "/favicon.ico", "/icon-192.png",
+                  "/icon-512.png", "/site.webmanifest"):
+            self.assertIn(p, paths, f"图标路由 {p} 未注册")
+        expect = {
+            "/apple-touch-icon.png": "image/png",
+            "/icon-192.png": "image/png",
+            "/icon-512.png": "image/png",
+            "/favicon.ico": "image/x-icon",
+            "/site.webmanifest": "application/manifest+json",
+        }
+        with TestClient(mod.app) as c:
+            for p, ctype in expect.items():
+                r = c.get(p)
+                self.assertEqual(r.status_code, 200, f"{p} 应 200")
+                self.assertEqual(r.headers["content-type"], ctype, p)
+                self.assertTrue(r.content, f"{p} 返回空内容")
+                # 图标缓存一周（反代/CDN 不每次回源）
+                self.assertEqual(r.headers.get("cache-control"), "public, max-age=604800", p)
+            # manifest 内容要和静态文件一致（name/short_name/颜色/两个 any 图标）
+            m = c.get("/site.webmanifest").json()
+            self.assertEqual((m["name"], m["short_name"]), ("双均线", "双均线"))
+            self.assertEqual(m["start_url"], "/")
+            self.assertEqual(m["display"], "browser")
+            self.assertEqual((m["background_color"], m["theme_color"]), ("#0d1117", "#0d1117"))
+            self.assertEqual(sorted(i["sizes"] for i in m["icons"]), ["192x192", "512x512"])
+            self.assertTrue(all(i["purpose"] == "any" for i in m["icons"]))
+
     def test_agent_check_passes_mode_and_handles_off(self):
         """装配级：_agent_check 必须把当前模式传下去，off 下不喊「清仓失败」。"""
         try:

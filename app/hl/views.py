@@ -37,7 +37,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app import posfields
-from app.ui_theme import (SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
+from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
                           theme_switch_html)
 
 logger = logging.getLogger(__name__)
@@ -1244,7 +1244,8 @@ def render_dashboard(payload: dict) -> str:
     attr_html = f" data-theme='{attr}'" if attr else ""
     return (
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"{ICON_LINKS}"
         f"{meta}<title>Hyperliquid 执行器监控</title>{THEME_CSS}{DASH_CSS}</head>"
         f"<body><div class='wrap'>{body}{_render_footer(refresh, theme, str(p.get('admin_k') or ''))}</div></body></html>")
 

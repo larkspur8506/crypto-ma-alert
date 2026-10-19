@@ -38,7 +38,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app import engine, sizing
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
                         _kv, _render_body, _signals_html, normalize_rows, status_payload)
-from app.ui_theme import (THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
+from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
 
 logger = logging.getLogger(__name__)
@@ -1195,7 +1195,8 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
     from app.hl.views import THEME_CSS
     return HTMLResponse(
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
-        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"{ICON_LINKS}"
         f"<title>crypto-ma-alert · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
         f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
