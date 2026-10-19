@@ -1097,7 +1097,13 @@ class TestPanelAndWiring(unittest.TestCase):
         self.assertIn("self._op_lock", body)
         self.assertIn("flatten_all", body)
 
-    def test_params_page_has_cleanup_checkbox_and_manual_field(self):
+    def test_cleanup_switch_moved_to_switch_page(self):
+        """2026-10-19：清仓开关从参数页迁到开关页「策略与保护」卡。
+
+        参数页只留手工兜底有效期（hl_agent_valid_until_ms）；agent_expiry_cleanup
+        的复选框、hidden 兜底都必须出现在开关页，且状态反映 cfg。
+        参数 POST 不再接受这个键（否则「保存全部参数」又能悄悄关掉它）。
+        """
         try:
             from fastapi import FastAPI
             from fastapi.testclient import TestClient
@@ -1120,47 +1126,53 @@ class TestPanelAndWiring(unittest.TestCase):
             app.include_router(build_admin_router(deps))
             c = TestClient(app)
             html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
-            self.assertIn("agent_expiry_cleanup", html)
             self.assertIn("hl_agent_valid_until_ms", html)
-            self.assertIn("到期前自动清仓", html)
+            self.assertNotIn("name='agent_expiry_cleanup'", html,
+                             "参数页不该再有清仓开关")
+            sw = c.get("/admin", params={"k": "tk", "tab": "switch"}).text
+            self.assertIn("策略与保护", sw)
+            self.assertIn("agent_expiry_cleanup", sw)
+            self.assertIn("到期前自动清仓", sw)
             # 默认开 → 复选框必须有 checked
-            self.assertRegex(html, r"name='agent_expiry_cleanup' value='1' checked")
+            self.assertRegex(sw, r"name='agent_expiry_cleanup' value='1' checked")
             # H3：复选框前必须有同名 hidden 兜底（未勾选时提交 0）
             self.assertRegex(
-                html, r"<input type='hidden' name='agent_expiry_cleanup' value='0'>"
-                      r"<label class='chk'><input type='checkbox' name='agent_expiry_cleanup'")
+                sw, r"<input type='hidden' name='agent_expiry_cleanup' value='0'>"
+                    r"<label class='chk'><input type='checkbox' name='agent_expiry_cleanup'")
             base = {"equity": "100", "risk_pct": "0.02", "leverage": "5",
                     "stop_min": "0.015", "stop_max": "0.1", "short_regime_ma": "200",
                     "equity_mode": "follow", "equity_min": "20", "k": "tk"}
-            # 1) 老表单不带这个字段（字段缺失）→ 保持原值，绝不静默改动
-            r = c.post("/admin/params", data=dict(base), follow_redirects=False)
+            # 1) 参数 POST 带这个键也不算数（参数页已不接受它）
+            r = c.post("/admin/params", data=dict(base, agent_expiry_cleanup="0"),
+                       follow_redirects=False)
             self.assertEqual(r.status_code, 303)
             self.assertIsNone(db.get_config_str("agent_expiry_cleanup") or None,
-                              "字段缺失（老书签）不该写库")
-            # 2) 未勾选（浏览器只提交 hidden=0）→ DB=0、生效=关
-            r = c.post("/admin/params",
-                       data=dict(base, agent_expiry_cleanup="0"), follow_redirects=False)
+                              "参数 POST 不该再写 agent_expiry_cleanup")
+            # 2) 开关页：未勾选（浏览器只提交 hidden=0）→ DB=0、生效=关
+            r = c.post("/admin/switch/strategy", data={"agent_expiry_cleanup": "0",
+                                                       "k": "tk"},
+                       follow_redirects=False)
             self.assertEqual(r.status_code, 303)
             self.assertIn("0", str(db.get_config_str("agent_expiry_cleanup")))
             self.assertFalse(A.cleanup_switch(db, Config()),
                              "取消勾选后必须真的关掉（H3：以前永远关不掉）")
-            html2 = c.get("/admin", params={"k": "tk", "tab": "params"}).text
-            self.assertNotRegex(html2, r"name='agent_expiry_cleanup' value='1' checked")
-            self.assertIn("当前 关", html2)
+            sw2 = c.get("/admin", params={"k": "tk", "tab": "switch"}).text
+            self.assertNotRegex(sw2, r"name='agent_expiry_cleanup' value='1' checked")
+            self.assertIn("当前 关", sw2)
             # 3) 勾选（浏览器提交 hidden=0 + checkbox=1，顺序即文档顺序）→ DB=1
-            r = c.post("/admin/params", content=(
-                "&".join(f"{k}={v}" for k, v in base.items())
-                + "&agent_expiry_cleanup=0&agent_expiry_cleanup=1"),
-                headers={"content-type": "application/x-www-form-urlencoded"},
-                follow_redirects=False)
+            r = c.post("/admin/switch/strategy",
+                       content="k=tk&agent_expiry_cleanup=0&agent_expiry_cleanup=1",
+                       headers={"content-type": "application/x-www-form-urlencoded"},
+                       follow_redirects=False)
             self.assertEqual(r.status_code, 303)
             self.assertIn("1", str(db.get_config_str("agent_expiry_cleanup")))
             self.assertTrue(A.cleanup_switch(db, Config()))
-            # 4) 识别不了的值按「开」（fail-open）
-            r = c.post("/admin/params",
-                       data=dict(base, agent_expiry_cleanup="weird"), follow_redirects=False)
+            # 4) 字段完全缺失（脚本/旧书签）→ 保持原值，绝不静默改动
+            r = c.post("/admin/switch/strategy", data={"k": "tk"},
+                       follow_redirects=False)
             self.assertEqual(r.status_code, 303)
-            self.assertIn("1", str(db.get_config_str("agent_expiry_cleanup")))
+            self.assertIn("1", str(db.get_config_str("agent_expiry_cleanup")),
+                          "缺字段时不许把清仓开关改掉")
         finally:
             tmp.cleanup()
 

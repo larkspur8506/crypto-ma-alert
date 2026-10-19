@@ -3,8 +3,11 @@
 验收点逐条对应：
 - 未授权 401
 - 四个 Tab 各 200 且含关键区块串（账户总值 / 单笔风险 / 只通知 / 下单记录 …）
-- 手机优先：不依赖 JS（页面里没有 <script）、无外部资源、字号 ≥13px
+- 手机优先：无框架、无外部资源（参数页只有一段原生内联 JS 做资金口径显隐）、字号 ≥13px
 - 改参数后 DB 值生效且页面回显
+- 参数 POST **不再接受**方向/保护类开关（enable_long / enable_shorts /
+  heartbeat_push / agent_expiry_cleanup），这四键改由「开关」页的
+  「策略与保护」卡（/admin/switch/strategy）负责
 - 非法值被拒（400）且**不写库**
 - 切 live 缺凭据 → 400；切实盘必须二次确认
 - kill switch 往返
@@ -41,7 +44,9 @@ except ImportError:                       # pragma: no cover - CI 里必然已�
 NOW = 1_760_000_000.0
 ADDR = "0xTESTADDRESS123456"
 
-# 参数表单的默认值（与 Config 默认一致），用例里按需覆盖
+# 参数表单的默认值（与 Config 默认一致），用例里按需覆盖。
+# 2026-10-19：enable_long / enable_shorts / heartbeat_push / agent_expiry_cleanup
+# 四个开关已撤出参数页（迁到「开关」页），所以夹具里不再带它们。
 PARAMS_OK = {
     "equity": "100", "risk_pct": "0.02", "leverage": "5",
     "stop_min": "0.015", "stop_max": "0.1", "short_regime_ma": "200",
@@ -208,8 +213,10 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "权益曲线", "仓位", "交易所挂单", "API 有效期"):
+        for s in ("账户总值", "权益曲线", "仓位", "交易所挂单"):
             self.assertIn(s, html)
+        # 2026-10-19：「API 有效期」卡片迁到参数页（运维设置，不是当下状态）
+        self.assertNotIn("<h2>API 有效期</h2>", html)
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
         # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
@@ -218,11 +225,13 @@ class TestOverviewTab(BaseCase):
             self.assertNotIn(gone, html, f"总览不该再有历史表：{gone}")
 
     def test_overview_keeps_current_state_blocks(self):
-        """迁走三张表后，总览的当下块必须还在（仓位/挂单/系统/API 有效期）。"""
+        """迁走三张表 + API 有效期卡片后，总览的当下块必须还在（仓位/挂单/系统）。"""
         html = self.body(tab="overview")
         for keep in ("<h2>仓位</h2>", "<h2>交易所挂单</h2>", "<h2>系统</h2>",
-                     "<h2>权益曲线</h2>", "<h2>API 有效期</h2>"):
+                     "<h2>权益曲线</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
+        # API 有效期卡片已迁到参数页 —— 总览不许「删了又长回来」
+        self.assertNotIn("<h2>API 有效期</h2>", html)
         # 三标的动态（用户钉死在 tabs 之后第一块）仍在
         self.assertIn("三标的动态", html)
 
@@ -257,6 +266,14 @@ class TestParamsTab(BaseCase):
         for s in ("策略", "执行与推送", "资金", "单笔风险", "杠杆", "止损距离",
                   "资金口径", "保存全部参数"):
             self.assertIn(s, html)
+        # 2026-10-19：API 有效期卡片迁到参数页末尾
+        self.assertIn("<h2>API 有效期</h2>", html)
+        # 资金口径改成单选钮 + data-mode（配合原生 JS 显隐）
+        self.assertIn("name='equity_mode'", html)
+        self.assertIn("type='radio'", html)
+        self.assertIn("data-mode=", html)
+        # 方向开关迁到「开关」页 → 参数页不该再出现「允许做多」
+        self.assertNotIn("允许做多", html)
 
     def test_params_shows_source_and_effective_value(self):
         self.db.set_config("equity", 100)
@@ -314,15 +331,33 @@ class TestParamsTab(BaseCase):
         self.assertNotIn("equity_min", self._db_vals() if hasattr(self, "_db_vals") else {} or {})
 
     def test_params_saves_modes_and_booleans(self):
-        self.post("/admin/params", **self.params_form(
-            equity_mode="fixed", equity_min="20", enable_long="", enable_shorts="on"))
+        """参数页只管数字/口径：方向与保护类开关**逐键不变**（2026-10-19 事故回归）。
+
+        事故：有人在参数页点「保存全部参数」，三个复选框未勾 → enable_long /
+        enable_shorts / heartbeat_push 被整份写 0，线上方向开关被静默关闭。
+        所以这里先预置成「非默认值」，再 POST 一张不含这四个键的表单，
+        断言四键**一个都没被碰**。
+        """
+        for key, val in (("enable_long", 0), ("enable_shorts", 0),
+                         ("heartbeat_push", 1), ("agent_expiry_cleanup", 0)):
+            self.db.set_config(key, val)
+        r = self.post("/admin/params", **self.params_form(equity_mode="fixed",
+                                                          equity_min="20"))
+        self.assertEqual(r.status_code, 303)
         self.assertEqual(self._cfg().equity_mode, "fixed")
         self.assertEqual(self._cfg().equity_min, 20.0)
+        for key, want in (("enable_long", "0"), ("enable_shorts", "0"),
+                          ("heartbeat_push", "1"), ("agent_expiry_cleanup", "0")):
+            self.assertEqual(str(self.db.get_config_str(key)), want,
+                             f"参数 POST 不许改 {key}")
         self.assertFalse(self._cfg().enable_long)
-        self.assertTrue(self._cfg().enable_shorts)
+        self.assertFalse(self._cfg().enable_shorts)
+        self.assertTrue(self._cfg().heartbeat_push)
+        self.assertFalse(self._cfg().agent_expiry_cleanup)
         html = self.body(tab="params")
-        self.assertIn("value='fixed' selected", html)
-        self.assertIn("允许做空", html)
+        # 单选钮：fixed 选中（不再是 <select> 的 value='fixed' selected）
+        self.assertIn("name='equity_mode' value='fixed' checked", html)
+        self.assertNotIn("允许做空", html, "方向开关已迁到「开关」页")
 
     def test_params_rejects_non_number_and_writes_nothing(self):
         snap_before = self.db.get_config()
@@ -537,11 +572,23 @@ class TestRecordsTab(BaseCase):
 
 
 class TestMobileNoJs(BaseCase):
-    def test_no_script_tags_in_any_tab(self):
-        for tab in ("overview", "params", "switch", "records"):
+    def test_only_inline_native_script_on_params(self):
+        """无框架、无外部资源：唯一的 <script> 是参数页资金口径显隐（内联原生 JS）。
+
+        （2026-10-19 之前所有 Tab 都是零 JS；资金口径显隐是用户明确要求的内联
+        原生 JS，无 JS 时两个资金字段都可见 —— 回退可用。）
+        """
+        for tab in ("overview", "switch", "records"):
             html = self.body(tab=tab)
-            self.assertNotIn("<script", html.lower(), f"{tab} 含 <script>")
+            self.assertNotIn("<script", html.lower(), f"{tab} 不该有 <script>")
             self.assertNotIn("javascript:", html.lower())
+        html = self.body(tab="params")
+        self.assertEqual(html.lower().count("<script"), 1, "参数页只允许一段内联脚本")
+        self.assertIn("input[name='equity_mode']:checked", html)
+        self.assertIn("data-mode", html)
+        # 内联脚本必须是原生（没有任何库/CND/import/src）
+        self.assertNotIn("<script src", html.lower())
+        self.assertNotIn("import ", html.lower())
 
     def test_no_external_resources(self):
         for tab in ("overview", "params", "switch", "records"):
@@ -656,7 +703,7 @@ class TestFullAppWiring(unittest.TestCase):
         mod = self._mod()
         paths = set(mod.app.openapi().get("paths", {}).keys())
         for p in ("/health", "/admin", "/admin/params", "/admin/switch/mode",
-                  "/admin/switch/notify", "/admin/switch/kill",
+                  "/admin/switch/strategy", "/admin/switch/notify", "/admin/switch/kill",
                   "/admin/rules", "/admin/logs", "/admin/tick",
                   "/admin/hl/mode", "/admin/hl/kill", "/c/{pid}",
                   "/hl", "/api/hl/status", "/api/hl/equity", "/api/hl/snapshot"):
@@ -778,12 +825,117 @@ class TestSwitchFlagParsing(BaseCase):
         self.assertIn("0", str(self.db.get_config_str("fill_push")))
 
     def test_params_bool_zero_string_stores_zero(self):
-        form = {**self.params_form(), "enable_shorts": "0"}
-        r = self.post("/admin/params", **form)
+        """方向开关现在归 /admin/switch/strategy：字符串 '0' 必须落 0。"""
+        self.db.set_config("enable_shorts", 1)
+        r = self.post("/admin/switch/strategy", enable_shorts="0")
         self.assertIn(r.status_code, (200, 303))
-        self.assertIn("0", str(self.db.get_config_str("enable_shorts")))
+        self.assertIn("tab=switch", r.headers["location"])
+        self.assertEqual(str(self.db.get_config_str("enable_shorts")), "0")
+        self.assertFalse(self._cfg().enable_shorts)
 
     def test_params_bool_one_still_stores_one(self):
-        form = {**self.params_form(), "enable_long": "1"}
-        self.post("/admin/params", **form)
-        self.assertIn("1", str(self.db.get_config_str("enable_long")))
+        self.db.set_config("enable_long", 0)
+        r = self.post("/admin/switch/strategy", enable_long="1")
+        self.assertIn(r.status_code, (200, 303))
+        self.assertEqual(str(self.db.get_config_str("enable_long")), "1")
+        self.assertTrue(self._cfg().enable_long)
+
+
+class TestStrategyCard(BaseCase):
+    """开关页「策略与保护」卡 + /admin/switch/strategy（2026-10-19 迁入）。
+
+    事故背景：2026-10-18/19 有人在参数页提交「保存全部参数」，三个复选框未勾 →
+    enable_long / enable_shorts / heartbeat_push 被整份写 0，线上方向开关被静默
+    关闭。修复：方向/保护类开关撤出参数页，改由本卡负责，且：
+      - 未勾选（只提交 hidden 的 0）= 关（必须能真的关掉）
+      - 字段完全缺失（脚本/旧书签只带一个键）= 其余键保持原值
+    """
+
+    def test_switch_page_has_strategy_card_with_three_checkboxes(self):
+        self.db.set_config("enable_long", 0)
+        self.db.set_config("enable_shorts", 1)
+        self.db.set_config("agent_expiry_cleanup", 1)
+        html = self.body(tab="switch")
+        self.assertIn("策略与保护", html)
+        self.assertIn("action='/admin/switch/strategy'", html)
+        for key, label in (("enable_long", "允许做多"), ("enable_shorts", "允许做空"),
+                           ("agent_expiry_cleanup", "到期前自动清仓")):
+            self.assertIn(label, html)
+            self.assertIn(f"name='{key}'", html)
+            # hidden 兜底（未勾选也要提交 0）
+            self.assertIn(f"<input type='hidden' name='{key}' value='0'>", html)
+        # 状态反映 cfg：做多关、做空开、清仓开
+        self.assertNotRegex(html, r"name='enable_long' value='1' checked")
+        self.assertRegex(html, r"name='enable_shorts' value='1' checked")
+        self.assertRegex(html, r"name='agent_expiry_cleanup' value='1' checked")
+        self.assertIn("当前 关", html)
+        # 卡片在「执行模式」之后、「推送开关」之前
+        self.assertLess(html.index("执行模式"), html.index("策略与保护"))
+        self.assertLess(html.index("策略与保护"), html.index("推送开关"))
+
+    def test_unchecked_hidden_zero_really_turns_off_and_back_on(self):
+        """未勾选（浏览器只发 hidden=0）→ 关；勾选（0 再 1）→ 开。"""
+        self.db.set_config("enable_long", 1)
+        self.db.set_config("enable_shorts", 1)
+        # 未勾选：只提交 hidden 的 0
+        r = self.post("/admin/switch/strategy", enable_long="0", enable_shorts="0",
+                      agent_expiry_cleanup="0")
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(str(self.db.get_config_str("enable_long")), "0")
+        self.assertEqual(str(self.db.get_config_str("enable_shorts")), "0")
+        self.assertEqual(str(self.db.get_config_str("agent_expiry_cleanup")), "0")
+        self.assertFalse(self._cfg().enable_long)
+        html = self.body(tab="switch")
+        self.assertNotRegex(html, r"name='enable_long' value='1' checked")
+        # 改回开：浏览器提交 hidden=0 + checkbox=1（同名多值取最后一个）
+        r = self.client.post(
+            "/admin/switch/strategy",
+            content="k={}&enable_long=0&enable_long=1".format(TOKEN),
+            headers={"content-type": "application/x-www-form-urlencoded"},
+            follow_redirects=False)
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(str(self.db.get_config_str("enable_long")), "1")
+        self.assertTrue(self._cfg().enable_long)
+        # 事件要落库，写清是哪个键
+        msgs = [e["message"] for e in self.db.hl_recent_events(5)]
+        self.assertTrue(any("策略与保护" in m for m in msgs), msgs)
+
+    def test_partial_post_keeps_other_keys(self):
+        """缺字段 = 不变：只带一个键时其余两键绝不能被顺手写成 0。"""
+        self.db.set_config("enable_long", 1)
+        self.db.set_config("enable_shorts", 1)
+        self.db.set_config("agent_expiry_cleanup", 1)
+        r = self.post("/admin/switch/strategy", enable_shorts="0")
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(str(self.db.get_config_str("enable_shorts")), "0")
+        self.assertEqual(str(self.db.get_config_str("enable_long")), "1",
+                         "没提交的键必须保持原值")
+        self.assertEqual(str(self.db.get_config_str("agent_expiry_cleanup")), "1",
+                         "没提交的键必须保持原值")
+
+    def test_empty_post_writes_nothing(self):
+        self.db.set_config("enable_long", 1)
+        before = self.db.get_config()
+        r = self.post("/admin/switch/strategy")
+        self.assertEqual(r.status_code, 303)
+        self.assertEqual(self.db.get_config(), before, "什么都没带时不许写库")
+
+    def test_params_post_cannot_touch_direction_switches(self):
+        """参数 POST 带上这些键也不会生效（参数页已不接受这四个键）。"""
+        for key in ("enable_long", "enable_shorts", "heartbeat_push",
+                    "agent_expiry_cleanup"):
+            self.db.set_config(key, 1)
+        form = self.params_form()
+        form.update({"enable_long": "0", "enable_shorts": "0",
+                     "heartbeat_push": "0", "agent_expiry_cleanup": "0"})
+        r = self.post("/admin/params", **form)
+        self.assertEqual(r.status_code, 303)
+        for key in ("enable_long", "enable_shorts", "heartbeat_push",
+                    "agent_expiry_cleanup"):
+            self.assertEqual(str(self.db.get_config_str(key)), "1",
+                             f"参数 POST 不该改 {key}")
+
+    def test_strategy_post_requires_token(self):
+        r = self.client.post("/admin/switch/strategy", data={"enable_long": "0"},
+                             follow_redirects=False)
+        self.assertEqual(r.status_code, 401)

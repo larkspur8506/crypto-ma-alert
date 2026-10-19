@@ -1,10 +1,12 @@
 """管理面板（合并版）：单一入口 ``/admin?k=<ADMIN_TOKEN>&tab=<tab>``。
 
-四个 Tab（链接切换，服务端渲染，**零 JS / 零 CDN**，手机弱网可开）：
+四个 Tab（链接切换，服务端渲染，**无 CDN / 无框架 / 无外部资源**，手机弱网可开；
+唯一的原生 JS 是「参数」页资金口径的单选钮显隐，无 JS 时两个字段都显示）：
 
 - ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/权益曲线区块）
-- ``params``   参数 —— 策略 / 执行与推送 / 资金 三组，显示来源（DB·env·默认）与影响预览
-- ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）、推送开关、kill switch
+- ``params``   参数 —— 策略 / 执行与推送 / 资金 / API 有效期 四组，显示来源（DB·env·默认）与影响预览
+- ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）、策略与保护（做多/做空/到期自动清仓）、
+  推送开关、kill switch
 - ``records``  记录 —— hl_orders / hl_fills / signals / alert_logs / hl_events 五块
   （「信号」2026-10-18 从总览迁入，复用 hl/views._signals_html）
 
@@ -102,6 +104,18 @@ NOTIFY_KEYS: Tuple[Tuple[str, str, str, str], ...] = (
     ("heartbeat_push", "每日心跳推送", "体检报告；关掉后只落库不推送，看守脚本仍判活", "0"),
     ("report_push", "日报 / 周报推送", "周报周一发送；关掉后只落库（kind=weekly_local）", "1"),
     ("fill_push", "成交回报推送", "开 = 开仓/平仓成交都推一条；关 = 不推（止损被触发等异常提醒不受影响）", "1"),
+)
+
+# 开关页「策略与保护」：key -> (中文标签, 说明, 默认值, env_key)
+# 2026-10-19 从参数页迁出（方向开关被「保存全部参数」整份写 0 的事故）。
+STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
+    ("enable_long", "允许做多", "关掉后不再发做多信号（已有仓位不受影响，止损照常）",
+     True, "ENABLE_LONG"),
+    ("enable_shorts", "允许做空", "关掉后不再发做空信号（已有仓位不受影响，止损照常）",
+     True, "ENABLE_SHORTS"),
+    ("agent_expiry_cleanup", "到期前自动清仓（≤3 天）",
+     "开 = API 快到期（剩余 3 天以内）时自动撤单平仓，避免到期后想平也平不了；"
+     "关 = 只提醒不清仓（需要自己盯）", True, "AGENT_EXPIRY_CLEANUP"),
 )
 
 
@@ -379,28 +393,29 @@ def _impact_line(d: Optional[dict]) -> str:
 
 # ---------------------------------------------------------------- 参数 Tab
 # (db_key, 分组, 标签, env_key, 默认值, 类型)
+# 2026-10-19 用户拍板：方向/保护类开关（enable_long / enable_shorts /
+# agent_expiry_cleanup）**撤出参数页**，迁到「开关」页的「策略与保护」卡。
+# 事故原因：这些键原来混在「保存全部参数」这一张 form 里，未勾选 = 提交 0，
+# 一次提交就把线上的方向开关静默关掉（2026-10-18/19 线上真出过）。参数页只留
+# 「填数字/选口径」的字段，开关全部归开关页。
 PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
     ("stop_min", "策略", "止损距离下限", "STOP_MIN", 0.02, "float"),
     ("stop_max", "策略", "止损距离上限", "STOP_MAX", 0.08, "float"),
-    ("enable_long", "策略", "允许做多", "ENABLE_LONG", True, "bool"),
-    ("enable_shorts", "策略", "允许做空", "ENABLE_SHORTS", True, "bool"),
     ("short_regime_ma", "策略", "做空趋势过滤均线（0=关闭，不建议）",
      "SHORT_REGIME_MA", 200, "int"),
     ("risk_pct", "执行与推送", "单笔风险", "RISK_PCT", 0.02, "float"),
     ("leverage", "执行与推送", "杠杆（逐仓）", "LEVERAGE", 5.0, "float"),
-    ("heartbeat_push", "执行与推送", "每日心跳推送", "HEARTBEAT_PUSH", False, "bool"),
+    ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "mode"),
     ("equity", "资金", "账户权益基数 U（固定模式用）", "ACCOUNT_EQUITY", 1000.0, "float"),
-    ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "str"),
     ("equity_min", "资金", "资金下限 U（跟随模式用）", "", 20.0, "float"),
-    ("agent_expiry_cleanup", "API 有效期", "到期前自动清仓（≤3 天）", "AGENT_EXPIRY_CLEANUP", True, "bool"),
     ("hl_agent_valid_until_ms", "API 有效期", "手工兜底的有效期（毫秒时间戳，可留空）",
      "HL_AGENT_VALID_UNTIL_MS", "", "text"),
 )
 _GROUPS: Tuple[Tuple[str, str], ...] = (
-    ("策略", "决定什么信号会被发出来"),
-    ("执行与推送", "决定下多大、占多少保证金"),
+    ("策略", "决定什么信号会被发出来；方向开关已迁到「开关」页"),
+    ("执行与推送", "决定下多大、占多少保证金（每日心跳推送在「开关」页）"),
     ("资金", "下单基数怎么算"),
-    ("API 有效期", "API 钱包到期前要不要自动清仓；接口查不到有效期时的手工兜底"),
+    ("API 有效期", "接口查不到有效期时的手工兜底；到期前要不要自动清仓在「开关」页"),
 )
 
 
@@ -419,7 +434,7 @@ def _cur_val(cfg: Any, key: str, default: Any, kind: str) -> str:
         return "开" if bool(raw) else "关"
     if kind == "int":
         return f"{int(_num(raw, _num(default)))}"
-    if kind == "str":
+    if kind in ("str", "mode"):
         return str(raw if raw is not None else default)
     if kind == "text":
         return str(raw if raw is not None else default)
@@ -430,7 +445,7 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
                   imp: Optional[dict], imp_max: Optional[dict]) -> str:
     """每项旁的一行小字：这个字段改动能带来什么变化（按当前值实算，不靠猜）。"""
     if key == "equity":
-        return f"固定基数 {_num(getattr(cfg, 'equity', 0)):,.0f}U → 单笔风险 " \
+        return f"仅「固定基数」模式用：基数 {_num(getattr(cfg, 'equity', 0)):,.0f}U → 单笔风险 " \
                f"{_num(getattr(cfg, 'equity', 0)) * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
     if key == "equity_mode":
         mode = str(getattr(cfg, "equity_mode", "follow") or "follow")
@@ -440,7 +455,7 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
             return f"⚠️ 读不到实时权益（{live:,.2f}）→ 实际按固定基数 {base:,.0f}U 下单，不是跟随"
         return f"跟随：实时权益 {live:,.2f}U → 当前生效基数 {base:,.0f}U"
     if key == "equity_min":
-        return f"跟随模式下基数不低于 {_num(getattr(cfg, 'equity_min', 0)):,.0f}U"
+        return f"仅「跟随实时权益」模式用：基数不低于 {_num(getattr(cfg, 'equity_min', 0)):,.0f}U"
     if key == "risk_pct":
         return f"{_num(getattr(cfg, 'risk_pct', 0)) * 100:.2f}% × 基数 {base:,.0f}U = 单笔风险 " \
                f"{base * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
@@ -456,20 +471,9 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
     if key == "stop_max":
         return f"最宽止损 {_num(getattr(cfg, 'stop_max', 0)) * 100:.2f}% → 名义 " \
                f"{imp_max['notional']:,.0f}U" if imp_max else "止损越宽仓位越小"
-    if key == "enable_long":
-        return "开 = 会发做多信号" if getattr(cfg, "enable_long", True) else "关 = 不做多"
-    if key == "enable_shorts":
-        return "开 = 会发做空信号" if getattr(cfg, "enable_shorts", True) else "关 = 不做空"
     if key == "short_regime_ma":
         n = int(_num(getattr(cfg, "short_regime_ma", 0)))
         return "0 = 关闭过滤（裸做空，不建议）" if n <= 0 else f"用 MA{n} 过滤空头信号"
-    if key == "heartbeat_push":
-        return "开 = 每天推一条心跳；关 = 只落库不推送" if getattr(cfg, "heartbeat_push", False) \
-            else "关 = 只落库不推送（看守脚本靠落库判断存活）"
-    if key == "agent_expiry_cleanup":
-        return ("开 = API 快到期（剩余 3 天以内）时自动撤单平仓，避免到期后想平也平不了"
-                if getattr(cfg, "agent_expiry_cleanup", True)
-                else "关 = 只提醒不清仓（到期后执行器无法平仓，需要自己盯）")
     if key == "hl_agent_valid_until_ms":
         return ("仅当 HL 授权接口查不到同名 Hermes 时用：填毫秒时间戳"
                 "（如 1830000000000）。留空 = 不改动当前值（要清空点下面的「清除兜底」）")
@@ -488,25 +492,48 @@ def _flag(val: Any) -> int:
     return 1 if str(val if val is not None else "").strip().lower() in _TRUTHY else 0
 
 
-def _cleanup_on(val: Any) -> int:
-    """「到期前自动清仓」的取值：**识别不了按「开」**（fail-open）。
-
-    与推送开关相反：漏清仓的代价是「到期后仓位想平也平不了」，误清仓只是提前
-    平掉一笔仓（还能再开）。所以只有明确的假值才判关。
-    """
-    if isinstance(val, bool):
-        return 1 if val else 0
-    raw = str(val if val is not None else "").strip().lower()
-    return 0 if raw in ("0", "false", "no", "off") else 1
-
-
-def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "") -> str:
+def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "",
+               attrs: str = "") -> str:
     st = f" step='{step}'" if step else ""
-    return (f"<div class='field'><div class='lbl'>{_esc(label)}"
+    at = f" {attrs}" if attrs else ""
+    return (f"<div class='field'{at}><div class='lbl'>{_esc(label)}"
             f"<span class='src'>&nbsp;来源 {src} · 当前 {_esc(value)}</span></div>"
             f"<input type='text' inputmode='decimal' required name='{_esc(key)}' "
             f"value='{_esc(value)}'{st}>"
             f"<div class='hint'>{hint}</div></div>")
+
+
+def _mode_field(key: str, label: str, cur: str, hint: str, src: str) -> str:
+    """资金口径：单选钮组（两个选项，服务端渲染 checked）。
+
+    以前是 <select>，和下面两个数字字段混在一起，「改口径」这件事不显眼；
+    改成单选钮并置顶，配合 :func:`_equity_mode_js` 按模式显隐对应字段。
+    """
+    opts = "".join(
+        f"<label class='rad'><input type='radio' name='{_esc(key)}' value='{v}' "
+        f"{'checked' if v == cur else ''}> {_esc(t)}</label>"
+        for v, t in (("follow", "跟随实时权益"), ("fixed", "固定基数")))
+    return (f"<div class='field'><div class='lbl'>{_esc(label)}"
+            f"<span class='src'>&nbsp;来源 {src} · 当前 {_esc(cur)}</span></div>"
+            f"{opts}<div class='hint'>{hint}</div></div>")
+
+
+def _equity_mode_js() -> str:
+    """参数页资金组：按「资金口径」单选钮显隐 equity / equity_min（原生 JS，无框架）。
+
+    约定：``data-mode`` 标出字段**只属于**哪个模式；选中值不同就 display:none。
+    脚本没跑起来（禁用 JS / 老浏览器）时两个字段都可见 —— 每个字段的 hint 里
+    已写明它属于哪个模式，因此无 JS 的回退是可用的，只是少了一层视觉过滤。
+    """
+    return (
+        "<script>(function(){var f=function(){"
+        "var r=document.querySelector(\"input[name='equity_mode']:checked\");"
+        "if(!r)return;var m=r.value;"
+        "var e=document.querySelectorAll('[data-mode]');"
+        "for(var i=0;i<e.length;i++){"
+        "e[i].style.display=(e[i].getAttribute('data-mode')===m)?'':'none';}};"
+        "var g=document.querySelectorAll(\"input[name='equity_mode']\");"
+        "for(var j=0;j<g.length;j++){g[j].addEventListener('change',f);}f();})();</script>")
 
 
 def _bool_field(key: str, label: str, on: bool, hint: str, src: str) -> str:
@@ -564,18 +591,17 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                          f"<input type='text' inputmode='numeric' name='{_esc(key)}' "
                          f"value='{_esc(cur)}'>"
                          f"<div class='hint'>{hint}</div></div>")
-            elif kind == "str":
-                cur = str(getattr(cfg, key, default))
-                opts = "".join(
-                    f"<option value='{v}' {'selected' if v == cur else ''}>{t}</option>"
-                    for v, t in (("follow", "跟随实时权益"), ("fixed", "固定基数")))
-                o.append(f"<div class='field'><div class='lbl'>{_esc(label)}"
-                         f"<span class='src'>&nbsp;来源 {src} · 当前 {_esc(cur)}</span></div>"
-                         f"<select name='{_esc(key)}'>{opts}</select>"
-                         f"<div class='hint'>{hint}</div></div>")
+            elif kind == "mode":
+                # 资金口径：单选钮（值班的人一眼看到「现在按哪个口径算钱」）
+                o.append(_mode_field(key, label, _cur_val(cfg, key, default, kind), hint, src))
             else:
+                # data-mode：字段只属于哪个资金口径（原生 JS 按选中值显隐；
+                # 无 JS 时两个都显示，hint 里已写明各自属于哪个模式）
+                attrs = {"equity": "data-mode='fixed'",
+                         "equity_min": "data-mode='follow'"}.get(key, "")
                 o.append(_num_field(key, label, _cur_val(cfg, key, default, kind),
-                                    hint, src, step="1" if kind == "int" else ""))
+                                    hint, src, step="1" if kind == "int" else "",
+                                    attrs=attrs))
         o.append("</div>")
 
     o.append("<button type='submit'>保存全部参数</button></form>")
@@ -588,6 +614,14 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                  f"<span class='hint'>手工兜底有效期当前为 {_esc(cur_until)}（毫秒）。"
                  "留空保存 = 保持原值。</span>"
                  "<button class='gray' type='submit'>清除兜底</button></form>")
+    # 「API 有效期」卡片 2026-10-19 从总览迁到这里（用户拍板：它是运维设置，
+    # 不是「当下状态」）。卡片自己兜底，渲染失败不弄挂参数页。
+    try:
+        o.append(render_agent_card(deps))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
+    # 资金口径显隐脚本（原生 JS，无框架、无外部资源）；必须在字段之后执行。
+    o.append(_equity_mode_js())
     return "".join(o)
 
 
@@ -657,19 +691,9 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     if sm is not None and sx is not None and sm > sx:
         errs.append(f"止损下限 {sm:g} 不能大于上限 {sx:g}")
 
-    # 复选框：勾选=1，未勾选=不传 → 0
-    out["enable_long"] = _flag(form.get("enable_long"))
-    out["enable_shorts"] = _flag(form.get("enable_shorts"))
-    out["heartbeat_push"] = _flag(form.get("heartbeat_push"))
-    # 到期前自动清仓（H3 + fail-open）：
-    #   字段缺失（老书签的表单/脚本没带这个键）→ **保持原值**，不写库；
-    #   有值（面板现在用 hidden+checkbox 双字段，必然是 0 或 1；脚本可能发别的）
-    #   → 识别不了按「开」。漏清仓的代价（到期后仓位关不掉）远大于提前平一笔。
-    _raw_cleanup = form.get("agent_expiry_cleanup")
-    if isinstance(_raw_cleanup, (list, tuple)):          # 同名多值：取最后一个
-        _raw_cleanup = _raw_cleanup[-1] if _raw_cleanup else None
-    if _raw_cleanup is not None and str(_raw_cleanup).strip() != "":
-        out["agent_expiry_cleanup"] = 1 if _cleanup_on(_raw_cleanup) else 0
+    # 方向/保护类开关（enable_long / enable_shorts / agent_expiry_cleanup）**不在
+    # 参数 POST 的处理范围**（2026-10-19 迁到 /admin/switch/strategy）。这里既不再
+    # 读取也不再有「缺省 = 0」的兜底 —— 参数提交永远碰不到这三个键。
     # 手工兜底的有效期（M3）：**空 = 不传 = 保持原值**，与同页其它数字字段一致。
     # 以前空串会落库把兜底值抹掉 —— 用户只想改个风险率，手工兜底就没了。
     # 要清空兜底走「API 有效期」卡片里的「清除兜底」按钮（显式操作）。
@@ -735,6 +759,24 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
              f"{'已配置（' + _esc(addr[:6]) + '&hellip;' + _esc(addr[-4:]) + '）' if addr else '未配置'}"
              f"｜私钥：{'已配置' if has_key else '未配置'}"
              f"｜地址/私钥来自 env，面板只读不改。</div></div>")
+
+    # ---- 策略与保护（2026-10-19 从参数页迁入） ----
+    # 这三个键以前在参数页的「保存全部参数」那张大表单里：未勾选 = 提交 0，
+    # 一次「保存全部参数」就能把线上方向开关静默关掉（2026-10-18/19 出过事故）。
+    # 现在独立成一张小卡 + 独立 POST，且用 hidden+checkbox 双字段：
+    #   未勾选 → 只提交 hidden 的 0 → 关（必须能关掉）
+    #   勾选   → 提交 0 再提交 1 → 后端取最后一个 = 开
+    #   字段完全缺失（脚本/旧书签）→ 后端保持原值，不写库
+    o.append("<div class='card'><div class='sec'>策略与保护</div>"
+             "<div class='hint'>决定发不发哪个方向、以及 API 快到期时要不要自动清仓。"
+             "改完立刻生效（下一轮 tick），不用重启。</div>"
+             "<form method='post' action='/admin/switch/strategy'>"
+             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>")
+    for key, label, hint, dflt, env_key in STRATEGY_KEYS:
+        cur = getattr(cfg, key, dflt)
+        on = _b(cur) if not isinstance(cur, bool) else cur
+        o.append(_bool_field(key, label, bool(on), hint, _source(raw, key, env_key)))
+    o.append("<button type='submit'>保存策略与保护</button></form></div>")
 
     # ---- 推送开关 ----
     o.append("<div class='card'><div class='sec'>推送开关</div>"
@@ -956,17 +998,12 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
     _render_body 自带 <h1> 和它自己的状态条，而本面板顶部已有标题 + 状态条，
     所以把这两块剥掉，避免同一屏出现两个 <h1>、两条状态条。
 
-    「API 有效期」卡片接在整个总览的**最后**（在「系统」卡之后）：它是低频查看的
-    运维信息，用户日常看的是三标的动态/账户/仓位；同时它不插进「三标的动态」与账户卡
-    之间（那个位置由需求钉死给三标的动态）。卡片自己兜底，渲染失败不弄挂总览。
+    「API 有效期」卡片原先是接在总览最后的，2026-10-19 已迁到「参数」页
+    （用户拍板：它是运维设置不是当下状态）。总览只剩「当下」信息。
     """
     body = _render_body(payload)
     body = re.sub(r"<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)
     body = re.sub(r"<div class='bar'>.*?</div>\s*", "", body, count=1, flags=re.S)
-    try:
-        body += render_agent_card(deps)
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
     return body
 
 
@@ -1065,11 +1102,11 @@ def render_agent_card(deps: AdminDeps) -> str:
     o.append("</div>")
     if not src:
         o.append("<div class='hint'>还没读到授信信息：系统每个整点检查一次；"
-                 "也可以到「参数」页填手工兜底的有效期。</div>")
+                 "也可以在本页下方「API 有效期」参数区填手工兜底的有效期。</div>")
     elif src == "manual":
-        o.append("<div class='hint'>有效期来自「参数」页的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
+        o.append("<div class='hint'>有效期来自本页参数区的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
-             f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓，可在「参数」页关闭）。</div>")
+             f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓，可在「开关」页的「策略与保护」里关闭）。</div>")
 
     # ---- 「更新 API」折叠表单（原生 <details>，零 JS）
     o.append("<details class=\"msgdetails\"><summary>更新 API（在 HL 网页续期后粘贴新私钥）</summary>"
@@ -1115,7 +1152,7 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
         f"{theme_switch_html(tab, theme, token)}"
         f"{rows_switch_html(tab, rows_n, token)}"
-        "<div class='foot'><span class='muted'>手机可用 · 零 JS · "
+        "<div class='foot'><span class='muted'>手机可用 · 无外部资源 · "
         "面板只读，不持私钥</span></div></div></body></html>")
 
 
@@ -1182,20 +1219,14 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                      leverage: str = Form(""), stop_min: str = Form(""),
                      stop_max: str = Form(""), short_regime_ma: str = Form(""),
                      equity_mode: str = Form("follow"), equity_min: str = Form(""),
-                     agent_expiry_cleanup: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
-                     enable_long: Optional[str] = Form(None),
-                     enable_shorts: Optional[str] = Form(None),
-                     heartbeat_push: Optional[str] = Form(None),
                      k: str = Form("")):
         token = _auth(deps, request, k or None)
         values, errs = _parse_params({
             "equity": equity, "risk_pct": risk_pct, "leverage": leverage,
             "stop_min": stop_min, "stop_max": stop_max,
             "short_regime_ma": short_regime_ma, "equity_mode": equity_mode,
-            "equity_min": equity_min, "enable_long": enable_long,
-            "enable_shorts": enable_shorts, "heartbeat_push": heartbeat_push,
-            "agent_expiry_cleanup": agent_expiry_cleanup,
+            "equity_min": equity_min,
             "hl_agent_valid_until_ms": hl_agent_valid_until_ms,
         })
         if errs:
@@ -1236,6 +1267,40 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                     deps.hl_set_kill(False, "")
                 except Exception as e:                                   # noqa: BLE001
                     logger.warning("[admin] 清 kill 失败：%s", e)
+        return RedirectResponse(_back(token, "switch"), status_code=303)
+
+    # ---------------- 策略与保护（方向开关 + 到期自动清仓） ----------------
+    @router.post("/admin/switch/strategy")
+    def admin_switch_strategy(request: Request,
+                              enable_long: Optional[str] = Form(None),
+                              enable_shorts: Optional[str] = Form(None),
+                              agent_expiry_cleanup: Optional[str] = Form(None),
+                              k: str = Form("")):
+        """保存「策略与保护」三个开关。
+
+        语义铁律（2026-10-19 事故回归）：
+          - **字段完全缺失（None）= 保持原值，不写库** —— 脚本/旧书签只带一个键时
+            不会把其余方向开关顺手关掉；
+          - 有值（面板是 hidden 的 0 / 勾选后 0+1）= 按 :func:`_flag` 解析后写库，
+            所以「未勾选 → 0」必须能真的关掉。
+        """
+        token = _auth(deps, request, k or None)
+        raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
+                    "agent_expiry_cleanup": agent_expiry_cleanup}
+        vals = {key: _flag(val) for key, val in raw_vals.items() if val is not None}
+        put_errs = [e for e in (deps.put(key, val) for key, val in vals.items()) if e]
+        if put_errs:
+            raise HTTPException(400, "策略与保护保存失败：" + "；".join(put_errs))
+        if not vals:
+            # 什么都没带：不写库、不记事件（避免假「已修改」）
+            return RedirectResponse(_back(token, "switch"), status_code=303)
+        word = {1: "开", 0: "关"}
+        deps.log_event("decision",
+                       "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s）"
+                       % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
+                          word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
+                          word[vals["agent_expiry_cleanup"]]
+                          if "agent_expiry_cleanup" in vals else "不变"))
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 推送开关 ----------------
