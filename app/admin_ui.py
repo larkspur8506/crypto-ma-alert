@@ -3,8 +3,10 @@
 四个 Tab（链接切换，服务端渲染，**无 CDN / 无框架 / 无外部资源**，手机弱网可开；
 唯一的原生 JS 是「参数」页资金口径的单选钮显隐，无 JS 时两个字段都显示）：
 
-- ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/权益曲线区块）
-- ``params``   参数 —— 策略 / 执行与推送 / 资金 / API 有效期 四组，显示来源（DB·env·默认）与影响预览
+- ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/权益曲线区块）；
+  末尾接「API 有效期」状态卡（地址/到期日/剩余/状态 + 到期前自动清仓开关状态）
+- ``params``   参数 —— 策略 / 执行与推送 / 资金 / API 有效期 四组，显示来源（DB·env·默认）与影响预览；
+  末尾另有「更新 API（续期）」折叠表单（粘新私钥，POST /admin/hl/agent/renew）
 - ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）、策略与保护（做多/做空/到期自动清仓）、
   推送开关、kill switch
 - ``records``  记录 —— hl_orders / hl_fills / signals / alert_logs / hl_events 五块
@@ -620,12 +622,13 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                  f"<span class='hint'>手工兜底有效期当前为 {_esc(cur_until)}（毫秒）。"
                  "留空保存 = 保持原值。</span>"
                  "<button class='gray' type='submit'>清除兜底</button></form>")
-    # 「API 有效期」卡片 2026-10-19 从总览迁到这里（用户拍板：它是运维设置，
-    # 不是「当下状态」）。卡片自己兜底，渲染失败不弄挂参数页。
+    # 「更新 API（续期）」表单 2026-10-19 从总览状态卡里拆出来单独放这里：
+    # 状态（到期日/剩余/状态词）是「当下」，回总览末尾；写私钥是运维设置，留参数页。
+    # 区块自己兜底，渲染失败不弄挂参数页。
     try:
-        o.append(render_agent_card(deps))
+        o.append(render_agent_renew_block(deps))
     except Exception as e:                                        # noqa: BLE001
-        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
+        logger.warning("[admin] 更新 API 区块渲染失败：%s", e)
     # 资金口径显隐脚本（原生 JS，无框架、无外部资源）；必须在字段之后执行。
     o.append(_equity_mode_js())
     return "".join(o)
@@ -1018,12 +1021,20 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
     _render_body 自带 <h1> 和它自己的状态条，而本面板顶部已有标题 + 状态条，
     所以把这两块剥掉，避免同一屏出现两个 <h1>、两条状态条。
 
-    「API 有效期」卡片原先是接在总览最后的，2026-10-19 已迁到「参数」页
-    （用户拍板：它是运维设置不是当下状态）。总览只剩「当下」信息。
+    「API 有效期」状态卡接在整个总览的**最后**（在「系统」卡之后）：它是低频查看的
+    运维信息，用户日常看的是三标的动态/账户/仓位；同时它不插进「三标的动态」与账户卡
+    之间（那个位置由需求钉死给三标的动态）。卡片自己兜底，渲染失败不弄挂总览。
+
+    「更新 API（续期）」表单**不在这里** —— 它是写操作入口，留在「参数」页
+    （:func:`render_agent_renew_block`）。2026-10-19 只搬走表单，状态卡回原位。
     """
     body = _render_body(payload)
     body = re.sub(r"<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)
     body = re.sub(r"<div class='bar'>.*?</div>\s*", "", body, count=1, flags=re.S)
+    try:
+        body += render_agent_card(deps)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
     return body
 
 
@@ -1037,10 +1048,13 @@ def _agent_source_txt(src: str) -> str:
 
 
 def render_agent_card(deps: AdminDeps) -> str:
-    """「API 有效期」卡片：地址（截断）/到期日/剩余天数/状态词 + 「更新 API」折叠表单。
+    """「API 有效期」状态卡（总览末尾）：地址（截断）/到期日/剩余天数/状态词/自动清仓开关。
 
     数据只来自 ``hl_agent_state``（DB 缓存）—— 渲染**零网络调用**，面板在 HL 接口
     全挂时也能打开。state 缺失/损坏时显示「未知」并给出「下一个整点会刷新」的说明。
+
+    **只渲染状态，不渲染写操作**：「更新 API（续期）」表单在「参数」页，见
+    :func:`render_agent_renew_block`。
     """
     from app.hl import agent as agent_mod
     state = {}
@@ -1122,14 +1136,29 @@ def render_agent_card(deps: AdminDeps) -> str:
     o.append("</div>")
     if not src:
         o.append("<div class='hint'>还没读到授信信息：系统每个整点检查一次；"
-                 "也可以在本页上方「API 有效期」参数区填手工兜底的有效期。</div>")
+                 "也可以到「参数」页填手工兜底的有效期。</div>")
     elif src == "manual":
-        o.append("<div class='hint'>有效期来自本页参数区的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
+        o.append("<div class='hint'>有效期来自「参数」页的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
              f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓，可在「开关」页的「策略与保护」里关闭）。</div>")
+    o.append("</div>")
+    return "".join(o)
 
-    # ---- 「更新 API」折叠表单（原生 <details>，零 JS）
-    o.append("<details class=\"msgdetails\"><summary>更新 API（在 HL 网页续期后粘贴新私钥）</summary>"
+
+def render_agent_renew_block(deps: AdminDeps) -> str:
+    """「更新 API（续期）」折叠表单（参数页末尾的独立小区块）。
+
+    2026-10-19 从总览状态卡里**原样搬出**：状态（到期日/剩余/状态词）留在总览，
+    写私钥这个运维动作跟着参数页走。表单 action / 字段 / 步骤文案与原卡片一致，
+    外层套 ``card`` + ``sec`` 与参数页其它组同构。
+
+    渲染**零网络调用**（只需当前 token），失败由调用方 try/except 兜底。
+    """
+    from app.hl import agent as agent_mod
+    o: List[str] = []
+    o.append("<div class='card'><div class='sec'>更新 API（续期）</div>")
+    # 原生 <details>，零 JS：无 JS 的手机也能展开粘贴
+    o.append("<details class=\"msgdetails\"><summary>在 HL 网页续期后粘贴新私钥</summary>"
              "<div class=\"fullmsg\">"
              "<div class='hint'>步骤：① 电脑/手机浏览器打开 HL 网页 → <b>More → API</b>；"
              f"② 用<b>同名 {agent_mod.AGENT_NAME}</b> 生成新 API 钱包（有效期选最长的 180 天）；"
