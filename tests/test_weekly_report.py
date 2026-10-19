@@ -138,7 +138,7 @@ class TestWithClosedPositions(WeeklyFixture):
     def test_status_line(self):
         self.assertIn("▍当前状态", self.text)
         self.assertIn("持仓：BTC 做空（", self.text)
-        self.assertIn(" 开仓）｜ 执行器：", self.text)
+        self.assertIn(" 开仓） ｜ 执行器：", self.text)
 
 
 class TestNoClosedPositions(WeeklyFixture):

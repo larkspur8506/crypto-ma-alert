@@ -978,6 +978,6 @@ def weekly_text(db, cfg) -> str:
         hold_txt = "、".join(hold)
     else:
         hold_txt = "无"
-    lines.append(f"持仓：{hold_txt}｜ 执行器：{_exec_mode(db)} ｜ "
+    lines.append(f"持仓：{hold_txt} ｜ 执行器：{_exec_mode(db)} ｜ "
                  f"信号源：{_feed_state(db)}")
     return "\n".join(lines)
