@@ -556,10 +556,21 @@ def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = 
             raise HTTPException(400, f"{key} 不是数字")
         # 存成 JSON 数字（不是字符串），避免 json.dumps 加引号让 apply_db 解析失败
         db.set_config(key, num)
-    # 复选框：勾选=1，未勾选=不传 → 0
-    db.set_config("enable_long", 1 if enable_long else 0)
-    db.set_config("enable_shorts", 1 if enable_shorts else 0)
-    db.set_config("heartbeat_push", 1 if heartbeat_push else 0)
+    # 复选框（2026-10-19 事故回归）：**缺字段 = 保持原值**，显式传 0 才关。
+    # 旧语义「不传 = 0」就是那次把线上方向开关静默关掉的向量 —— 老书签/curl
+    # 只想改数字时，方向开关绝不能被顺手清掉。显式值按 _flag 同口径解析：
+    # 字符串 "0" 是真值，绝不能写 `1 if v else 0`（会把「关」写成「开」）。
+    _truthy = ("1", "true", "yes", "on", "y", "t")
+
+    def _flag_like(v: Optional[str]) -> int:
+        return 1 if str(v if v is not None else "").strip().lower() in _truthy else 0
+
+    if enable_long is not None:
+        db.set_config("enable_long", _flag_like(enable_long))
+    if enable_shorts is not None:
+        db.set_config("enable_shorts", _flag_like(enable_shorts))
+    if heartbeat_push is not None:
+        db.set_config("heartbeat_push", _flag_like(heartbeat_push))
     # 老书签的表单里没有这个复选框：**不传 = 保持原值**（不能按「未勾选」清成 0，
     # 否则老页面一提交就把到期保护静默关掉）。显式传 0 才关。
     if agent_expiry_cleanup is not None:

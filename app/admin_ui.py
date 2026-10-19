@@ -1287,7 +1287,17 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
                     "agent_expiry_cleanup": agent_expiry_cleanup}
-        vals = {key: _flag(val) for key, val in raw_vals.items() if val is not None}
+        # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
+        # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
+        # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
+        vals = {}
+        for key, val in raw_vals.items():
+            if val is None:
+                continue
+            if key == "agent_expiry_cleanup":
+                vals[key] = 0 if str(val).strip().lower() in ("0", "false", "no", "off") else 1
+            else:
+                vals[key] = _flag(val)
         put_errs = [e for e in (deps.put(key, val) for key, val in vals.items()) if e]
         if put_errs:
             raise HTTPException(400, "策略与保护保存失败：" + "；".join(put_errs))

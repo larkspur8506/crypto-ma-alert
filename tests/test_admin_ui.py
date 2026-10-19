@@ -739,17 +739,28 @@ class TestFullAppWiring(unittest.TestCase):
     def test_legacy_rules_post_compatibility(self):
         mod = self._mod()
         with TestClient(mod.app) as c:
+            # 2026-10-19 事故回归：legacy POST **缺字段 = 保持原值**（显式 0 才关）。
+            # 旧断言 assertFalse(enable_shorts) 钉的正是「不传 = 0」这条危险语义。
             r = c.post("/admin/rules", data={
                 "equity": "777", "risk_pct": "0.03", "leverage": "4",
                 "stop_min": "0.02", "stop_max": "0.09",
-                "short_regime_ma": "120", "enable_long": "on", "k": TOKEN},
+                "short_regime_ma": "120", "k": TOKEN},
                 follow_redirects=False)
             self.assertEqual(r.status_code, 303)
             self.assertIn("tab=params", r.headers["location"])
             self.assertEqual(mod.current_config().equity, 777.0)
             self.assertEqual(mod.current_config().risk_pct, 0.03)
             self.assertEqual(mod.current_config().short_regime_ma, 120)
+            self.assertTrue(mod.current_config().enable_shorts, "缺字段不许把做空关掉")
+            # 显式 0 仍然要能关掉（保留兼容能力）
+            r = c.post("/admin/rules", data={
+                "equity": "777", "risk_pct": "0.03", "leverage": "4",
+                "stop_min": "0.02", "stop_max": "0.09", "short_regime_ma": "120",
+                "enable_long": "0", "enable_shorts": "0", "k": TOKEN},
+                follow_redirects=False)
+            self.assertEqual(r.status_code, 303)
             self.assertFalse(mod.current_config().enable_shorts)
+            self.assertFalse(mod.current_config().enable_long)
 
     def test_legacy_hl_mode_and_kill_curl_compat(self):
         mod = self._mod()
@@ -839,6 +850,29 @@ class TestSwitchFlagParsing(BaseCase):
         self.assertIn(r.status_code, (200, 303))
         self.assertEqual(str(self.db.get_config_str("enable_long")), "1")
         self.assertTrue(self._cfg().enable_long)
+
+    def test_strategy_weird_value_direction_is_fail_closed(self):
+        """方向开关：识别不了的值按「关」（安全侧；旧参数页语义本就如此）。"""
+        self.db.set_config("enable_long", 1)
+        r = self.post("/admin/switch/strategy", enable_long="weird")
+        self.assertIn(r.status_code, (200, 303))
+        self.assertIn("0", str(self.db.get_config_str("enable_long")))
+
+    def test_strategy_weird_value_cleanup_is_fail_open(self):
+        """到期自动清仓：识别不了的值按「开」（沿用旧 _cleanup_on 的 H3 取舍）。
+
+        漏清仓的代价（到期后仓位想平也平不了）远大于误开（可能提前平一笔）。
+        面板本身只提交 0/1，这条只防脚本发垃圾值时把保护静默关掉。
+        """
+        self.db.set_config("agent_expiry_cleanup", 0)
+        r = self.post("/admin/switch/strategy", agent_expiry_cleanup="weird")
+        self.assertIn(r.status_code, (200, 303))
+        self.assertIn("1", str(self.db.get_config_str("agent_expiry_cleanup")))
+
+    def test_strategy_explicit_zero_still_turns_cleanup_off(self):
+        self.db.set_config("agent_expiry_cleanup", 1)
+        self.post("/admin/switch/strategy", agent_expiry_cleanup="0")
+        self.assertIn("0", str(self.db.get_config_str("agent_expiry_cleanup")))
 
 
 class TestStrategyCard(BaseCase):
