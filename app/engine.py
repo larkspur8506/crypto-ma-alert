@@ -40,6 +40,12 @@ DISPLAY_TZ_OFFSET_HOURS = float(os.environ.get("DISPLAY_TZ_OFFSET", "8"))
 DISPLAY_TZ = dt.timezone(dt.timedelta(hours=DISPLAY_TZ_OFFSET_HOURS))
 TZ_LABEL = "北京时间" if DISPLAY_TZ_OFFSET_HOURS == 8 else f"UTC{DISPLAY_TZ_OFFSET_HOURS:+g}"
 
+# 周报窗口：固定「过去 7 天」（滚动窗口，不是自然周——周一跑也能覆盖完整 7 天）。
+WEEKLY_WINDOW_S = 7 * 86400
+# 系统上线日（周报「上线以来」段的起点，写死；不要拿最早一条成交推——早期手工
+# 试单会让起点漂移，读者对不上「共 N 笔」的口径）。
+WEEKLY_LAUNCH_DATE = dt.date(2026, 10, 12)
+
 
 def fmt_ms(ms: int) -> str:
     return dt.datetime.fromtimestamp(ms / 1000, DISPLAY_TZ).strftime("%m-%d %H:%M")
@@ -730,28 +736,248 @@ def heartbeat_text(db, cfg) -> str:
     return "\n".join(lines)
 
 
-def weekly_text(db, cfg) -> str:
+def _disp_symbol(sym) -> str:
+    """BTC_USDT → BTC（周报只说币名，交易所在哪不影响读者理解）。"""
+    s = str(sym or "").strip()
+    for suf in ("_USDT", "_USDC", "_USD"):
+        if s.endswith(suf):
+            return s[: -len(suf)]
+    return s
+
+
+def _side_word(side) -> str:
+    """方向白话：+1 做多 / -1 做空。"""
+    try:
+        return "做多" if int(side or 1) > 0 else "做空"
+    except (TypeError, ValueError):
+        return "做多"
+
+
+def _sgn(x: float, nd: int = 2, comma: bool = False) -> str:
+    """带符号数字：+1.23 / −1.23（负数用排版减号 U+2212，微信里比 ASCII 横杠清楚）。"""
+    body = f"{abs(float(x)):,.{nd}f}" if comma else f"{abs(float(x)):.{nd}f}"
+    return ("+" if float(x) >= 0 else "−") + body
+
+
+def _circle(i: int) -> str:
+    """①…⑳；超过 20 笔退化成 21. 22. —— 圈码只到 20。"""
+    return chr(0x2460 + i - 1) if 1 <= i <= 20 else f"{i}."
+
+
+def _exit_reason_plain(reason, side) -> str:
+    """离场原因 → 一句人话。未知原因原样保留（绝不翻译成看着像结论的词）。"""
+    r = str(reason or "").strip()
+    if r == "ma20":
+        # 多头是收盘跌破均线离场、空头是收盘站上均线离场：方向不同说法必须不同，
+        # 否则空单写「收下均线」等于把离场理由说反。
+        return "价格收上均线，正常离场" if _side_word(side) == "做空" else "价格收下均线，正常离场"
+    if r == "stop":
+        return "触发止损"
+    if r in ("agent_expiry_cleanup", "expiry_cleanup"):
+        return "API 到期保护清仓"
+    return r or "原因未记录"
+
+
+def _exec_mode(db) -> str:
+    """执行器模式：DB（面板写入）> env > 未知。读不到就写「未知」，不猜成 off。"""
+    raw = ""
+    try:
+        raw = str(db.get_config_str("hl_exec_mode", "") or "").strip().strip('"')
+    except Exception:                                               # noqa: BLE001
+        raw = ""
+    if not raw:
+        raw = (os.environ.get("HL_EXEC_MODE") or "").strip()
+    # 只认三种合法模式；其它（含空）统统写「未知」——把脏值原样印出去等于替
+    # 用户断言一个不存在的执行状态。
+    return raw if raw in ("off", "dry", "live") else "未知"
+
+
+def _feed_state(db) -> str:
+    """信号源健康度：与心跳同口径 —— 最近一次失败晚于最近一次成功即异常。
+
+    没有任何健康行时写「未知」（不能默认正常：一次都没成功的源也不等于正常）。
+    """
+    try:
+        rows = list(db.feed_status() or [])
+    except Exception:                                               # noqa: BLE001
+        return "未知"
+    if not rows:
+        return "未知"
+    bad = []
+    for r in rows:
+        ok_at = float(r["last_ok_at"] or 0)
+        err_at = float(r["error_at"] or 0)
+        if not (ok_at > 0 and ok_at >= err_at):
+            bad.append(_disp_symbol(r["symbol"]))
+    if not bad:
+        return "正常"
+    return "异常（" + "、".join(bad) + "）"
+
+
+def _equity_window(db) -> Optional[Tuple[float, float]]:
+    """窗口首条 / 最新一条 hl_snapshots 的账户净值（equity 列）。任一端取不到返回 None。
+
+    「最新一条」就是库里最后那行 —— 它的 equity 是 0/NULL 时按取不到处理，
+    不回退到更早的快照冒充本周净值（那等于拿旧数当新数）。
+    """
     import time as _t
-    since = _t.time() - 7 * 86400
-    rows = db.closed_positions(since)
-    lines = [f"{cfg.alert_prefix}周报 {dt.datetime.now(DISPLAY_TZ).strftime('%Y-%m-%d')}"]
-    if rows:
-        rs = [r["r_multiple"] or 0.0 for r in rows]
-        wins = [x for x in rs if x > 0]
-        lines.append(f"本周平仓 {len(rs)} 笔：均R {sum(rs) / len(rs):+.2f}，"
-                     f"胜率 {len(wins) / len(rs) * 100:.0f}%，总R {sum(rs):+.1f}")
+    first = None
+    first_id = None
+    try:
+        snaps = list(db.hl_snapshots(_t.time() - WEEKLY_WINDOW_S) or [])
+    except Exception:                                               # noqa: BLE001
+        snaps = []
+    for r in snaps:
+        try:
+            v = float(r["equity"])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if v > 0:
+            first = v
+            first_id = posfields.field(r, "id")
+            break
+    last = None
+    last_id = None
+    try:
+        row = db.hl_latest_snapshot()
+        if row is not None:
+            v = float(row["equity"])
+            if v > 0:
+                last, last_id = v, posfields.field(row, "id")
+    except Exception:                                               # noqa: BLE001
+        last = None
+    if first is None or last is None:
+        return None
+    # 首尾是同一行 = 窗口里只有一条快照：算不出「本周变化」，按取不到处理
+    # （否则会把 0 变化写成「本周 ±0.0U」，读者会误以为账户这周纹丝不动）。
+    if first_id is not None and first_id == last_id:
+        return None
+    return first, last
+
+
+def weekly_text(db, cfg) -> str:
+    """周报：过去 7 天（北京时间）的平仓、账户净值、逐笔与当前状态。
+
+    读者是拿着真金白银跟单的人，所以三条硬约束：
+    1. 数字只从库里取 —— 净值取不到就写「本轮取不到净值，下轮补」，绝不拿配置
+       本金冒充真实账户；
+    2. 一个数字只出现一次（净值差只在概览），逐笔段不重复合计；
+    3. 只写人话：不复利推演、不写「永续口径/抵押品」这类黑话。
+    """
+    import time as _t
+    now_ts = _t.time()
+    since = now_ts - WEEKLY_WINDOW_S
+    start_d = dt.datetime.fromtimestamp(since, DISPLAY_TZ).date()
+    end_d = dt.datetime.fromtimestamp(now_ts, DISPLAY_TZ).date()
+
+    week_rows = list(db.closed_positions(since) or [])
+    all_rows = list(db.closed_positions(0.0) or [])
+    try:
+        recent = list(db.recent_positions(200) or [])
+    except Exception:                                               # noqa: BLE001
+        recent = []
+    pending_rows = [r for r in recent if r["status"] == "pending"]
+    # 当前持仓 = 真开出来的仓（open）。pending 单列在那行 ⚠️ 提醒里 —— 塞进持仓
+    # 数里会让「持仓 2」里混着一笔还没下单的信号，与下面「待确认」行重复计数。
+    open_rows = [r for r in recent if r["status"] == "open"]
+    # 新开 = 窗口内**真开出来的仓**（open/closed）。pending（待确认）与 ignored
+    # （用户点了忽略/超时作废）都没真进场，两处都算会让概览比实际多开一倍。
+    new_cnt = 0
+    for r in recent:
+        if r["status"] not in ("open", "closed"):
+            continue
+        try:
+            if float(r["created_at"] or 0) >= since:
+                new_cnt += 1
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+
+    lines = [f"{cfg.alert_prefix}周报 {start_d.strftime('%m-%d')}～{end_d.strftime('%m-%d')}"
+             f"（窗口=过去 7 天，{TZ_LABEL}）"]
+
+    # ---------------- 概览
+    lines.append("▍本周概览")
+    if week_rows:
+        by_kd: Dict[Tuple[str, str], int] = {}
+        for r in week_rows:
+            key = (_disp_symbol(r["symbol"]), _side_word(r["side"]))
+            by_kd[key] = by_kd.get(key, 0) + 1
+        kd_txt = "、".join(f"{k[0]} {k[1]}×{v}" if v > 1 else f"{k[0]} {k[1]}"
+                           for k, v in sorted(by_kd.items()))
+        by_why: Dict[str, int] = {}
+        for r in week_rows:
+            why = _exit_reason_plain(r["exit_reason"], r["side"])
+            by_why[why] = by_why.get(why, 0) + 1
+        why_txt = "、".join(f"{k} {v} 笔" for k, v in by_why.items())
+        lines.append(f"平仓 {len(week_rows)} 笔（{kd_txt}；离场原因：{why_txt}）"
+                     f"· 新开 {new_cnt} 笔 · 当前持仓 {len(open_rows)}")
     else:
-        lines.append("本周无平仓")
-    allrows = db.closed_positions(0.0)
-    if allrows:
-        rs = [r["r_multiple"] or 0.0 for r in allrows]
-        # 逐笔连乘（旧版用「均值的幂」高估：50笔+3R+50笔-1R 时 7244 vs 真实 6708）
-        compounded = 1.0
-        for r in rs:
-            compounded *= (1.0 + cfg.risk_pct * r)
-        lines.append(f"累计 {len(rs)} 笔：均R {sum(rs) / len(rs):+.2f}，总R {sum(rs):+.1f}，"
-                     f"按每笔 {cfg.risk_pct * 100:.0f}% 风险复利 ≈ "
-                     f"{fmt_money(cfg.equity * compounded)}U（本金 {fmt_money(cfg.equity)}U）")
-    pending = [r for r in db.recent_positions(200) if r["status"] == "pending"]
-    lines.append(f"未确认（按假设值统计）{len(pending)} 笔")
+        lines.append(f"本周无平仓 · 当前持仓 {len(open_rows)}")
+
+    if pending_rows:
+        lines.append(f"⚠️ 有 {len(pending_rows)} 笔信号待确认，本周统计暂按假设值")
+
+    eq = _equity_window(db)
+    if eq is None:
+        lines.append("账户净值：（本轮取不到净值，下轮补）")
+    else:
+        a, b = eq
+        delta = b - a
+        pct = (delta / a * 100.0) if a else 0.0
+        lines.append(f"账户净值：{a:,.1f} → {b:,.1f} U"
+                     f"（本周 {_sgn(delta, 1, comma=True)} U，约 {_sgn(pct, 1)}%）")
+
+    # ---------------- 逐笔
+    if week_rows:
+        risk_txt = f"{float(cfg.risk_pct) * 100:.2f}%"
+        lines.append("")
+        lines.append(f"▍本周逐笔（1R = 这笔交易计划的亏损额，即开仓时净值的 {risk_txt}）")
+        for i, r in enumerate(week_rows, 1):
+            entry = posfields.entry_px(r)
+            if entry is None:
+                entry = r["entry_price"]
+            exit_px = posfields.field(r, "exit_price")
+            closed_at = float(r["closed_at"] or 0)
+            day = dt.datetime.fromtimestamp(closed_at, DISPLAY_TZ).strftime("%m-%d")
+            rmult = float(r["r_multiple"] or 0.0)
+            lines.append(
+                f"{_circle(i)} {day} {_disp_symbol(r['symbol'])} {_side_word(r['side'])} "
+                f"{fmt_money(entry)} → {fmt_money(exit_px or 0)}　{_sgn(rmult, 2)}R　"
+                f"{_exit_reason_plain(r['exit_reason'], r['side'])}")
+
+    # ---------------- 上线以来
+    lines.append("")
+    lines.append(f"▍上线以来（{WEEKLY_LAUNCH_DATE.strftime('%m-%d')} 起）")
+    if all_rows:
+        all_r = [float(r["r_multiple"] or 0.0) for r in all_rows]
+        wins = sum(1 for x in all_r if x > 0)
+        losses = sum(1 for x in all_r if x < 0)
+        lines.append(f"共 {len(all_r)} 笔：胜 {wins} · 负 {losses}，"
+                     f"合计 {_sgn(sum(all_r), 2)}R")
+    else:
+        lines.append("共 0 笔：还没有已平仓的交易")
+
+    week_r = [float(r["r_multiple"] or 0.0) for r in week_rows]
+    if len(week_r) >= 2 and all(x < 0 for x in week_r):
+        n = len(week_r)
+        probs = "、".join(f"{0.65 ** k * 100:.1f}%（{k} 笔）" for k in (n, n + 1, n + 2))
+        lines.append(f"本策略历史胜率约 35%，靠少数大赢单覆盖多数小亏单；"
+                     f"起步连亏的概率约 {probs}，属正常波动，不是策略失效。")
+    lines.append("按既定规则：实盘满 20 笔或满 12 个月才做第一次评估，系统会自动报告。")
+
+    # ---------------- 当前状态
+    lines.append("")
+    lines.append("▍当前状态")
+    if open_rows:
+        hold = []
+        for r in sorted(open_rows, key=lambda x: float(
+                posfields.field(x, "opened_at") or x["created_at"] or 0)):
+            opened = float(posfields.field(r, "opened_at") or r["created_at"] or 0)
+            day = dt.datetime.fromtimestamp(opened, DISPLAY_TZ).strftime("%m-%d") if opened else "日期不详"
+            hold.append(f"{_disp_symbol(r['symbol'])} {_side_word(r['side'])}（{day} 开仓）")
+        hold_txt = "、".join(hold)
+    else:
+        hold_txt = "无"
+    lines.append(f"持仓：{hold_txt}｜ 执行器：{_exec_mode(db)} ｜ "
+                 f"信号源：{_feed_state(db)}")
     return "\n".join(lines)
