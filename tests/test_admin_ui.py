@@ -216,8 +216,8 @@ class TestOverviewTab(BaseCase):
         html = self.body(tab="overview")
         for s in ("账户总值", "权益曲线", "仓位", "交易所挂单"):
             self.assertIn(s, html)
-        # 2026-10-19：「API 有效期」卡片迁到参数页（运维设置，不是当下状态）
-        self.assertNotIn("<h2>API 有效期</h2>", html)
+        # 2026-10-19：状态卡在总览末尾（PR#29 搬多了，用户拍板只把「更新 API」表单留参数页）
+        self.assertIn("<h2>API 有效期</h2>", html)
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
         # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
@@ -231,8 +231,8 @@ class TestOverviewTab(BaseCase):
         for keep in ("<h2>仓位</h2>", "<h2>交易所挂单</h2>", "<h2>系统</h2>",
                      "<h2>权益曲线</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
-        # API 有效期卡片已迁到参数页 —— 总览不许「删了又长回来」
-        self.assertNotIn("<h2>API 有效期</h2>", html)
+        # API 有效期状态卡在总览末尾（只把写私钥的「更新 API」表单留在参数页）
+        self.assertIn("<h2>API 有效期</h2>", html)
         # 三标的动态（用户钉死在 tabs 之后第一块）仍在
         self.assertIn("三标的动态", html)
 
@@ -267,8 +267,10 @@ class TestParamsTab(BaseCase):
         for s in ("策略", "执行与推送", "资金", "单笔风险", "杠杆", "止损距离",
                   "资金口径", "保存全部参数"):
             self.assertIn(s, html)
-        # 2026-10-19：API 有效期卡片迁到参数页末尾
-        self.assertIn("<h2>API 有效期</h2>", html)
+        # 2026-10-19：状态卡回总览末尾；参数页只留「更新 API（续期）」表单
+        self.assertNotIn("<h2>API 有效期</h2>", html)
+        self.assertIn("/admin/hl/agent/renew", html)
+        self.assertNotIn("代理钱包地址", html)
         # 资金口径改成单选钮 + data-mode（配合原生 JS 显隐）
         self.assertIn("name='equity_mode'", html)
         self.assertIn("type='radio'", html)

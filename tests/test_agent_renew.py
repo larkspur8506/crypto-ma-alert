@@ -436,37 +436,53 @@ class TestRenewPanel(Base):
         app.include_router(build_admin_router(deps))
         return TestClient(app)
 
-    def test_params_tab_has_card_and_collapsed_form(self):
+    def test_overview_has_status_card(self):
+        """状态卡（地址/到期日/剩余/状态词）在总览 —— 只把「更新 API」表单留参数页。"""
         A.write_state(self.db, {"address": "0xc1ee4519ce893070c83cf90b324c6c8e5484be22",
                                 "valid_until_ms": NOW_MS + 100 * DAY_MS,
                                 "days_left": 100, "checked_ms": NOW_MS,
                                 "cleanup": "none", "source": "api", "level": "ok"})
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("<h2>API 有效期</h2>", html)
         self.assertIn("代理钱包地址", html)
         self.assertIn("0xc1ee…be22", html, "地址要前 6 + 后 4 截断")
         self.assertIn("到期日", html)
         self.assertIn("还剩 100 天", html)
         self.assertIn("正常", html)
+        self.assertIn("到期前自动清仓", html)
+        # 状态卡里不再有写操作入口（续期表单已迁参数页）
+        self.assertNotIn("action='/admin/hl/agent/renew'", html)
+
+    def test_params_tab_has_renew_block(self):
+        """「更新 API（续期）」折叠表单在参数页：原生 <details>，无地址/状态行。"""
+        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        self.assertIn("更新 API（续期）", html)
         # 折叠表单：原生 <details class="msgdetails">
-        self.assertIn('<details class="msgdetails"><summary>更新 API', html)
+        self.assertIn('<details class="msgdetails"><summary>在 HL 网页续期后粘贴新私钥',
+                      html)
         self.assertIn("action='/admin/hl/agent/renew'", html)
         self.assertIn("type='password' name='privkey'", html)
         self.assertIn("More → API", html)
         self.assertIn("同名 Hermes", html)
+        self.assertNotIn("代理钱包地址", html)
 
-    def test_card_position_at_end_of_params_page(self):
-        """2026-10-19：卡片从总览末尾迁到参数页末尾（保存按钮 / 清除兜底之后）。"""
+    def test_card_position_at_end_of_pages(self):
+        """状态卡在总览末尾（「系统」卡之后）；续期表单在参数页保存按钮之后。"""
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 10 * DAY_MS,
                                 "days_left": 10, "checked_ms": NOW_MS,
                                 "cleanup": "none", "source": "api", "level": "near"})
         c = self._client()
-        html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
-        self.assertLess(html.index("保存全部参数"), html.index("<h2>API 有效期</h2>"))
-        # 总览（当下状态页）不再有这张卡片
         ov = c.get("/admin", params={"k": "tk", "tab": "overview"}).text
-        self.assertNotIn("<h2>API 有效期</h2>", ov)
-        self.assertNotIn("代理钱包地址", ov)
+        # 总览末尾：账户卡与「系统」区块之后
+        self.assertLess(ov.index("账户</div>"), ov.index("<h2>API 有效期</h2>"))
+        self.assertLess(ov.index("<h2>系统</h2>"), ov.index("<h2>API 有效期</h2>"))
+        # 三标的动态仍在账户卡之前（原位置未被挤动）
+        if "三标的动态" in ov:
+            self.assertLess(ov.index("三标的动态"), ov.index("账户</div>"))
+        # 参数页：续期小区块在「保存全部参数」之后
+        html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
+        self.assertLess(html.index("保存全部参数"), html.index("更新 API（续期）"))
+        self.assertNotIn("<h2>API 有效期</h2>", html)
 
     def test_state_word_mapping(self):
         """L4：用精确锚点断言（「状态」那一行的 `<span class='v'>`），不再用恒真的 assertIn。"""
@@ -477,7 +493,7 @@ class TestRenewPanel(Base):
                                     "valid_until_ms": NOW_MS + 5 * DAY_MS,
                                     "days_left": 5, "checked_ms": NOW_MS,
                                     "cleanup": "none", "source": "api", "level": level})
-            html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+            html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
             self.assertRegex(html, pat % word,
                              f"level={level} 时状态词应精确渲染成 {word}")
 
@@ -486,7 +502,7 @@ class TestRenewPanel(Base):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": None,
                                 "days_left": None, "checked_ms": NOW_MS,
                                 "cleanup": "none", "source": "api", "level": "no_expiry"})
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertRegex(html, "<span class='k'>状态</span><span class='v[^']*'>不限期</span>")
         self.assertIn("不会到期", html)
         self.assertIn("不限期（HL 授权没设到期）", html)
@@ -496,7 +512,7 @@ class TestRenewPanel(Base):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,
                                 "days_left": 2, "checked_ms": NOW_MS,
                                 "cleanup": "skipped", "source": "api", "level": "cleanup"})
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("未自动清仓（执行器 off）", html)
         self.assertNotIn("清仓失败", html)
 
@@ -504,19 +520,19 @@ class TestRenewPanel(Base):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,
                                 "days_left": 2, "checked_ms": NOW_MS,
                                 "cleanup": "done", "source": "api", "level": "cleanup"})
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("已清仓", html)
 
     def test_cleanup_failed_shows_retry(self):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,
                                 "days_left": 2, "checked_ms": NOW_MS,
                                 "cleanup": "failed", "source": "api", "level": "cleanup"})
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("清仓失败", html)
 
     def test_unknown_state_renders_without_network(self):
         """state 空 → 显示未知与「下一个整点」，且不调用任何 info 方法。"""
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("<h2>API 有效期</h2>", html)
         self.assertIn("未知", html)
         self.assertIn("下一个整点", html)
@@ -525,7 +541,7 @@ class TestRenewPanel(Base):
         A.write_state(self.db, {"address": "0xabc", "valid_until_ms": NOW_MS + 2 * DAY_MS,
                                 "days_left": 2, "checked_ms": NOW_MS,
                                 "cleanup": "none", "source": "api", "level": "cleanup"})
-        html = self._client(cleanup_on=False).get("/admin", params={"k": "tk", "tab": "params"}).text
+        html = self._client(cleanup_on=False).get("/admin", params={"k": "tk", "tab": "overview"}).text
         self.assertIn("已关闭", html)
 
     def test_renew_endpoint_success_303_to_overview(self):
