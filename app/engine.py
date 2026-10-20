@@ -407,21 +407,12 @@ def _index_of_bar(bars: Sequence[strategy.Bar], bar_ms: int) -> Optional[int]:
 # symbol_state，面板只读库。**纯展示层，不参与任何信号或执行决策。**
 
 def _dense_run(band: Sequence[Optional[float]], cfg, i: int) -> int:
-    """以第 i 根结尾的「连续密集」根数。
+    """以第 i 根结尾的「连续密集」根数（薄封装：判定在 strategy.dense_run，同一份口径）。
 
-    密集的原始判定就是 strategy.squeeze_flags 的核心条件（band ≤ 回看窗口的 20% 分位）。
-    这里用 `min_bars=1` 调**同一个函数**取原始判定（「连续 ≥1 根」= 单根成立），再往回
-    数连续根数 —— 不复制窗口/分位常数，也不另写一套判定，避免与信号口径分叉
-    （signal 要的是「连续 ≥ cfg.min_squeeze_bars 根」，面板要的是不足 6 根时还差几根）。
+    面板要的是「还差几根」，signal 要的是「连续 ≥ cfg.min_squeeze_bars 根」；两边都从
+    strategy 的 `squeeze_flags(min_bars=1)` 派生，不复制窗口/分位常数。
     """
-    if i < 0 or not band:
-        return 0
-    flags = strategy.squeeze_flags(band, cfg.band_window, cfg.band_quantile, 1)
-    n, j = 0, min(i, len(flags) - 1)
-    while j >= 0 and flags[j]:
-        n += 1
-        j -= 1
-    return n
+    return strategy.dense_run(band, i, cfg.band_window, cfg.band_quantile)
 
 
 def symbol_snapshot(cfg, bars: Sequence[strategy.Bar], ind: Dict[str, List[Optional[float]]],

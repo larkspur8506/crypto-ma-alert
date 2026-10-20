@@ -971,6 +971,137 @@ def _symbol_dynamics(p: dict) -> str:
     return "".join(o)
 
 
+# ---------------------------------------------------------------- 「为什么没开仓」（/why）
+# 用户视角的问题永远是同一句：「行情在动，为什么它不动？」——这张区块就是答案，每标的一行：
+# 信号态（六步里的拦截点）+ 本标的的闸门徽章（静置剩余 / churn 次数 / 熔断）。
+#
+# 数据来自 `app.why.build_rows`（纯只读：现取 4h K 线 → strategy.explain_entry 给六步 →
+# Executor.gate_state_for 读闸门）。**面板不重算任何判定**，只做渲染。
+WHY_BLOCK_TITLE = "为什么没开仓"
+# 拦截点 → 人话（key 与 strategy.WHY_STEPS 一致；unknown 是漂移兜底）
+_WHY_STEP_TXT = {
+    "ok": "无拦截（信号成立）",
+    "bars": "K 线根数不足",
+    "squeeze": "均线不密集",
+    "breakout": "收盘没破线",
+    "regime": "MA200 过滤拦下",
+    "stop": "止损距离越界",
+    "decision": "无信号",
+    "unknown": "口径漂移（需排查）",
+}
+_WHY_STEP_CLS = {"ok": "pos", "bars": "neg", "squeeze": "muted", "breakout": "muted",
+                 "regime": "muted", "stop": "warn", "decision": "muted", "unknown": "neg"}
+_GATE_TXT = {"ok": "闸门放行", "settle": "静置中", "churn": "churn 熔断"}
+_GATE_CLS = {"ok": "pos", "settle": "warn", "churn": "neg"}
+
+
+def _why_signal_cell(r: Dict[str, Any]) -> str:
+    """信号态单元格：开着仓说仓位，没开仓说被哪一步拦下（含原因摘要）。"""
+    pos = _as_dict(r.get("position"))
+    why = _as_dict(r.get("why"))
+    if pos:
+        st = str(pos.get("status") or "")
+        side = "多" if int(_num(pos.get("side"), 1)) >= 0 else "空"
+        if st == "open":
+            return (f"<span class='pos'>持仓中（{side}）</span>"
+                    f"<div class='muted'>{_fmt_sz(pos.get('qty'))} {_esc(pos.get('qty_unit') or '')}"
+                    f" · 止损 {_fmt(pos.get('stop'))}</div>")
+        if st == "pending":
+            return ("<span class='warn'>待确认（占槽）</span>"
+                    "<div class='muted'>同一标的至多 1 仓，确认前不评估新入场</div>")
+    if r.get("error"):
+        return f"<span class='neg'>行情读取失败</span><div class='muted'>{_esc(r['error'])}</div>"
+    if not why:
+        return "<span class='muted'>—</span>"
+    if why.get("fired"):
+        side = "多" if int(_num(why.get("side"))) > 0 else "空"
+        return (f"<span class='pos'>信号成立（{side}）</span>"
+                f"<div class='muted'>等入场 / 或本轮已被处理</div>")
+    key = str(why.get("blocked_by") or "decision")
+    txt = _WHY_STEP_TXT.get(key, key)
+    cls = _WHY_STEP_CLS.get(key, "muted")
+    reason = str(why.get("reason") or "—")
+    drift = " <span class='neg'>⚠️漂移</span>" if why.get("drift") else ""
+    return (f"<span class='{cls}'>{_esc(txt)}</span>{drift}"
+            f"<div class='muted'>{_esc(reason)}</div>")
+
+
+def _why_gate_cell(r: Dict[str, Any]) -> str:
+    """闸门徽章：关注侧（持仓方向 > 信号方向 > 双侧都给）。纯展示，读的是执行器类状态。"""
+    gates = _as_dict(r.get("gates"))
+    gate = _as_dict(r.get("gate"))
+    side = int(_num(r.get("gate_side")))
+    items: List[tuple] = []
+    if gate:
+        items.append(("多" if side >= 0 else "空", gate))
+    else:
+        for key, label in (("long", "多"), ("short", "空")):
+            g = _as_dict(gates.get(key))
+            if g:
+                items.append((label, g))
+    if not items:
+        return "<span class='muted'>—</span>"
+    out: List[str] = []
+    for label, g in items:
+        verdict = str(g.get("verdict") or "ok")
+        txt = _GATE_TXT.get(verdict, verdict)
+        cls = _GATE_CLS.get(verdict, "muted")
+        # 静置窗口只有 15s，四舍五入到整数秒就够；churn 阈值 <=0 = 熔断关闭，要如实说
+        limit = int(_num(g.get("churn_limit")))
+        churn_txt = (f"churn {int(_num(g.get('churn_count')))}/{limit}" if limit > 0
+                     else "churn 熔断已关闭")
+        out.append(f"<span class='{cls}'>{label}·{_esc(txt)}</span>"
+                   f"<div class='muted'>静置剩余 {int(_num(g.get('settle_remaining_s')))}s"
+                   f" · {_esc(churn_txt)}</div>")
+    return "".join(out)
+
+
+def _why_block(rows: List[Dict[str, Any]]) -> str:
+    """「为什么没开仓」区块：每标的一行（信号态 / 拦截原因 / 闸门徽章）。
+
+    位置：总览「三标的动态」之后 —— 两者回答的是同一个问题（现在能不能动），
+    一个说「离触发线多远」，一个说「卡在哪一步」，分开看会来回切页。
+    fail-soft：行数据缺失/字段为 None 都不抛，最坏显示「—」；整块异常由调用点兜。
+    """
+    if not rows:
+        return ""
+    o: List[str] = [
+        f"<h2>{WHY_BLOCK_TITLE}"
+        "<span class=\"muted\">每根 4h 收盘按同一套规则判定 · 闸门状态实时读取 · 只读诊断</span></h2>",
+        "<div class='tablewrap'><table><thead><tr>"
+        "<th>标的</th><th>现价</th><th>信号态 / 拦截原因</th><th>闸门（动作前置）</th>"
+        "</tr></thead><tbody>",
+    ]
+    for r in rows:
+        d = _as_dict(r)
+        coin = _esc(d.get("coin") or _disp(d.get("symbol")) or "—")
+        o.append("<tr>"
+                 f"<td>{coin}</td>"
+                 f"<td class='num'>{_fmt(d.get('price'))}</td>"
+                 f"<td>{_why_signal_cell(d)}</td>"
+                 f"<td>{_why_gate_cell(d)}</td>"
+                 "</tr>")
+    o.append("</tbody></table></div>")
+    # 可见脚注（iOS Safari 点不出 title）：说明「信号」与「闸门」是两道独立的门。
+    o.append("<div class='legend'>信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）；"
+             "闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），"
+             "只影响「什么时候动手」，不改变信号本身。</div>")
+    return "".join(o)
+
+
+def _why_rows(deps: "DashboardDeps") -> List[Dict[str, Any]]:
+    """现算 /why 行（只读）。任何异常都退回空列表 —— 诊断区块绝不弄挂总览页。"""
+    try:
+        from app import why as why_mod
+        cfg = _call(deps.config_fn)
+        if cfg is None:
+            return []
+        return why_mod.build_rows(deps.db, cfg)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] /why 诊断计算失败（区块略去）：%s", e)
+        return []
+
+
 def _sign(v: Any, unit: str = " U") -> tuple:
     """返回 (带符号文本, 颜色 class)。"""
     f = _opt_num(v)
@@ -1082,6 +1213,16 @@ def _render_body(p: dict) -> str:
         o.append(_symbol_dynamics(p))
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
+
+    # ---------------- 为什么没开仓（/why，只读诊断） ----------------
+    # 紧接「三标的动态」：前者说「离触发线多远」，这里说「卡在哪一步、有没有被闸门挡」，
+    # 是同一个问题的两半。数据由调用方注入 payload["why"]（本函数不做 I/O、不建依赖），
+    # 这样 _render_body 仍可在测试里用纯 dict 驱动。
+    try:
+        o.append(_why_block(_as_list(p.get("why"))))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] /why 区块渲染失败：%s", e)
+
 
     # ---------------- 账户卡片 ----------------
     o.append("<div class='card'><div class='sec'>账户</div><div class='grid'>")
@@ -1371,6 +1512,18 @@ def build_router(deps: DashboardDeps) -> Any:
             "positions": p.get("positions") or [],
             "curve": p.get("equity_curve") or {},
         }
+
+    @router.get("/api/hl/why")
+    def hl_why(request: Request, k: str = ""):
+        """`/why` 决策解释（JSON，只读）：每标的一行六步 + 闸门状态。
+
+        与面板同一份数据（`_why_rows` → `app.why.build_rows`），方便运维用 curl 看
+        「现在为什么不开仓」，而不必去翻 HTML。只读，无任何副作用。
+        """
+        if _admin_required(deps, k, request):
+            raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
+        rows = _why_rows(deps)
+        return {"ts": _num(_call(deps.now_fn), time.time()), "symbols": rows}
 
     @router.get("/api/hl/snapshot")
     def hl_snapshot(request: Request, k: str = ""):

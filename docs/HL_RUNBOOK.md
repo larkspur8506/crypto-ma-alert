@@ -65,7 +65,22 @@ curl -s -X POST -d "on=0&k=$K" "$BASE/admin/hl/kill"
 
 # 手动触发一次 tick（跑真实行情，dry 模式不会下单）
 curl -s -X POST "$BASE/admin/tick?k=$K"
+
+# 为什么没开仓（/why，只读诊断；PR-5）
+curl -s "$BASE/api/hl/why?k=$K" | python3 -m json.tool   # 每标的：六步 + 闸门状态
+# 容器内纯文本版（同一条链路；不进面板也能看）
+ssh oracle1 'sudo -n docker exec crypto-ma-alert python -m app.why'
 ```
+
+`/api/hl/why` 的字段口径：
+
+- `symbols[].why.steps[]` —— 六步（`bars` 根数 → `squeeze` 密集 → `breakout` 破线 →
+  `regime` MA200 → `stop` 止损距离 → `decision` 结论），每步 `ok` + 一句人话 `detail`；
+- `symbols[].why.blocked_by` —— **第一个**不成立的步骤（`ok` = 有信号）；
+- `symbols[].why.drift` —— 六步推导与 `evaluate_entry` 的返回值不一致（正常恒 `false`，
+  出现即说明诊断与信号口径已分叉，需排查）；
+- `symbols[].gates.{long,short}` —— 闸门状态（静置剩余秒 / 10 分钟 churn 次数 / 是否熔断）。
+  **只读**：读它不会续期静置窗口、不会加 churn 计数、不写事件、不置 kill。
 
 ### 服务器侧
 
@@ -217,6 +232,8 @@ strike，再解除 kill 即可。
 /opt/data/cache/scratch/cma-venv/bin/python -m unittest tests.test_app_smoke
 # API 到期监控 / 自动清仓 / 面板更新 API
 /opt/data/cache/scratch/cma-venv/bin/python -m unittest tests.test_agent_expiry tests.test_agent_renew
+# /why 只读诊断（六步 + 闸门只读性 + 与 evaluate_entry 一致性）
+/opt/data/cache/scratch/cma-venv/bin/python -m unittest tests.test_why
 # 只读客户端（不需要凭据）
 /opt/data/cache/scratch/cma-venv/bin/python -c "from app.hl.info import HlInfo; print(len(HlInfo().specs()))"
 ```
