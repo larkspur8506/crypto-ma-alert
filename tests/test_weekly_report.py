@@ -10,14 +10,15 @@ import datetime as dt
 import os
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app import engine                                          # noqa: E402
 from app.config import Config                                   # noqa: E402
 from app.db import DB                                           # noqa: E402
-from app.db import now as db_now                                # noqa: E402
 
 DAY = 86400.0
 MINUS = "−"          # 文案里的排版减号（U+2212），与 ASCII 横杠不同
@@ -38,15 +39,39 @@ def make_db() -> DB:
     return DB(os.path.join(tmp, "weekly.db"))
 
 
-_NOW = db_now()          # 统一时间基准：夹具里所有相对秒数都从这一刻往回算
+_CLOCK_BASE = dt.datetime(2026, 10, 19, 12, 0,
+                          tzinfo=engine.DISPLAY_TZ).timestamp()
 _SEQ = [0]               # signal_bar_ms 唯一化：positions 有 UNIQUE(symbol, signal_bar_ms)
+
+# 时钟平移（天）：默认 0；回归「日期漂移」时可整体挪到 ±2 天再跑全文件，
+# 用例必须仍然全绿 —— 证明断言只依赖时钟的相对关系，不依赖真实日期。
+CLOCK_OFFSET_DAYS = float(os.environ.get("FROZEN_CLOCK_OFFSET_DAYS", "0") or 0.0)
+
+
+def frozen_clock(offset_days: float = 0.0):
+    """把时间源冻在 `_CLOCK_BASE`（北京时间 2026-10-19 12:00）再加 offset_days。
+
+    为什么必须冻：engine.weekly_text 用 `time.time()` 算「过去 7 天」窗口和逐笔日期，
+    夹具的仓位/快照时间戳如果也取真实 now，两边同源却会随墙钟一起漂 —— 一旦断言
+    里出现写死日期（或跨自然日边界），CI 就会某天突然变红：2026-10-20 那次红灯
+    就是期望串钉了 10-17、实际渲染成 10-18。
+
+    冻在**正午**而不是 23:xx，是为了 ±48h 平移时不跨自然日：断言只看相对日期，
+    不会因为「跑测试时正好几点」而改变结果。patch 的是 `time.time` 本身，
+    engine/db 都是 `import time` 后调 `time.time()`，所以一次 patch 两边同时生效。
+    """
+    return mock.patch("time.time", return_value=_CLOCK_BASE + offset_days * DAY)
 
 
 def add_position(db: DB, *, symbol="BTC_USDT", side=-1, entry=100_000.0, stop=103_000.0,
                  status="open", created_days_ago=1.0, exit_price=None, exit_reason=None,
                  r_multiple=None, close_days_ago=0.5, opened_days_ago=None) -> int:
-    """建一行仓位；closed 的按参数钉死 r_multiple / closed_at（展示层只读这几个字段）。"""
-    now = _NOW
+    """建一行仓位；closed 的按参数钉死 r_multiple / closed_at（展示层只读这几个字段）。
+
+    时间基准取**当前（可能被冻住的）时钟**，不取模块级常量：这样夹具时间戳与
+    实现取 now 是同一个来源，时钟整体平移时场景跟着一起走。
+    """
+    now = time.time()
     _SEQ[0] += 1
     pid = db.create_position(symbol=symbol,
                              signal_bar_ms=int((now - created_days_ago * DAY) * 1000) + _SEQ[0],
@@ -72,13 +97,53 @@ def add_position(db: DB, *, symbol="BTC_USDT", side=-1, entry=100_000.0, stop=10
 
 
 def snap(db: DB, days_ago: float, equity: float) -> None:
-    db.hl_add_snapshot({"ts": _NOW - days_ago * DAY, "equity": equity})
+    db.hl_add_snapshot({"ts": time.time() - days_ago * DAY, "equity": equity})
+
+
+def date_of(days_ago: float) -> str:
+    """当前（冻结）时钟往前 days_ago 天的「%m-%d」——与 engine 渲染逐笔日期同一来源。
+
+    期望串从夹具时间戳推导而不是写死 "10-17"：写死日期会让用例随真实时间漂，
+    这正是 2026-10-20 CI 变红的原因（钉 10-17，实际渲染 10-18）。
+    """
+    return dt.datetime.fromtimestamp(time.time() - days_ago * DAY,
+                                     engine.DISPLAY_TZ).strftime("%m-%d")
+
+
+def today() -> dt.date:
+    """冻结时钟下的「北京今天」。
+
+    不能用 `dt.datetime.now(tz)`：它读 C 层 clock_gettime，绕过被 patch 的
+    `time.time`，于是断言用真实日期、渲染用冻结日期 —— 平移时钟时又会假红。
+    """
+    return dt.datetime.fromtimestamp(time.time(), engine.DISPLAY_TZ).date()
+
+
+_clock = frozen_clock(CLOCK_OFFSET_DAYS)
+
+
+def setUpModule():
+    _clock.start()
+
+
+def tearDownModule():
+    _clock.stop()
 
 
 class WeeklyFixture(unittest.TestCase):
+    """所有周报用例的公共夹具。
+
+    时钟在整个模块生命周期内冻结（见 `setUpModule`），而不是每个用例各自开关：
+    engine 的 7 天窗口与夹具时间戳必须共用同一个 now，否则跨零点那一瞬间就会
+    出现「仓位不在窗口内 / 日期差一天」的偶发红灯。
+    """
+
     def setUp(self):
         self.db = make_db()
         self.cfg = make_cfg()
+
+    def tearDown(self):
+        self.db.conn.close()
 
     def render(self) -> str:
         return engine.weekly_text(self.db, self.cfg)
@@ -101,9 +166,10 @@ class TestWithClosedPositions(WeeklyFixture):
         self.text = self.render()
 
     def test_header_is_rolling_7_day_window(self):
-        today = dt.datetime.now(engine.DISPLAY_TZ).date()
-        start = today - dt.timedelta(days=7)
-        self.assertIn(f"【双均线】周报 {start:%m-%d}～{today:%m-%d}（窗口=过去 7 天，北京时间）",
+        # 用冻结时钟的「今天」，与 engine 渲染标题的 now 同源；不能用 dt.datetime.now()
+        today_ = today()
+        start = today_ - dt.timedelta(days=7)
+        self.assertIn(f"【双均线】周报 {start:%m-%d}～{today_:%m-%d}（窗口=过去 7 天，北京时间）",
                       self.text)
 
     def test_overview_counts(self):
@@ -124,9 +190,10 @@ class TestWithClosedPositions(WeeklyFixture):
 
     def test_per_trade_lines(self):
         self.assertIn("▍本周逐笔（1R = 这笔交易计划的亏损额，即开仓时净值的 1.33%）", self.text)
-        self.assertIn(f"① 10-17 BTC 做空 82,909 → 83,930　{MINUS}0.89R　价格收上均线，正常离场",
+        # 日期从夹具的 close_days_ago 推导（同一时间来源），不再写死 10-17/10-18
+        self.assertIn(f"① {date_of(2.0)} BTC 做空 82,909 → 83,930　{MINUS}0.89R　价格收上均线，正常离场",
                       self.text)
-        self.assertIn("② 10-18 ETH 做多 2,500 → 2,650　+3.00R　价格收下均线，正常离场", self.text)
+        self.assertIn(f"② {date_of(1.0)} ETH 做多 2,500 → 2,650　+3.00R　价格收下均线，正常离场", self.text)
 
     def test_no_black_box_or_compounding(self):
         for bad in ("复利", "永续口径", "抵押品", "均R", "总R", "本金"):
