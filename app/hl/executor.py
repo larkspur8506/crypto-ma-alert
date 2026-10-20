@@ -53,6 +53,35 @@ FEE_UNQUOTED_MAX = 200
 # 末位，所以按「≤1 tick 视为一致」，并额外给一个相对噪声容差兜住大数量。
 SIZE_DIFF_STRIKES_TO_KILL = 2
 
+# ---------------------------------------------------------------- 闸门（PR-4）
+# 1) 静置闸门（settling gate）：入场**成交回报**之后 15s 内，该 coin-side 的持仓状态
+#    （数量、挂单列表）还在收敛中，此时按快照去撤单/复价/补挂重试或者再开一次仓，
+#    用的都是「上一个瞬间」的世界。窗口**有界且不可续期**：只由那一次成交回报起算，
+#    后续任何事件（对账、补挂、平仓回报）都不延长它 —— 可续期就等于可以被无限拖延，
+#    而它的目的是「等一小会儿」，不是「一直等」。
+SETTLE_WINDOW_S = 15.0
+# 2) churn 熔断：同一 coin-side 在 CHURN_WINDOW_S 内 cancel/replace（撤单或改价重挂）
+#    达到上限就停手。阈值可配（ExecParams.churn_max ← hl_churn_max），窗口固定：
+#    「10 分钟内 5 次」是运维口径，窗口本身不该随手改（改了就无法和告警文案对照）。
+CHURN_WINDOW_S = 600.0
+CHURN_MAX_DEFAULT = 5
+
+# 动作类别：决定一次动作要过哪几道闸。**放行清单是刻意写死的** ——
+#   首次止损挂单 / 平仓 属于「保护动作」，任何闸门都不能延迟它们（延迟 = 裸仓窗口），
+#   所以它们不查闸；其余动作（新开仓、撤单复价补挂重试）才需要过闸。
+ACT_ENTRY = "entry"                    # 新开仓：静置 + churn
+ACT_REPAIR = "repair"                  # 修复类补挂（stop:fix）：静置 + churn
+ACT_REPLACE = "replace"                # 离场路径的「撤止损 → 重挂」：只过 churn
+                                       # （静置不查：那时止损已被撤，再等就是裸仓）
+ACT_STOP_FIRST = "stop_first"          # 首次止损挂单：不过闸（安全动作）
+ACT_CLOSE = "close"                    # 平仓：不过闸（保护动作）
+
+GATE_OK = "ok"
+GATE_SETTLE = "settle"
+GATE_CHURN = "churn"
+
+_GATE_NONE_ACTIONS = (ACT_STOP_FIRST, ACT_CLOSE)
+
 # pnl_source 取值（positions.pnl_source，面板/报告据此判断该不该采信 net_pnl）
 PNL_SRC_FILLS = "fills"          # 有成交，net_pnl 来自 hl_fills 聚合
 PNL_SRC_NO_FILLS = "no_fills"    # 窗内查不到成交（net_pnl 为 NULL，不猜 0）
@@ -182,6 +211,12 @@ class ExecParams:
     # 默认关的理由：流水口径依赖 hl_fills 已同步完整，上线初期两边数字不一致时，
     # 先让差异被记录、被人工核对，再决定要不要切换读数（切换是可回滚的一行配置）。
     pnl_from_fills: bool = False
+    # churn 熔断阈值（PR-4）：同一 coin-side 在 CHURN_WINDOW_S 内 cancel/replace
+    # 达到这次数 → 停手 + 告警（走既有 _alert 通道）。可配（面板/DB 键 hl_churn_max），
+    # 0 或负数 = 关闭熔断（只保留静置闸门）。默认 5：实测正常一轮修不出 5 次撤挂，
+    # 到这个量级必然是「止损挂不上 → 撤了重挂 → 又挂不上」的循环，此时停手比继续试安全
+    # （继续试只会制造更多无保护的瞬间，且交易所侧限频也会打满）。
+    churn_max: int = CHURN_MAX_DEFAULT
     code_rev: str = ""
 
     @property
@@ -216,13 +251,42 @@ class Executor:
     _size_strikes: Dict[str, int] = {}
     _size_strikes_lock = threading.Lock()
 
+    # 静置闸门（PR-4）：(账本路径, coin, side) → 解禁的 deadline（time.time() 绝对秒）。
+    # **必须类属性**：build_executor() 每轮 tick 新建实例，实例属性活不过一轮，
+    # 成交回报写在 A 实例、15s 内的对账跑在 B 实例 —— 放实例上等于闸门只挡住自己这一轮。
+    # 只存「什么时候解禁」而不是「还有多少秒」：剩余秒数每读一次都要重算，存绝对时间
+    # 就不可能被读取方续期（从数据形状上堵死「越等越久」）。
+    _settle_until: Dict[Tuple[str, str, int], float] = {}
+    _settle_lock = threading.Lock()
+
+    # churn 计数（PR-4）：(账本路径, coin, side) → [动作时刻, ...]（只留窗口内的）。
+    # 同样放类属性（跨实例累计）；**只存进程内存**，重启清零可接受 —— 重启本身就
+    # 打断了撤挂风暴，而写 DB 会引入「几天前的旧记录把标的永久熔断」的风险。
+    _churn_hits: Dict[Tuple[str, str, int], List[float]] = {}
+    _churn_lock = threading.Lock()
+    # 已就该轮 churn 熔断告警过的键 → 最后告警时刻（同一窗口内只喊一次，
+    # 否则每轮 tick 都推一条，真异常会被自己刷掉）。
+    _churn_alerted: Dict[Tuple[str, str, int], float] = {}
+
+    # 闸门事件的**每轮限频**状态：轮次号 + 键 → 最后一次记事件的轮次号。
+    # 「同 coin-side 每轮最多一条」靠比较这两个数实现（一次 tick 里补挂重试 + 开仓
+    # 可能连撞两次闸，全记会把 15s 窗口刷成一堆同样的行）。
+    _gate_round_no: int = 0
+    _gate_ev_round: Dict[Tuple[str, str, int], int] = {}
+    _gate_ev_lock = threading.Lock()
+
     def __init__(self, db, params: ExecParams, info, exchange, notifier=None):
         self.db = db
         self.p = params
         self.info = info
         self.ex = exchange
         self.notifier = notifier
-        # 最近一次成功同步成交的时刻（实例级）。关账路径里「同步 → 算净额」会与
+        # 闸门状态的作用域：**(账本路径, coin, side)**。为什么不只用 (coin, side)：
+        # 同一进程里可能先后跑多个账本（测试用临时 DB、运维脚本指向别的库），
+        # 跨账本共享熔断就是「A 库的撤挂风暴把 B 库的标的停手」。生产里 db.path 恒定，
+        # 跨 tick 新建的 Executor 共用同一个作用域 —— 跨实例累计的语义不受影响。
+        self._gate_scope = str(getattr(db, "path", "") or "")
+
         # _on_exit 自己的那次同步撞车，10s 内不重复打同一个接口（同一实例内判断，
         # 跨实例本来就会重新同步，语义不变）。
         self._last_sync_at = 0.0
@@ -581,6 +645,226 @@ class Executor:
             return 0
 
 
+    # ------------------------------------------------------------ 闸门（PR-4）
+    def _gate_key(self, coin: str, side: Any) -> Tuple[str, str, int]:
+        """闸门状态的键：**(账本路径, coin, side)**（见 `__init__` 里的 _gate_scope）。"""
+        return (self._gate_scope, str(coin), int(side if side is not None else 1))
+
+    def _gate_act(self, action: str, coin: str, side: Any,
+                  symbol: Optional[str] = None) -> bool:
+        """动作前过闸的统一入口：True = 放行；False = 拦下（已记事件，调用方直接 return）。
+
+        每个动作路径都调它，而不是各自 `if settle or churn: ...` —— 见 _gate_check
+        的注释（逐处写必然漂移，漏一处就是陈旧状态下的下单，多处一处就是裸仓）。
+        """
+        verdict, reason = self._gate_check(action, coin, side, symbol=symbol)
+        if verdict == GATE_OK:
+            return True
+        self._gate_event(action, coin, side, verdict, reason, symbol=symbol)
+        return False
+
+    def _churn_note(self, coin: str, side: Any) -> int:
+        """一次 cancel/replace 动作**真的发出去之后**记数（返回窗口内次数）。
+
+        只在动作真的发出后记：闸门拦下的（没发出去的）动作不算 churn —— 否则
+        「被熔断拦住」会继续给熔断加数，窗口永远滑不出去，等于永久停手。
+        """
+        return self._churn_record(coin, side)
+
+    def _settle_arm(self, coin: str, side: Any) -> None:
+        """入场**成交回报**后给该 coin-side 上 15s 静置窗口（PR-4 任务 1）。
+
+        只由成交回报调用（`_on_entry_locked` 拿到 STATUS_FILLED 之后）。写入是
+        「覆盖成 now+15s」而不是「累加」：即便同一秒来了两笔成交（部分成交分两笔），
+        解禁时间也只是往后推到「最后一笔成交 + 15s」，**不会**因为别的事件无限延长。
+        """
+        key = self._gate_key(coin, side)
+        try:
+            with self._settle_lock:
+                self._settle_until[key] = time.time() + SETTLE_WINDOW_S
+        except Exception as e:                                       # noqa: BLE001
+            # 闸门是**附加保护**：内存状态写失败不能反过来把开仓/平仓带崩（fail-open 到
+            # 「没有闸门」，而不是「永远开着闸门」—— 后者会把所有动作永久拦死）。
+            logger.warning("[hl-exec] 静置闸门写入失败（本轮不设闸）：%s", e)
+
+    def _settle_remaining(self, coin: str, side: Any) -> float:
+        """该 coin-side 的静置剩余秒数；已过期（或从没设过）返回 0 并顺手清键。
+
+        过期即清：不清的话 `_settle_until` 会随标的数量缓慢增长（长期运行的容器里
+        每个 coin-side 一条，永不回收）。**只读，绝不续期** —— 这是「不可续期」的实现点：
+        没有任何代码路径会用「当前时刻」重写一个更晚的 deadline，除了下一次成交回报。
+        """
+        key = self._gate_key(coin, side)
+        now = time.time()
+        try:
+            with self._settle_lock:
+                deadline = self._settle_until.get(key)
+                if deadline is None:
+                    return 0.0
+                left = float(deadline) - now
+                if left <= 0:
+                    self._settle_until.pop(key, None)
+                    return 0.0
+                return left
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 静置闸门读取失败（按无闸放行）：%s", e)
+            return 0.0
+
+    def _churn_record(self, coin: str, side: Any, now: Optional[float] = None) -> int:
+        """记一次 cancel/replace 动作，返回**窗口内**累计次数。
+
+        窗口 = [now − CHURN_WINDOW_S, now]：滑出窗口的记录当场丢掉（计数永远只反映
+        「最近 10 分钟真发生了多少次撤挂」），于是熔断会随着窗口滑动**自动恢复**，
+        不需要任何人工解锁动作（也能避免「忘了清熔断导致永久停手」）。
+        """
+        key = self._gate_key(coin, side)
+        ts = time.time() if now is None else float(now)
+        lo = ts - CHURN_WINDOW_S
+        try:
+            with self._churn_lock:
+                hits = [t for t in (self._churn_hits.get(key) or []) if t > lo]
+                hits.append(ts)
+                self._churn_hits[key] = hits
+                return len(hits)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] churn 计数失败（按未超限放行）：%s", e)
+            return 0
+
+    def _churn_count(self, coin: str, side: Any, now: Optional[float] = None) -> int:
+        """窗口内已发生的 cancel/replace 次数（只读，不记新动作）。"""
+        key = self._gate_key(coin, side)
+        ts = time.time() if now is None else float(now)
+        lo = ts - CHURN_WINDOW_S
+        try:
+            with self._churn_lock:
+                hits = [t for t in (self._churn_hits.get(key) or []) if t > lo]
+                if hits:
+                    self._churn_hits[key] = hits
+                else:
+                    self._churn_hits.pop(key, None)
+                return len(hits)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] churn 读取失败（按未超限放行）：%s", e)
+            return 0
+
+    def _churn_limit(self) -> int:
+        """生效阈值：<=0 = 熔断关闭（只留静置闸门）。配置脏值时退回默认，不静默关掉保护。"""
+        try:
+            n = int(getattr(self.p, "churn_max", CHURN_MAX_DEFAULT))
+        except (TypeError, ValueError):
+            return CHURN_MAX_DEFAULT
+        return n
+
+    def _churn_tripped(self, coin: str, side: Any) -> bool:
+        limit = self._churn_limit()
+        return limit > 0 and self._churn_count(coin, side) >= limit
+
+    def _gate_check(self, action: str, coin: str, side: Any,
+                    symbol: Optional[str] = None) -> Tuple[str, str]:
+        """动作前的统一闸门。返回 (verdict, reason)，verdict ∈ {ok, settle, churn}。
+
+        为什么是一张表而不是每处各写一遍判断：动作点有 5 处（见各调用点的 act=），
+        逐处写必然漂移 —— 某个点漏了静置、另一个点把首次止损也拦了，前者制造陈旧
+        状态下的动作，后者制造裸仓。类别 → 是否过闸的映射只在本函数一处。
+
+        **保护动作零延迟**：首次止损挂单与平仓直接 return ok，连内存都不读
+        （不在闸门内做任何可能抛异常的事）。
+        """
+        if action in _GATE_NONE_ACTIONS:
+            return GATE_OK, ""
+        limit = self._churn_limit()
+        # ① churn：先看次数（已熔断就没必要再谈静置 —— 停手是更强的结论）
+        if limit > 0:
+            n = self._churn_count(coin, side)
+            if n >= limit:
+                self._churn_alert_once(coin, side, n, limit, symbol)
+                return GATE_CHURN, (f"churn 熔断：10 分钟内已 {n} 次撤单/重挂"
+                                    f"（阈值 {limit}），本 coin-side 修复类动作暂停到窗口滑出")
+        # ② 静置：只对「新开仓 / 修复类补挂」查。
+        #    **离场路径的重挂不查静置**：那条路径进到这里时止损**已经被撤掉**（平仓
+        #    IOC 没成交），再等 15s 就是纯裸仓 —— 延迟它等于用闸门制造风险。它的
+        #    频率问题由 churn 熔断管（见上），那一条不会推迟任何动作，只会把
+        #    「重挂」换成「市价平」（两者都是保护动作）。
+        if action in (ACT_ENTRY, ACT_REPAIR):
+            left = self._settle_remaining(coin, side)
+            if left > 0:
+                # 修复类**首次**保护动作豁免：本 coin-side 最近 10 分钟还没有任何
+                # 撤/挂动作（churn=0），说明这次补挂是「仓刚成交、止损没挂上」的第一手
+                # 保护 —— 拦它等于裸仓等 15s。要拦的是「补挂重试」：第二次起说明
+                # 前一次已经发过单、只是快照还没刷新，重复发只会挂出重复止损。
+                if not (action == ACT_REPAIR and self._churn_count(coin, side) == 0):
+                    return GATE_SETTLE, (f"静置中（成交回报后 {SETTLE_WINDOW_S:g}s 窗口，"
+                                         f"剩余 {left:.0f}s）：暂不做重复动作")
+        return GATE_OK, ""
+
+    def _churn_alert_once(self, coin: str, side: Any, n: int, limit: int,
+                          symbol: Optional[str] = None) -> bool:
+        """churn 熔断告警：**同一窗口内只推一次**（返回是否本次真推了）。
+
+        每轮 tick 都会重新过闸，不去重就是 5 分钟一条、直到窗口滑出 —— 把真正需要
+        人看的「止损挂不上」淹掉。窗口滑出后计数归零，下次再熔断会重新告警。
+        """
+        key = self._gate_key(coin, side)
+        now = time.time()
+        try:
+            with self._churn_lock:
+                last = self._churn_alerted.get(key)
+                if last is not None and now - float(last) < CHURN_WINDOW_S:
+                    return False
+                self._churn_alerted[key] = now
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] churn 告警去重状态读写失败（照常告警）：%s", e)
+        side_word = _side_word(int(side or 1))
+        self._event(EV_DECISION,
+                    f"{symbol or coin} {side_word} churn 熔断：10 分钟内 {n} 次撤单/重挂"
+                    f"（阈值 {limit}）→ 暂停修复类动作，等窗口滑出（不置 kill）",
+                    symbol=symbol,
+                    data={"coin": coin, "side": int(side or 1), "hits": n, "limit": limit,
+                          "window_s": CHURN_WINDOW_S})
+        self._alert(f"【HL执行】⚠️ {coin} {side_word} 撤单/重挂过于频繁"
+                    f"（10 分钟内 {n} 次，阈值 {limit}）—— 已暂停该标的的修复类动作"
+                    f"（补挂/复价），等 10 分钟窗口滑出后自动恢复。\n"
+                    f"平仓与首次止损挂单不受影响；kill 未置位（这不是对账异常）。"
+                    f"若持续出现，多半是止损单被交易所拒单，请看一眼交易所。")
+        return True
+
+    def _gate_event(self, action: str, coin: str, side: Any, verdict: str,
+                    reason: str, symbol: Optional[str] = None) -> None:
+        """闸门拦截留痕。**同 coin-side 每轮 tick 最多一条**（轮次标记见 _gate_new_round）。"""
+        if not self._gate_event_allowed(coin, side):
+            return
+        left = self._settle_remaining(coin, side)
+        self._event(EV_DECISION, f"{symbol or coin} {_side_word(side)} 动作被闸门拦下"
+                                 f"（{action}）：{reason}（剩余 {left:.0f}s）",
+                    symbol=symbol,
+                    data={"coin": coin, "side": int(side or 1), "action": action,
+                          "verdict": verdict, "remaining_s": round(left, 1)})
+
+    def _gate_event_allowed(self, coin: str, side: Any) -> bool:
+        """限频：同 coin-side 在**同一轮 tick** 内只记一条闸门事件。
+
+        实现用一个进程内「轮次号 + 已记过的键集合」，轮次号在 `run()` 每次进入时自增、
+        也由 on_entry/on_exit 各自新开一轮 —— 一次 tick 里可能连续撞多次闸（补挂重试
+        每轮一次、开仓一次），全记就会把 15s 窗口刷成 10 条同样的行。
+        """
+        key = self._gate_key(coin, side)
+        try:
+            with self._gate_ev_lock:
+                if self._gate_ev_round.get(key) == self._gate_round_no:
+                    return False
+                self._gate_ev_round[key] = self._gate_round_no
+                return True
+        except Exception:                                            # noqa: BLE001
+            return True                                              # 记不上就照常记
+
+    def _gate_new_round(self) -> None:
+        """开一轮（tick / on_entry / on_exit）：闸门事件限频按轮重置。"""
+        try:
+            with self._gate_ev_lock:
+                self._gate_round_no += 1
+        except Exception:                                            # noqa: BLE001
+            pass
+
     def _repair_missing_stop(self, row: dict, snap: dict,
                              kill_before: Optional[bool] = None) -> None:
         """**确认**有仓却没有止损挂单 → 先自动补挂原止损价；补不上就市价平掉。
@@ -639,12 +923,30 @@ class Executor:
         except HlInfoError:
             sz_dec = 5
         px = hl_sizing.round_price(stop, sz_dec)
-        try:
-            res = self.ex.place_order(coin, side != 1, sz, px, reduce_only=True,
-                                      trigger_px=px,
-                                      cloid=self._attempt_cloid(symbol, bar_ms, PURPOSE_STOP + ":fix"))
-        except Exception as ex:                                     # noqa: BLE001
-            res = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
+        # 闸门（PR-4）：修复类补挂是「重复动作」，要过静置 + churn。
+        #   静置（成交回报后 15s）→ **只延迟**，绝不升级成平仓：刚成交那 15s 里
+        #   「补挂」与「已挂好但快照还没刷新」无法区分，据此平仓等于每笔成交都平一次。
+        #     例外：churn=0 的**首次**保护补挂不过静置（见 _gate_check），否则就是裸仓等 15s。
+        #   churn 熔断（10 分钟 N 次）→ 停补挂，但仓位不能裸着 → 直接走下面的市价平仓
+        #   （保护动作不过闸）。这正是本 PR 要打断的「撤-挂-撤-挂」循环的出口。
+        verdict, reason = self._gate_check(ACT_REPAIR, coin, side, symbol=symbol)
+        if verdict != GATE_OK:
+            self._gate_event(ACT_REPAIR, coin, side, verdict, reason, symbol=symbol)
+            if verdict == GATE_SETTLE:
+                return                            # 等 15s 窗口过去，本轮不动交易所
+            res = {"ok": False, "status": "gated",
+                   "error": f"churn 熔断（{reason}）：停止补挂"}
+        else:
+            # 计数在**真正发单之前**记：修复尝试本身就是 churn（挂不上的止损被反复
+            # 重挂正是要熔断的对象）。放在成功之后记会让「一直失败」永远数不到阈值。
+            self._churn_note(coin, side)
+            try:
+                res = self.ex.place_order(coin, side != 1, sz, px, reduce_only=True,
+                                          trigger_px=px,
+                                          cloid=self._attempt_cloid(symbol, bar_ms,
+                                                                   PURPOSE_STOP + ":fix"))
+            except Exception as ex:                                 # noqa: BLE001
+                res = {"ok": False, "error": f"{type(ex).__name__}: {ex}"}
         if res.get("ok") and res.get("status") in (STATUS_RESTING, STATUS_FILLED):
             self.db.hl_update_order(symbol, bar_ms, PURPOSE_STOP, status=res["status"],
                                     oid=res.get("oid"), error=None)
@@ -692,6 +994,17 @@ class Executor:
             bad.append(f"未配置 HL coin 映射：{symbol}（拒绝开仓）")
         if self.db.hl_kill():
             bad.append("kill switch 已触发")
+        # 闸门（PR-4）：新开仓属于「重复动作」——同一 coin-side 刚有成交回报（15s 静置）
+        # 或正在撤挂风暴里（churn 熔断）时都不许再开。放这里（而不是 on_entry 里另写一段）
+        # 是因为这条路径已经有统一的「拒绝 → 落 skipped 意图 + 告警」出口，闸门拒绝与
+        # 其它闸门拒绝落库口径一致，事后复盘只有一处可查。
+        if coin is not None:
+            verdict, reason = self._gate_check(ACT_ENTRY, coin, int(getattr(plan, "side", 1) or 1),
+                                              symbol=symbol)
+            if verdict != GATE_OK:
+                self._gate_event(ACT_ENTRY, coin, int(getattr(plan, "side", 1) or 1), verdict,
+                                 reason, symbol=symbol)
+                bad.append(f"闸门拦截开仓：{reason}")
         if self.p.live and not self.ex.available:
             # 只在 live 校验写通道：dry 期不下单、不需要私钥（否则「先跑影子不用给私钥」就不成立）
             bad.append(f"写通道不可用：{self.ex.init_error or '未配置凭据'}")
@@ -780,6 +1093,7 @@ class Executor:
     def on_entry(self, position_id: int) -> bool:
         """接管一次开仓。返回 True = 已接管（调用方不要再走人工确认流）。"""
         with self._op_lock:
+            self._gate_new_round()
             return self._on_entry_locked(position_id)
 
     def _on_entry_locked(self, position_id: int) -> bool:
@@ -906,14 +1220,22 @@ class Executor:
         if res["status"] == STATUS_RESTING:
             # IOC 不该挂着；挂上了说明限价不够激进 → 撤掉并放弃（不追价）
             self.ex.cancel(coin, int(res["oid"] or 0))
+            self._churn_note(coin, side)          # 撤单也是 churn（PR-4 口径）
             return self._entry_failed(symbol, bar_ms, "IOC 未成交（限价不够激进），已撤单放弃")
         filled_sz = float(res["filled_sz"] or plan.sz)
         avg_px = float(res["avg_px"] or mid)
         self.db.hl_update_order(symbol, bar_ms, PURPOSE_ENTRY, status=ST_FILLED,
                                 oid=res.get("oid"), filled_sz=filled_sz, avg_px=avg_px,
                                 raw=str(res.get("raw"))[:2000])
+        # 静置闸门开窗（PR-4）：从**成交回报这一刻**起 15s，该 coin-side 的重复动作
+        # （再开仓 / 修复类补挂 / 复价）暂停 —— 交易所的持仓与挂单列表此刻还在收敛。
+        # 放在「确认成交之后、挂止损之前」：止损（下面 ACT_STOP_FIRST）在放行清单里，
+        # 于是这 15s 绝不会因为闸门而出现裸仓，同时它保护的是成交后紧跟的那串重复动作。
+        self._settle_arm(coin, side)
 
         # 3) 止损单（硬要求）
+        #    闸门：这是 ACT_STOP_FIRST（放行清单）——**首张止损单永不过闸**：
+        #    它出现的那一刻仓位已经成交、还没有任何保护，任何延迟都是裸仓窗口。
         stop_res = self.ex.place_order(coin, side != 1, filled_sz,
                                        hl_sizing.round_price(stop, sz_decimals),
                                        reduce_only=True, trigger_px=hl_sizing.round_price(stop, sz_decimals),
@@ -1024,6 +1346,7 @@ class Executor:
     def on_exit(self, position_id: int, reason: str, ref_price: float) -> bool:
         """接管一次离场。返回 True = 已接管（调用方不要再动 DB 状态）。"""
         with self._op_lock:
+            self._gate_new_round()
             return self._on_exit_locked(position_id, reason, ref_price)
 
     def _on_exit_locked(self, position_id: int, reason: str, ref_price: float) -> bool:
@@ -1082,6 +1405,10 @@ class Executor:
         #    对账补挂在 stop:fix —— 只撤 PURPOSE_STOP 会漏掉这两类，留下幽灵触发单。
         #    撤单动作撤的是「交易所侧当前挂着的止损」，所以把 DB 里三种 purpose 的
         #    未撤单记录全查一遍，按 oid 去重逐个撤。
+        #    PR-4 闸门：这一串撤单是**平仓动作的前置步骤**（ACT_CLOSE，放行清单内）——
+        #    拦它就等于「止损撤不掉所以平不了」，反而是把人锁在一个他想离开的仓位里；
+        #    但它照样**计入 churn**：真正的「撤-挂-撤-挂」风暴往往就是从这里开始的，
+        #    计数不能因为动作被豁免而漏掉。
         cancelled_purposes = []
         for purpose in (PURPOSE_STOP, PURPOSE_STOP + ":fix", PURPOSE_EXIT_REHANG):
             so = self.db.hl_order(symbol, bar_ms, purpose)
@@ -1092,12 +1419,14 @@ class Executor:
                     if (r["symbol"] == symbol and r["purpose"] == purpose
                             and r["status"] in (ST_RESTING, ST_SENT) and r["oid"]):
                         self.ex.cancel(coin, int(r["oid"]))
+                        self._churn_note(coin, side)
                         self.db.hl_update_order(symbol, int(r["bar_ms"]), purpose,
                                                 status="cancelled")
                         cancelled_purposes.append(purpose)
                 continue
             if so is not None and so["oid"] and so["status"] in (ST_RESTING, ST_SENT, ST_FILLED):
                 self.ex.cancel(coin, int(so["oid"]))
+                self._churn_note(coin, side)
                 self.db.hl_update_order(symbol, bar_ms, purpose, status="cancelled")
                 cancelled_purposes.append(purpose)
         # 2) 平仓（reduce-only IOC）。限价必须按**平仓方向**算滑点
@@ -1138,6 +1467,7 @@ class Executor:
             # 而止损单已被撤掉。处理：撤掉这张挂单、**立即挂回原止损**（保护仓位）、
             # 拉人工提醒；不关本地账，让下一轮 on_exit / 对账继续跟进。
             self.ex.cancel(coin, int(res.get("oid") or 0))
+            self._churn_note(coin, side)
             self.db.hl_update_order(symbol, exit_bar_ms, PURPOSE_EXIT, status=ST_FAILED,
                                     error="平仓 IOC 未成交（已撤单并挂回止损）")
             # 重挂止损用独立 purpose（exit:rehang）：与开仓止损（stop@入场bar）、
@@ -1145,10 +1475,19 @@ class Executor:
             # 复用任何一个都会被拒单，重挂失败=仓位裸奔。
             re_stop_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
             rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
-            re_stop = self.ex.place_order(
-                coin, side != 1, sz, re_stop_px,
-                reduce_only=True, trigger_px=re_stop_px,
-                cloid=rehang_cloid)
+            # 闸门（PR-4）：重挂止损是「replace」，要过 churn（不过静置 —— 上面已经
+            # 撤掉了止损，这里再等 15s 就是纯裸仓）。熔断时**不重挂**，直接落到下面
+            # 已有的「重挂失败 → 市价平仓」分支：仓位一样有保护（平掉），但不再往
+            # 交易所打第 N 张注定被拒的触发单 —— 这正是要打断的循环。
+            if self._gate_act(ACT_REPLACE, coin, side, symbol=symbol):
+                self._churn_note(coin, side)
+                re_stop = self.ex.place_order(
+                    coin, side != 1, sz, re_stop_px,
+                    reduce_only=True, trigger_px=re_stop_px,
+                    cloid=rehang_cloid)
+            else:
+                re_stop = {"ok": False, "status": "gated",
+                           "error": "churn 熔断：停止重挂止损，改为市价平仓"}
             re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
             self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side, sz,
                                      px=re_stop_px, reduce_only=True,
@@ -1210,12 +1549,20 @@ class Executor:
                 sz_dec = 5
             re_px = hl_sizing.round_price(float(row["actual_stop"] or row["stop_price"]), sz_dec)
             rehang_cloid = self._attempt_cloid(symbol, exit_bar_ms, PURPOSE_EXIT_REHANG)
-            try:
-                re_stop = self.ex.place_order(
-                    coin, side != 1, remain, re_px, reduce_only=True, trigger_px=re_px,
-                    cloid=rehang_cloid)
-            except Exception as ex:                                   # noqa: BLE001
-                re_stop = {"ok": False, "error": f"{type(ex).__name__}: {ex}", "status": "error"}
+            # 闸门（PR-4）：部分成交后重挂剩余量止损，同样按 replace 过 churn。
+            # 熔断时不重挂 → 落到下面的「重挂失败 → 市价平掉剩余量」（保护动作不过闸）。
+            if self._gate_act(ACT_REPLACE, coin, side, symbol=symbol):
+                self._churn_note(coin, side)
+                try:
+                    re_stop = self.ex.place_order(
+                        coin, side != 1, remain, re_px, reduce_only=True, trigger_px=re_px,
+                        cloid=rehang_cloid)
+                except Exception as ex:                               # noqa: BLE001
+                    re_stop = {"ok": False, "error": f"{type(ex).__name__}: {ex}",
+                               "status": "error"}
+            else:
+                re_stop = {"ok": False, "status": "gated",
+                           "error": "churn 熔断：停止重挂剩余量止损，改为市价平仓"}
             re_ok = bool(re_stop.get("ok")) and re_stop.get("status") in (STATUS_RESTING, STATUS_FILLED)
             try:
                 self.db.hl_record_intent(symbol, coin, exit_bar_ms, PURPOSE_EXIT_REHANG, side,
@@ -1592,6 +1939,7 @@ class Executor:
     def run(self, force_snapshot: bool = False) -> List[str]:
         """每轮 tick 调用：快照 → 对账 → 熔断 → 死手开关 → 心跳。返回告警文案。"""
         with self._op_lock:
+            self._gate_new_round()          # 闸门事件限频按轮重置（PR-4）
             return self._run_locked(force_snapshot)
 
     def _run_locked(self, force_snapshot: bool = False) -> List[str]:

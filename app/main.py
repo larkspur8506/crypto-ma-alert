@@ -131,6 +131,9 @@ def hl_params():
         # 净 PnL 口径（PR-3）：默认关。DB > env（Config.apply_db 已解析好），
         # 与 fill_push 同一种「从面板配置读布尔」的模式。
         pnl_from_fills=bool(getattr(cfg, "hl_pnl_from_fills", False)),
+        # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
+        # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
+        churn_max=_churn_max(cfg),
         # 死手开关默认关闭：识别不了的值也按「关」处理（安全侧默认，与推送开关的 fail-open 相反）
         use_schedule_cancel=str(db.get_config_str(
             "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
@@ -149,6 +152,17 @@ def hl_params():
 
 
 _hl_info = None
+
+
+def _churn_max(cfg) -> int:
+    """churn 熔断阈值（PR-4）。脏值/缺键一律退回 5（默认保护），**不**退回 0 ——
+    0 的语义是「关闭熔断」，一个读坏的字符串不该悄悄把保护关掉（fail-closed）。"""
+    raw = getattr(cfg, "hl_churn_max", None)
+    try:
+        n = int(float(str(raw).strip().strip('"').strip("'")))
+    except (TypeError, ValueError):
+        return 5
+    return n if n >= 0 else 5
 
 
 def hl_info_base() -> str:

@@ -65,6 +65,10 @@ class Config:
     # app/hl/executor.py:ExecParams.pnl_from_fills（先观测差异、再切换读数）。
     # net_pnl 列两态都写，开关只影响「读哪个数」，不丢数据、可回滚。
     hl_pnl_from_fills: bool = _env("HL_PNL_FROM_FILLS", "0").lower() in ("1", "true", "yes", "on")
+    # churn 熔断阈值（PR-4）：同一 coin-side 在 10 分钟内撤单/改价重挂达到这次数就停手。
+    # 0 = 关闭熔断（只留 15s 静置闸门）。默认 5 —— 正常修复不会到 5 次，到了就是
+    # 「止损挂不上 → 撤 → 重挂」的循环，继续试只会制造更多无保护瞬间。
+    hl_churn_max: int = _env_i("HL_CHURN_MAX", 5)
     # extraAgents 查不到有效期时的手工兜底（毫秒时间戳字符串；空=没有）
     hl_agent_valid_until_ms: str = _env("HL_AGENT_VALID_UNTIL_MS", "")
 
@@ -97,7 +101,7 @@ class Config:
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
-                   "hl_agent_valid_until_ms", "hl_pnl_from_fills")
+                   "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
@@ -113,6 +117,9 @@ class Config:
         "equity": (1.0, 100_000_000.0),
         "equity_min": (1.0, 100_000_000.0),
         "short_regime_ma": (0, 1000),
+        # churn 熔断阈值（PR-4）：0 = 关闭（只留静置闸门），上限 100 防止「配成 10000
+        # 等于关掉保护还自以为开着」。
+        "hl_churn_max": (0, 100),
     }
 
     # 字符串配置允许「显式清空」的键。

@@ -418,6 +418,10 @@ PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
      "SHORT_REGIME_MA", 200, "int"),
     ("risk_pct", "执行与推送", "单笔风险", "RISK_PCT", 0.02, "float"),
     ("leverage", "执行与推送", "杠杆（逐仓）", "LEVERAGE", 5.0, "float"),
+    # PR-4：churn 熔断阈值。放在参数页而不是「开关」页 —— 它是个数值（0 = 关），
+    # 和 risk_pct 一样属于「策略参数」，改完下一轮 tick 生效。
+    ("hl_churn_max", "执行与推送", "撤单/重挂熔断阈值（10 分钟内次数，0=关闭）",
+     "HL_CHURN_MAX", 5, "int"),
     ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "mode"),
     ("equity", "资金", "账户权益基数 U（固定模式用）", "ACCOUNT_EQUITY", 1000.0, "float"),
     ("equity_min", "资金", "资金下限 U（跟随模式用）", "", 20.0, "float"),
@@ -689,6 +693,23 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     sm = take_float("stop_min", "止损下限", *_R["stop_min"])
     sx = take_float("stop_max", "止损上限", *_R["stop_max"])
     emin = take_float("equity_min", "资金下限", *_R["equity_min"], strict=False)
+    # churn 熔断阈值（PR-4）：整数，0 = 关闭熔断。**缺字段/空 = 保持原值**——
+    # 与同页其它字段一致（老书签/curl 不带这个键时不能把它刷成 0=关掉保护）。
+    ch_raw = form.get("hl_churn_max")
+    if ch_raw is not None:
+        ch_txt = str(ch_raw or "").strip()
+        if ch_txt:
+            try:
+                ch_v = int(float(ch_txt.replace(",", "")))
+            except ValueError:
+                errs.append("撤单/重挂熔断阈值不是数字")
+                ch_v = None
+            if ch_v is not None:
+                lo, hi = _R["hl_churn_max"]
+                if not (lo <= ch_v <= hi):
+                    errs.append(f"撤单/重挂熔断阈值必须在 {lo:g}~{hi:g} 之间（0=关闭）")
+                else:
+                    out["hl_churn_max"] = ch_v
 
     # 做空均线：必须是整数
     sraw = str(form.get("short_regime_ma") or "").strip()
@@ -1281,6 +1302,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                      stop_max: str = Form(""), short_regime_ma: str = Form(""),
                      equity_mode: Optional[str] = Form(None),
                      equity_min: Optional[str] = Form(None),
+                     hl_churn_max: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
                      k: str = Form("")):
         token = _auth(deps, request, k or None)
@@ -1289,6 +1311,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             "stop_min": stop_min, "stop_max": stop_max,
             "short_regime_ma": short_regime_ma, "equity_mode": equity_mode,
             "equity_min": equity_min,
+            # PR-4：缺字段（None）= 保持原值，与 equity_mode 同口径
+            "hl_churn_max": hl_churn_max,
             "hl_agent_valid_until_ms": hl_agent_valid_until_ms,
         })
         if errs:
