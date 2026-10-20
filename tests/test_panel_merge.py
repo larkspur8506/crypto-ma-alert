@@ -120,6 +120,14 @@ class TestSinglePrice(PanelMergeBase):
         self.assertNotIn("81,504", html, "缓存里的旧价不允许再出现在同一屏")
         self.assertIn('<span class="px">81,516.00</span>', _card(html, "BTC"))
 
+    def test_reason_wording_matches_state_word(self):
+        """状态词「均线未密集」与原因行「均线不密集：…」曾是两种说法 —— 只做展示层替换，
+        不动 strategy 的文案（/api/hl/why 仍是原文），面板里必须只剩一种。"""
+        html = self.render({"why": [_why()]})
+        card = _card(html, "BTC")
+        self.assertIn("均线未密集", card)
+        self.assertNotIn("均线不密集", card)
+
     def test_reason_line_does_not_repeat_price(self):
         # 原因行是 strategy 给的人话（含带宽/门槛），它不该再抄一遍现价
         row = _why()
@@ -270,7 +278,8 @@ class TestMissingWhyRow(PanelMergeBase):
                              _st(symbol="SOL_USDT", coin="SOL", price=None, dense_cnt=None)],
         })
         btc, eth, sol = _card(html, "BTC"), _card(html, "ETH"), _card(html, "SOL")
-        self.assertIn("均线不密集：带宽", btc)         # 有 why 的原因行
+        self.assertIn("均线未密集：带宽", btc)         # 有 why 的原因行（词面已统一）
+        self.assertNotIn("均线不密集", btc, "同一张卡里不许再出现 strategy 的原文措辞")
         self.assertIn("诊断数据暂不可用", eth)          # 缺 why → 标注读数时间
         self.assertIn(f"显示 {_fmt_dt(UPDATED_AT, '%H:%M')} 的读数", eth)
         self.assertIn("3,001.00", eth)

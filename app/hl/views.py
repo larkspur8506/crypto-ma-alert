@@ -1005,8 +1005,12 @@ def _reason_line(r: Dict[str, Any]) -> str:
             pct = f"（{sd * 100:.2f}%）" if sd is not None else ""
             return _whyline(f"信号成立：入场 {_fmt(ep)}、止损 {_fmt(sp)}{pct}", "pos")
         return _whyline(str(why.get("reason") or "信号成立"), "pos")
-    # reason 由 strategy.explain_entry 给（带带宽/门槛数字的人话），面板只加漂移标记
-    txt = str(why.get("reason") or "—")
+    # reason 由 strategy.explain_entry 给（带带宽/门槛数字的人话），面板只做两件展示层的事：
+    # ① 词面统一：strategy 的文案是「均线不密集」，而本卡状态词与图例统一用「均线未密集」——
+    #    同一张卡上下两种说法等于又回到合并前「两套状态词」的老毛病。只替换展示文本，
+    #    不动 strategy 的文案与判定（信号口径禁止改），/api/hl/why 仍返回 strategy 原文。
+    # ② 漂移标记：六步推导与 evaluate_entry 不一致时如实标出来。
+    txt = str(why.get("reason") or "—").replace("均线不密集", "均线未密集")
     if why.get("drift"):
         txt += " ⚠️口径漂移"
     return _whyline(txt, "muted")

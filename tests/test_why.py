@@ -752,10 +752,12 @@ class TestPanels(WhyRowsBase):
         self.assertEqual(html.count('class="sym"'), 2)
 
     def test_block_reason_comes_from_strategy_and_ok_gate_is_silent(self):
-        """不密集：原因行用人话讲拦截原因；闸门全正常 → 连「放行」字样都不出现。"""
+        """不密集：原因行用人话讲拦截原因（词面与状态词统一为「未密集」）；
+        闸门全正常 → 连「放行」字样都不出现。"""
         from app.hl.views import _symbol_dynamics
         html = _symbol_dynamics({"why": self.rows(flat_then_trend())})
-        self.assertIn("均线不密集", html)
+        self.assertIn("均线未密集", html)
+        self.assertNotIn("均线不密集", html)
         self.assertNotIn("闸门放行", html)
         self.assertNotIn("静置剩余", html)
 
