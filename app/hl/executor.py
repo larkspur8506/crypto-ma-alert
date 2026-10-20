@@ -37,6 +37,16 @@ logger = logging.getLogger(__name__)
 # split 兜底已删除（见 Executor.coin），所以这里必须与注册表同源。
 DEFAULT_COIN_MAP = {s: registry.hl_coin(s) for s in registry.known_symbols()}
 
+# 手续费的**计价币**白名单：只有这些币种的 fee 才能直接当 U 累加（1:1）。
+# HL 允许用 HYPE 抵扣或按其他币计费，此时 fee 是「币的数量」——
+# 直接加进净利会把 0.2 ARB 当 0.2 U，误差可达几个数量级。
+QUOTE_FEE_TOKENS = frozenset({"USDC", "USDT", "USD"})
+
+# 「费用币种未折算」事件的去重 marker（存已提示过的 tid，逗号分隔）：
+# user_fills 的窗口会重复返回同一笔成交，不记 marker 就会每轮刷一条事件。
+FEE_UNQUOTED_KEY = "hl_fee_unquoted_tids"
+FEE_UNQUOTED_MAX = 200
+
 
 # ---------------------------------------------------------------- 推送文案（人类可读）
 
@@ -1031,6 +1041,11 @@ class Executor:
 
         下界用「opened_at − 120s」：入场成交发生在 opened_at 写库**之前**，
         用 >= opened_at 会把入场那笔手续费排除掉（净利被高估）。
+
+        取数用**时间窗**（hl_fills_since）而不是「最近 N 条」：多标的并行 + 持仓跨日时，
+        500 条滚动窗口会被别的币的成交挤满，目标币的费用被静默漏算（净利虚高）。
+        累加优先 ``fee_quote``（已折算成 U），历史行 fee_quote 为 NULL 回退用 ``fee``；
+        两者都缺的行跳过（不猜）。
         """
         try:
             since = float(since_ts or 0) - 120.0
@@ -1039,16 +1054,62 @@ class Executor:
         if since < 0:
             since = 0.0
         total = 0.0
-        for r in self.db.hl_recent_fills(500):
+        for r in self.db.hl_fills_since(since):
             try:
-                if str(r["coin"]) == coin and float(r["ts"] or 0) >= since:
-                    total += float(r["fee"] or 0.0)
-            except (TypeError, ValueError, KeyError):
+                if str(r["coin"]) != coin:
+                    continue
+                ts = r["ts"]
+                # 窗口按 created_at（入库时间）取，而「这笔钱什么时候花的」是 ts。
+                # 回填/重启导致两者错位时，ts 有值就再卡一次下界；ts 缺失时信窗口。
+                if ts is not None and float(ts) < since:
+                    continue
+                val = r["fee_quote"] if r["fee_quote"] is not None else r["fee"]
+                if val is None:
+                    continue
+                total += float(val)
+            except (TypeError, ValueError, KeyError, IndexError):
                 continue
         return total
 
+    def _fee_quote(self, fee: float, fee_token: Any) -> Optional[float]:
+        """把交易所手续费折算成计价币金额；无法折算返回 None（宁可缺，也不假装是 U）。
+
+        只有 fee_token 属于 QUOTE_FEE_TOKENS 时 fee 才是 U 计价（1:1）。其余币种
+        （ARB/HYPE…）需要汇率才能折算，本地没有可信汇率源 → 留 None，由
+        ``_fees_since`` 跳过该笔，同时由调用方记一条事件等人工补。
+        """
+        tok = str(fee_token or "").strip().upper()
+        if tok not in QUOTE_FEE_TOKENS:
+            return None
+        return float(fee or 0.0)
+
+    def _note_unquoted_fee(self, tid: str, fee_token: Any, coin: str, fee: float) -> None:
+        """「费用币种未折算」事件一仓一条：同一 tid 只记一次（marker 存 configuration）。
+
+        为什么去重：user_fills 每次返回最近一段窗口，同一笔成交每轮都会出现；不去重
+        就是每轮一条事件，把 hl_events 刷成噪声，真异常反而被埋掉。
+        """
+        try:
+            seen = str(self.db.get_config_str(FEE_UNQUOTED_KEY) or "")
+            known = [t for t in seen.split(",") if t]
+            if tid in known:
+                return
+            known.append(tid)
+            # 只留最近 FEE_UNQUOTED_MAX 个，避免 configuration 行无限增长
+            self.db.set_config(FEE_UNQUOTED_KEY, ",".join(known[-FEE_UNQUOTED_MAX:]))
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 手续费去重 marker 读写失败：%s", e)
+        self._event(EV_ORDER,
+                    f"{coin} 成交 {tid} 手续费以 {fee_token or '未知币种'} 计价（{fee:g}），"
+                    f"未能折算成 U 已跳过计入净利，请人工核对",
+                    data={"tid": tid, "fee_token": fee_token, "fee": fee})
+
     def _sync_fills(self, limit: int = 100) -> int:
-        """把交易所的成交同步进 hl_fills（按 tid 去重，幂等）。返回新增条数。"""
+        """把交易所的成交同步进 hl_fills（按 tid 去重，幂等）。返回新增条数。
+
+        fee_quote 在写入时就算好（见 ``_fee_quote``）：读侧（``_fees_since``、
+        面板净利）不该重复做币种判断，否则每多一个读点就多一处漏判的机会。
+        """
         if not self.p.account_address:
             return 0
         fills = self.info.user_fills(self.p.account_address) or []
@@ -1061,15 +1122,20 @@ class Executor:
                 continue
             coin = str(f.get("coin") or "")
             direction = str(f.get("dir") or "")
+            fee = self._num(f.get("fee"))
+            fee_token = f.get("feeToken")
+            fee_quote = self._fee_quote(fee, fee_token)
             self.db.hl_upsert_fill(
                 tid=tid, symbol=reverse.get(coin, f"{coin}_USDT"), coin=coin,
                 side=1 if "Long" in direction else -1, sz=self._num(f.get("sz")),
-                px=self._num(f.get("px")), fee=self._num(f.get("fee")),
-                fee_token=f.get("feeToken"), dir=direction,
+                px=self._num(f.get("px")), fee=fee,
+                fee_token=fee_token, fee_quote=fee_quote, dir=direction,
                 closed_pnl=self._num(f.get("closedPnl")), hash=f.get("hash"),
                 reduce_only=("Close" in direction),
                 ts=int(f["time"]) // 1000 if f.get("time") else None)
             added += 1
+            if fee_quote is None:
+                self._note_unquoted_fee(tid, fee_token, coin, fee)
         if added:
             self._event(EV_ORDER, f"同步 {added} 笔交易所成交到本地", data={"added": added})
         return added
