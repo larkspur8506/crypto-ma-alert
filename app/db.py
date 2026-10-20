@@ -122,7 +122,7 @@ CREATE TABLE IF NOT EXISTS hl_fills (
     tid TEXT UNIQUE,
     symbol TEXT, coin TEXT,
     side INTEGER, sz REAL, px REAL,
-    fee REAL, fee_token TEXT, dir TEXT, closed_pnl REAL, hash TEXT,
+    fee REAL, fee_token TEXT, fee_quote REAL, dir TEXT, closed_pnl REAL, hash TEXT,
     reduce_only INTEGER DEFAULT 0,
     ts INTEGER, created_at REAL NOT NULL
 );
@@ -194,6 +194,13 @@ class DB:
         if sscols and "sma200" not in sscols:
             self.conn.execute("ALTER TABLE symbol_state ADD COLUMN sma200 REAL")
             logger.info("[db] 迁移：symbol_state 新增 sma200 列")
+        # 手续费币种归一（PR-1）：交易所成交的 fee 可能以非计价币（如 ARB/HYPE）计价，
+        # 直接按 U 累加会把「币的数量」当「U」加进净利。fee_quote = 折算后的 U 金额，
+        # 无法折算时留 NULL（读取侧回退到 fee，历史行行为不变）。
+        fcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(hl_fills)")}
+        if fcols and "fee_quote" not in fcols:
+            self.conn.execute("ALTER TABLE hl_fills ADD COLUMN fee_quote REAL")
+            logger.info("[db] 迁移：hl_fills 新增 fee_quote 列")
 
     # ---------------- configuration
     @_locked
@@ -515,14 +522,20 @@ class DB:
 
     @_locked
     def hl_upsert_fill(self, **kw) -> None:
-        """落一笔成交（按交易所 tid 去重）。"""
+        """落一笔成交（按交易所 tid 去重）。
+
+        ``fee`` 是交易所原值，币种由 ``fee_token`` 指明；``fee_quote`` 是折算成计价币
+        （U）后的金额 —— 只有 fee_token 属于计价币时才等于 fee，其余留 None 由调用方
+        决定怎么标注（见 Executor._sync_fills）。列顺序与 CREATE TABLE 一致。
+        """
         self.conn.execute(
-            "INSERT OR IGNORE INTO hl_fills(tid, symbol, coin, side, sz, px, fee, fee_token, dir,"
-            " closed_pnl, hash, reduce_only, ts, created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT OR IGNORE INTO hl_fills(tid, symbol, coin, side, sz, px, fee, fee_token,"
+            " fee_quote, dir, closed_pnl, hash, reduce_only, ts, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (str(kw.get("tid")), kw.get("symbol"), kw.get("coin"), kw.get("side"), kw.get("sz"),
-             kw.get("px"), kw.get("fee"), kw.get("fee_token"), kw.get("dir"),
-             kw.get("closed_pnl"), kw.get("hash"), 1 if kw.get("reduce_only") else 0,
-             kw.get("ts"), now()))
+             kw.get("px"), kw.get("fee"), kw.get("fee_token"), kw.get("fee_quote"),
+             kw.get("dir"), kw.get("closed_pnl"), kw.get("hash"),
+             1 if kw.get("reduce_only") else 0, kw.get("ts"), now()))
         self.conn.commit()
 
     @_locked
