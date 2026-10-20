@@ -796,6 +796,9 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .kv:last-child{border-bottom:0}
 .kv .k{color:var(--muted);white-space:nowrap}
 .kv .v{font-weight:600;font-variant-numeric:tabular-nums;text-align:right}
+/* 卡内的句子行（原因 / 闸门异常 / 待确认提示）：与 .kv 的「键→数字」两列区分开，
+   整句折行、不抢现价的视觉重量。 */
+.whyline{margin-top:4px;font-size:12px;line-height:1.5;overflow-wrap:anywhere}
 .pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.muted{color:var(--muted);font-size:12px}
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;
             border:1px solid var(--line);border-radius:10px;background:var(--card)}
@@ -832,15 +835,28 @@ a{color:var(--link)}
 
 
 # ---------------------------------------------------------------- 三标的动态区块
-# 总览页最顶部（tabs 之后第一个区块、在「账户」卡片之前）的区块：每标的现价 / 状态词 /
-# 到触发线的距离。数据全部来自 symbol_state（引擎每轮 tick upsert），面板纯读库；
-# 触发线与密集根数的口径由 app/engine.symbol_snapshot 计算（复用 strategy 的序列）。
+# 位置：总览页最顶部（tabs 之后第一个区块、在「账户」卡片之前）。每标的一张卡，自上而下：
+#   名称 · 状态词 · 现价 → 距离行 → 原因行 → 闸门异常行 → （区块底部一句可见脚注）
+#
+# 为什么把「为什么没开仓」并进来：两块回答的是同一个问题（现在能不能动）。分开渲染时同一屏
+# 会出现两个现价（缓存 vs 现取，数字还不一样）、两套状态词（「均线未密集」/「均线不密集」）、
+# 两处密集根数；而闸门正常时整列都是同一条「放行」，纯噪音。合并后**现价只有一个来源、
+# 状态词只有一套、闸门只在异常时出现**，同时保留两块各自不可替代的信息：距离行的线价
+# （可操作）与原因行的六步拦截数字（带带宽/门槛）。
+#
+# 数据：why 行（app.why.build_rows，现算）为主源；why 缺失/报错时退回 symbol_state
+# （引擎 tick 落的缓存）并标注读数时间。面板依旧不重算任何判定，只挑字段渲染。
 _SQUEEZE_CAP = 6          # 密集根数展示封顶：满 6 根即已满足入场前提
 _NEAR_TITLE = "接近触发（按收盘判定）"
 # 图例行（区块底部，手机看不见 title 悬停，口径必须落在可见文字上）：
 # ① 离场只看收盘破线 → 琥珀（接近）就有意义；②③ 破线还要满足前置条件，琥珀会误导。
+# 「信号 = 六步规则 / 闸门 = 动作前的附加保护」这段原属「为什么没开仓」的脚注 ——
+# 两块合一后只剩一条脚注，否则同一屏又要读两遍口径。
 _LEGEND_HTML = ("<div class=\"sym-legend\">① 离场按 4h 收盘判定 · "
-                "② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空</div>")
+                "② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空 · "
+                "信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）· "
+                "闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），"
+                "只影响「什么时候动手」，不改变信号本身；闸门正常时不显示</div>")
 _EXIT_TITLE = {1: "按 4h 收盘判定，非盘中触发：收盘跌破该线即自动平仓",
                -1: "按 4h 收盘判定，非盘中触发：收盘站上该线即自动平仓"}
 _LONG_TITLE = "4h 收盘突破该线即入场（需均线密集满 6 根）"
@@ -908,11 +924,220 @@ def _sym_row(label: str, mark: str, title: str, need: Optional[float], line: Any
             f"<span class=\"v\">{val}</span></div>")
 
 
+def _pos_of(r: Dict[str, Any]) -> tuple:
+    """卡片用的仓位口径：(status, side)。
+
+    两个来源不同：why 行给 why.position（status='open'/'pending' 才有意义）；只有
+    symbol_state 的降级路径没有 status，position_side 非空即代表「有 open 仓」
+    （_symbol_state_rows 只把 status='open' 的仓写成 position_side）。
+    返回 ("", None) = 无仓 → 走 ②③ 入场距离行。
+    """
+    pos = _as_dict(r.get("position"))
+    st = str(pos.get("status") or "")
+    if st in ("open", "pending"):
+        return st, (_opt_int(pos.get("side")) or 1)
+    sd = _opt_int(r.get("position_side"))
+    if sd in (1, -1):
+        return "open", sd
+    return "", None
+
+
+def _sym_state(r: Dict[str, Any]) -> tuple:
+    """状态词（唯一一套，按优先级，命中即止）：(文本, 颜色 class, 悬停 title)。
+
+    1. 行情读取失败 / 没有现价 → neg（数字都没有，谈密集/信号都是空话）
+    2. 有 open 仓 → muted（walk 不评估入场，密集根数对它没意义）
+    3. 有 pending 仓 → warn（占着槽位）
+    4. why.fired → pos（信号成立，等执行）
+    5~6. 密集酝酿 n/6（hot，封顶 6）→ 均线未密集（muted）
+
+    旧代码在两块里各写一套（「均线未密集」vs「均线不密集」），统一取前者。
+    """
+    px = _opt_num(r.get("price"))
+    if r.get("error") or px is None or px <= 0:
+        return "行情读取失败", "neg", ""
+    status, side = _pos_of(r)
+    if status == "open":
+        return f"持仓中（{'多' if side == 1 else '空'}）", "muted", ""
+    if status == "pending":
+        return "待确认（占槽）", "warn", "同一标的至多 1 仓，确认或忽略后才会评估新信号"
+    why = _as_dict(r.get("why"))
+    if why.get("fired"):
+        return (f"信号成立（{'多' if int(_num(why.get('side'))) > 0 else '空'}）", "pos",
+                str(why.get("reason") or ""))
+    return _sym_state_word(None, r.get("dense_cnt"))
+
+
+def _whyline(text: str, cls: str = "muted") -> str:
+    """卡内的一句人话（原因行 / 闸门异常行 / 待确认提示）。
+
+    与距离行（.kv）分开的类名：.kv 是「键 → 数字」两列，这里是一整句，样式与语义都不同。
+    """
+    return f"<div class=\"whyline {cls}\">{_esc(text)}</div>" if cls else \
+        f"<div class=\"whyline\">{_esc(text)}</div>"
+
+
+def _reason_line(r: Dict[str, Any]) -> str:
+    """原因行：吸收原「信号态 / 拦截原因」单元格，一句人话、带数字。
+
+    顺序刻意与 _sym_state 一致（仓位在行情之上）：有仓时真正该做的是处理这一仓，
+    而不是去读「假如无仓」的行情读数。降级路径必须把**读数时间**写出来，
+    否则用户会把缓存里的旧价当成现价（这正是合并前两个现价打架的根源）。
+    """
+    status, _ = _pos_of(r)
+    if status == "open":
+        return _whyline("持仓中，本轮不评估新入场", "muted")
+    if status == "pending":
+        return _whyline("待确认占用仓位槽，确认或忽略后才会评估新信号", "warn")
+    err = str(r.get("error") or "")
+    when = _fmt_dt(r.get("updated_at"), "%H:%M")
+    if err:
+        tail = f"（显示 {when} 的读数）" if _opt_num(r.get("price")) is not None else ""
+        return _whyline(f"行情读取失败：{err}{tail}", "neg")
+    why = _as_dict(r.get("why"))
+    if not why:
+        return _whyline(f"诊断数据暂不可用（显示 {when} 的读数）", "muted")
+    if why.get("fired"):
+        sig = _as_dict(why.get("signal"))
+        ep, sp = _opt_num(sig.get("entry_price")), _opt_num(sig.get("stop_price"))
+        sd = _opt_num(sig.get("stop_dist"))
+        if ep is not None and sp is not None:
+            pct = f"（{sd * 100:.2f}%）" if sd is not None else ""
+            return _whyline(f"信号成立：入场 {_fmt(ep)}、止损 {_fmt(sp)}{pct}", "pos")
+        return _whyline(str(why.get("reason") or "信号成立"), "pos")
+    # reason 由 strategy.explain_entry 给（带带宽/门槛数字的人话），面板只加漂移标记
+    txt = str(why.get("reason") or "—")
+    if why.get("drift"):
+        txt += " ⚠️口径漂移"
+    return _whyline(txt, "muted")
+
+
+def _gate_lines(r: Dict[str, Any]) -> List[str]:
+    """闸门异常行：**只在不正常时产生 DOM**（正常放行是噪音，一个字都不渲染）。
+
+    关注侧沿用现有语义：持仓方向 > 信号方向 > 双侧都给（why.gate_side 已算好）。
+    churn_limit<=0 = 熔断被人为关闭，此时「正在静置」只报静置 —— 报 churn 次数没有意义
+    （永远不会熔断），只会让人以为它随时会停手。
+    """
+    gates = _as_dict(r.get("gates"))
+    gate = _as_dict(r.get("gate"))
+    items: List[tuple] = []
+    if gate:
+        items.append(gate)
+    else:
+        for key in ("long", "short"):
+            g = _as_dict(gates.get(key))
+            if g:
+                items.append(g)
+    out: List[str] = []
+    for g in items:
+        verdict = str(g.get("verdict") or "ok")
+        if verdict == "ok":
+            continue
+        if verdict == "settle":
+            out.append(_whyline(f"⚠️ 静置剩余 {int(_num(g.get('settle_remaining_s')))}s", "warn"))
+        elif verdict == "churn":
+            limit = int(_num(g.get("churn_limit")))
+            if limit <= 0:
+                continue
+            out.append(_whyline(f"⚠️ churn {int(_num(g.get('churn_count')))}/{limit}"
+                                f"（10 分钟内 {limit} 次撤挂即熔断）", "warn"))
+        else:
+            # 未知 verdict（执行器改了枚举而面板没跟上）：如实显示，别假装没事
+            out.append(_whyline(f"⚠️ 闸门状态未知：{verdict}", "warn"))
+    return out
+
+
+def _merge_one(w: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
+    """why 行（主源）+ symbol_state 行（降级源）→ 一张卡的数据。纯挑字段，不算判定。
+
+    索引口径统一取「最后一根已收盘 bar」(ind[i])：sma20 / ②③ 的线价 / 密集根数 / SMA200
+    全部同索引 —— 因为下一次入场判定比的就是这一根。why 行里的 ma_max_prev / ma_min_prev /
+    values.dense_cnt 是 ind[i-1]（**上一根**，本轮判定用的那根），拿它算「到线距离」会让
+    线价与距离差一根 bar、和 ① 的 SMA20 对不上；所以只在 symbol_state 缺失时兜底。
+    """
+    why = _as_dict(w.get("why"))
+    vals = _as_dict(why.get("values"))
+    err = str(w.get("error") or "")
+    px_w = _opt_num(w.get("price"))
+    # 降级判定：why 行缺失 / 取行情报错 / why 没有现价 —— 三者都只能用缓存读数
+    degraded = bool(not w or err or px_w is None)
+    if degraded:
+        price, sma20 = _opt_num(st.get("price")), _opt_num(st.get("sma20"))
+        long_trig, short_trig = _opt_num(st.get("long_trigger")), _opt_num(st.get("short_trigger"))
+        dense, ma200 = _opt_int(st.get("dense_cnt")), _opt_num(st.get("sma200"))
+    else:
+        price = px_w
+        sma20 = _opt_num(w.get("sma20"))
+        if sma20 is None:
+            sma20 = _opt_num(st.get("sma20"))
+        long_trig = _opt_num(st.get("long_trigger"))
+        if long_trig is None:
+            long_trig = _opt_num(vals.get("ma_max_prev"))
+        short_trig = _opt_num(st.get("short_trigger"))
+        if short_trig is None:
+            short_trig = _opt_num(vals.get("ma_min_prev"))
+        dense = _opt_int(st.get("dense_cnt"))
+        if dense is None:
+            dense = _opt_int(vals.get("dense_cnt"))
+        ma200 = _opt_num(st.get("sma200"))
+        if ma200 is None and int(_num(vals.get("regime_ma"))) == 200:
+            # ③ 琥珀要「现价 < MA200」；regime_val 只在看空方向时算过，且窗口可配
+            ma200 = _opt_num(vals.get("regime_val"))
+    sym = str(w.get("symbol") or st.get("symbol") or "")
+    return {
+        "symbol": sym,
+        "coin": str(w.get("coin") or st.get("coin") or "") or _disp(sym),
+        "price": price, "sma20": sma20, "sma200": ma200,
+        "long_trigger": long_trig, "short_trigger": short_trig,
+        "dense_cnt": dense,
+        "position": _as_dict(w.get("position")),
+        "position_side": st.get("position_side"),
+        "why": why, "error": err or None,
+        "gates": _as_dict(w.get("gates")), "gate": _as_dict(w.get("gate")),
+        "gate_side": _opt_int(w.get("gate_side")) or 0,
+        "updated_at": _opt_num(st.get("updated_at")),
+    }
+
+
+def _merged_cards(p: dict) -> List[Dict[str, Any]]:
+    """payload → 卡片数据（why 顺序为主，why 缺的标的按 symbol_state 顺序补在后面）。
+
+    两个方向都要兜：why 少一个标的不能让这张卡消失（fail-soft，只是没有原因行）；
+    symbol_state 整块缺失时 why 照样能画（价格/线价取 why 行）。
+    """
+    why_rows = [_as_dict(x) for x in _as_list(p.get("why"))]
+    st_rows: List[Dict[str, Any]] = []
+    st_by_sym: Dict[str, Dict[str, Any]] = {}
+    for x in _as_list(p.get("symbol_state")):
+        d = _as_dict(x)
+        sym = str(d.get("symbol") or "")
+        if sym:
+            st_by_sym[sym] = d
+            st_rows.append(d)
+    cards: List[Dict[str, Any]] = []
+    seen = set()
+    for w in why_rows:
+        sym = str(w.get("symbol") or "")
+        cards.append(_merge_one(w, st_by_sym.get(sym) or {}))
+        seen.add(sym)
+    for d in st_rows:
+        sym = str(d.get("symbol") or "")
+        if sym in seen:
+            continue
+        seen.add(sym)
+        cards.append(_merge_one({}, d))
+    # 既没 symbol 也没 coin 的脏行无法定位标的（也没有可展示的名字）→ 直接略去
+    return [c for c in cards if c.get("symbol") or c.get("coin")]
+
+
 def _sym_card(r: Dict[str, Any]) -> str:
-    """一个标的的卡片：现价 + 状态词 + 距离行（持仓只给离场线；无仓给两条入场线）。"""
+    """一个标的的卡片：现价 + 状态词 + 距离行（持仓只给离场线；无仓给两条入场线）
+    + 原因行 + 闸门异常行。现价全页只在这里出现一次（两块合并的核心约束）。
+    """
     price = _opt_num(r.get("price"))
-    side = _opt_int(r.get("position_side"))
-    st_txt, st_cls, st_title = _sym_state_word(side, r.get("dense_cnt"))
+    status, side = _pos_of(r)
+    st_txt, st_cls, st_title = _sym_state(r)
     title_attr = f" title=\"{_esc(st_title)}\"" if st_title else ""
     name = _esc(r.get("coin") or _disp(r.get("symbol")) or "—")
     o = [("<div class=\"sym\"><div class=\"sym-h\">"
@@ -920,7 +1145,10 @@ def _sym_card(r: Dict[str, Any]) -> str:
           f"<span class=\"st {st_cls}\"{title_attr}>{st_txt}</span>"
           f"<span class=\"px\">{_fmt(price)}</span></div>")]
     if price is not None and price > 0:
-        if side in (1, -1):
+        if status == "pending":
+            # pending 占着仓位槽：确认前根本不会评估新入场，距离行是假信息
+            o.append(_whyline("确认前不评估新入场", "muted"))
+        elif status == "open":
             need = _need_pct("exit_short" if side < 0 else "exit_long", price, r.get("sma20"))
             if need is not None:
                 o.append(_sym_row("距自动离场线", "①", _EXIT_TITLE[-1 if side < 0 else 1],
@@ -943,6 +1171,8 @@ def _sym_card(r: Dict[str, Any]) -> str:
             if need is not None:
                 o.append(_sym_row("下破开空", "③", _SHORT_TITLE, need, r.get("short_trigger"),
                                   allow_warn=short_ok))
+    o.append(_reason_line(r))
+    o.extend(_gate_lines(r))
     o.append("</div>")
     return "".join(o)
 
@@ -950,11 +1180,14 @@ def _sym_card(r: Dict[str, Any]) -> str:
 def _symbol_dynamics(p: dict) -> str:
     """「三标的动态」区块（总览页最顶部，tabs 之后第一个区块，见 _render_body）。
 
-    fail-soft：某标的 symbol_state 行缺失 / 字段 NULL → 该标的价格显示「—」、对应子行
-    整体不渲染，其余标的不受影响；整块任何异常都不能弄挂总览页（调用点在 try 里）。
+    合并后这里同时回答「离触发线多远」（距离行）和「卡在哪一步 / 被闸门挡了吗」
+    （原因行 / 闸门异常行）—— 原「为什么没开仓」区块已删除。
+
+    fail-soft：某标的两侧数据都缺失 → 价格显示「—」、子行整体不渲染，其余标的不受影响；
+    整块任何异常都不能弄挂总览页（调用点在 try 里）。
     区块头时间 = 三个标的里最新的 updated_at（北京时间，与面板其它时间同口径）。
     """
-    rows = [_as_dict(x) for x in _as_list(p.get("symbol_state"))]
+    rows = _merged_cards(p)
     if not rows:
         return ""
     stamps = [t for t in (_opt_num(r.get("updated_at")) for r in rows) if t]
@@ -971,124 +1204,10 @@ def _symbol_dynamics(p: dict) -> str:
     return "".join(o)
 
 
-# ---------------------------------------------------------------- 「为什么没开仓」（/why）
-# 用户视角的问题永远是同一句：「行情在动，为什么它不动？」——这张区块就是答案，每标的一行：
-# 信号态（六步里的拦截点）+ 本标的的闸门徽章（静置剩余 / churn 次数 / 熔断）。
-#
-# 数据来自 `app.why.build_rows`（纯只读：现取 4h K 线 → strategy.explain_entry 给六步 →
-# Executor.gate_state_for 读闸门）。**面板不重算任何判定**，只做渲染。
-WHY_BLOCK_TITLE = "为什么没开仓"
-# 拦截点 → 人话（key 与 strategy.WHY_STEPS 一致；unknown 是漂移兜底）
-_WHY_STEP_TXT = {
-    "ok": "无拦截（信号成立）",
-    "bars": "K 线根数不足",
-    "squeeze": "均线不密集",
-    "breakout": "收盘没破线",
-    "regime": "MA200 过滤拦下",
-    "stop": "止损距离越界",
-    "decision": "无信号",
-    "unknown": "口径漂移（需排查）",
-}
-_WHY_STEP_CLS = {"ok": "pos", "bars": "neg", "squeeze": "muted", "breakout": "muted",
-                 "regime": "muted", "stop": "warn", "decision": "muted", "unknown": "neg"}
-_GATE_TXT = {"ok": "闸门放行", "settle": "静置中", "churn": "churn 熔断"}
-_GATE_CLS = {"ok": "pos", "settle": "warn", "churn": "neg"}
-
-
-def _why_signal_cell(r: Dict[str, Any]) -> str:
-    """信号态单元格：开着仓说仓位，没开仓说被哪一步拦下（含原因摘要）。"""
-    pos = _as_dict(r.get("position"))
-    why = _as_dict(r.get("why"))
-    if pos:
-        st = str(pos.get("status") or "")
-        side = "多" if int(_num(pos.get("side"), 1)) >= 0 else "空"
-        if st == "open":
-            return (f"<span class='pos'>持仓中（{side}）</span>"
-                    f"<div class='muted'>{_fmt_sz(pos.get('qty'))} {_esc(pos.get('qty_unit') or '')}"
-                    f" · 止损 {_fmt(pos.get('stop'))}</div>")
-        if st == "pending":
-            return ("<span class='warn'>待确认（占槽）</span>"
-                    "<div class='muted'>同一标的至多 1 仓，确认前不评估新入场</div>")
-    if r.get("error"):
-        return f"<span class='neg'>行情读取失败</span><div class='muted'>{_esc(r['error'])}</div>"
-    if not why:
-        return "<span class='muted'>—</span>"
-    if why.get("fired"):
-        side = "多" if int(_num(why.get("side"))) > 0 else "空"
-        return (f"<span class='pos'>信号成立（{side}）</span>"
-                f"<div class='muted'>等入场 / 或本轮已被处理</div>")
-    key = str(why.get("blocked_by") or "decision")
-    txt = _WHY_STEP_TXT.get(key, key)
-    cls = _WHY_STEP_CLS.get(key, "muted")
-    reason = str(why.get("reason") or "—")
-    drift = " <span class='neg'>⚠️漂移</span>" if why.get("drift") else ""
-    return (f"<span class='{cls}'>{_esc(txt)}</span>{drift}"
-            f"<div class='muted'>{_esc(reason)}</div>")
-
-
-def _why_gate_cell(r: Dict[str, Any]) -> str:
-    """闸门徽章：关注侧（持仓方向 > 信号方向 > 双侧都给）。纯展示，读的是执行器类状态。"""
-    gates = _as_dict(r.get("gates"))
-    gate = _as_dict(r.get("gate"))
-    side = int(_num(r.get("gate_side")))
-    items: List[tuple] = []
-    if gate:
-        items.append(("多" if side >= 0 else "空", gate))
-    else:
-        for key, label in (("long", "多"), ("short", "空")):
-            g = _as_dict(gates.get(key))
-            if g:
-                items.append((label, g))
-    if not items:
-        return "<span class='muted'>—</span>"
-    out: List[str] = []
-    for label, g in items:
-        verdict = str(g.get("verdict") or "ok")
-        txt = _GATE_TXT.get(verdict, verdict)
-        cls = _GATE_CLS.get(verdict, "muted")
-        # 静置窗口只有 15s，四舍五入到整数秒就够；churn 阈值 <=0 = 熔断关闭，要如实说
-        limit = int(_num(g.get("churn_limit")))
-        churn_txt = (f"churn {int(_num(g.get('churn_count')))}/{limit}" if limit > 0
-                     else "churn 熔断已关闭")
-        out.append(f"<span class='{cls}'>{label}·{_esc(txt)}</span>"
-                   f"<div class='muted'>静置剩余 {int(_num(g.get('settle_remaining_s')))}s"
-                   f" · {_esc(churn_txt)}</div>")
-    return "".join(out)
-
-
-def _why_block(rows: List[Dict[str, Any]]) -> str:
-    """「为什么没开仓」区块：每标的一行（信号态 / 拦截原因 / 闸门徽章）。
-
-    位置：总览「三标的动态」之后 —— 两者回答的是同一个问题（现在能不能动），
-    一个说「离触发线多远」，一个说「卡在哪一步」，分开看会来回切页。
-    fail-soft：行数据缺失/字段为 None 都不抛，最坏显示「—」；整块异常由调用点兜。
-    """
-    if not rows:
-        return ""
-    o: List[str] = [
-        f"<h2>{WHY_BLOCK_TITLE}"
-        "<span class=\"muted\">每根 4h 收盘按同一套规则判定 · 闸门状态实时读取 · 只读诊断</span></h2>",
-        "<div class='tablewrap'><table><thead><tr>"
-        "<th>标的</th><th>现价</th><th>信号态 / 拦截原因</th><th>闸门（动作前置）</th>"
-        "</tr></thead><tbody>",
-    ]
-    for r in rows:
-        d = _as_dict(r)
-        coin = _esc(d.get("coin") or _disp(d.get("symbol")) or "—")
-        o.append("<tr>"
-                 f"<td>{coin}</td>"
-                 f"<td class='num'>{_fmt(d.get('price'))}</td>"
-                 f"<td>{_why_signal_cell(d)}</td>"
-                 f"<td>{_why_gate_cell(d)}</td>"
-                 "</tr>")
-    o.append("</tbody></table></div>")
-    # 可见脚注（iOS Safari 点不出 title）：说明「信号」与「闸门」是两道独立的门。
-    o.append("<div class='legend'>信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）；"
-             "闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），"
-             "只影响「什么时候动手」，不改变信号本身。</div>")
-    return "".join(o)
-
-
+# ---------------------------------------------------------------- /why 数据源
+# 面板的「原因行 / 闸门异常行」数据来自这里：`app.why.build_rows`（纯只读：现取 4h K 线 →
+# strategy.explain_entry 给六步 → Executor.gate_state_for 读闸门）。**面板不重算任何判定**，
+# 只做渲染；`GET /api/hl/why` 与容器内 `python -m app.why` 走的也是这一条链路。
 def _why_rows(deps: "DashboardDeps") -> List[Dict[str, Any]]:
     """现算 /why 行（只读）。任何异常都退回空列表 —— 诊断区块绝不弄挂总览页。"""
     try:
@@ -1205,23 +1324,16 @@ def _render_body(p: dict) -> str:
         o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
                  f"<span class='muted'>交易所侧数据暂不可用；信号 / 下单 / 成交记录见「记录」页。</span></div>")
 
-    # ---------------- 三标的动态 ----------------
+    # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
     # 位置由需求钉死：总览页最顶部、tabs 之后第一个区块（在「账户」卡片之前），
-    # 手机打开面板先看到三个标的的状态。整块自己兜底（缺数据只略去子行），
-    # 万一渲染炸了也不能弄挂总览页 —— 这里再包一层 try。
+    # 手机打开面板先看到三个标的的状态。距离行 + 原因行 + 闸门异常行都在这一块里 ——
+    # 原来紧跟在后面的「为什么没开仓」表格已合并进来（同一屏两个现价/两套状态词是硬伤）。
+    # 数据由调用方注入 payload（why 由 admin_ui 现算，symbol_state 来自 DB 缓存），
+    # 本函数不做 I/O，逐块兜底：缺哪份数据就只少那几行，绝不弄挂总览页。
     try:
         o.append(_symbol_dynamics(p))
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
-
-    # ---------------- 为什么没开仓（/why，只读诊断） ----------------
-    # 紧接「三标的动态」：前者说「离触发线多远」，这里说「卡在哪一步、有没有被闸门挡」，
-    # 是同一个问题的两半。数据由调用方注入 payload["why"]（本函数不做 I/O、不建依赖），
-    # 这样 _render_body 仍可在测试里用纯 dict 驱动。
-    try:
-        o.append(_why_block(_as_list(p.get("why"))))
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] /why 区块渲染失败：%s", e)
 
 
     # ---------------- 账户卡片 ----------------

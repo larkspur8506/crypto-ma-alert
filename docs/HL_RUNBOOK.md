@@ -72,10 +72,15 @@ curl -s "$BASE/api/hl/why?k=$K" | python3 -m json.tool   # 每标的：六步 + 
 ssh oracle1 'sudo -n docker exec crypto-ma-alert python -m app.why'
 ```
 
+面板上这块已经不单独成段：它的「拦截原因 / 闸门异常」并进了总览最顶部的「三标的动态」
+卡片（原因行 + 闸门异常行），同一屏不再出现两个现价、两套状态词。
+
 `/api/hl/why` 的字段口径：
 
 - `symbols[].why.steps[]` —— 六步（`bars` 根数 → `squeeze` 密集 → `breakout` 破线 →
   `regime` MA200 → `stop` 止损距离 → `decision` 结论），每步 `ok` + 一句人话 `detail`；
+- `symbols[].sma20` —— 最后一根**已收盘** bar 的 SMA20（与触发线同索引；面板「距自动离场线」
+  用它画，只作展示，不参与判定）；
 - `symbols[].why.blocked_by` —— **第一个**不成立的步骤（`ok` = 有信号）；
 - `symbols[].why.drift` —— 六步推导与 `evaluate_entry` 的返回值不一致（正常恒 `false`，
   出现即说明诊断与信号口径已分叉，需排查）；
