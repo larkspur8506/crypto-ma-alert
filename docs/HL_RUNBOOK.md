@@ -123,6 +123,32 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 ### B. 对账 mismatch（`hl_events` 有「对账异常」）
 执行器会**自动 kill**（停止新开仓）。处理：① 用 §4 的 `clearinghouseState` 看真实仓位；② 与本地 `positions` 表核对；③ 人工把仓位与本地记录对齐（平掉多余的仓 / 在确认页补录）；④ 面板解除 kill 前，先确认 `hl_orders` 里没有卡在 `intent/sent` 的单。
 
+### B2. 数量对账不一致（`hl_events` 有「数量对账」/「持仓数量对账不一致」）
+reconcile 除了比「有没有仓 / 有没有止损」，还比**数量**：本地 `hl_fills` 的净量
+（ΣOpen − ΣClose，窗口 `opened_at−300s` 至今）对交易所 `szi`，容差 1 tick
+（`10^-szDecimals`）。两击规则：
+1. 首次超差 → 记事件 + **自动全量回捞一次** `userFillsByTime`（从开仓前 300s）重算；
+   回捞后一致 = 自愈（**不会**动 kill、不计击）；
+2. 回捞后仍超差 → 计一击（第 1 击只观察，不 kill）；
+3. 连续 2 击 → 自动 kill + 推「对账异常」告警（fail-closed）。
+
+strike 计数只在进程内存里（重启清零），且按 (仓位, 标的) 计。排查：
+① `hl_events` 里搜「数量对账」看两边的数字；② 面板「记录」页看该标的 `hl_fills` 是否
+缺腿（部分成交、手工加减仓、IOC 只成一半都会让两边分叉）；③ 真实数量以交易所为准，
+本地 `hl_sz` 错要人工核对（执行器的止损量是按下单时 `hl_sz` 挂的，量错了保护也是错的）；
+④ 若确认是「本地流水缺数据」而非真错仓，回捞会把成交补进 `hl_fills` → 下一轮自动清零
+strike，再解除 kill 即可。
+
+### B3. 关账净额差异（`hl_events` 有「关账口径差异」）
+每笔关账都会用 `hl_fills` 聚合出流水口径净额（`positions.net_pnl`），并与本地价差口径
+（`r_multiple` / 价差×币量）比对：`|ΔR| > max(0.15, 0.10×|R|)` 或
+`|Δnet| > max(1.0, 0.0005×名义)` 就记一条 `reconcile` 事件（**纯观测**，不 kill、不告警）。
+看到这条说明「本地记的价/量」与「交易所流水」有出入，去面板「记录」页按 `hl_fills` 核对；
+`pnl_source`：`fills` = 已算（有出入场腿）、`no_exit_fills` = 平仓成交还没同步（净额留空）、
+`no_fills` = 查不到任何成交（人工流/未同步）。
+「开关」页「策略与保护 → 记录页净额改用流水口径」（`hl_pnl_from_fills`，**默认关**）只决定
+记录页要不要显示「净额（流水）」列，不改变入库行为 —— 打开后如果数字可疑，关回去即可。
+
 ### C. 执行器卡死 / 心跳超 15 分钟
 ① 先看容器是否活着；② 死手开关会在 `HL_DEADMAN_MINUTES` 后自动撤掉所有挂单（**止损单也会被撤 → 仓位裸奔**）→ 立刻人工挂回止损或平仓；③ 重启容器：`ssh oracle1 'cd /opt/1panel/docker/compose/crypto-ma-alert && sudo -n docker compose restart'`；④ 重启后先看 `hl_events` 确认对账通过。
 

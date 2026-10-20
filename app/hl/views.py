@@ -121,6 +121,31 @@ def _opt_int(v: Any) -> Optional[int]:
     return None if f is None else int(f)
 
 
+def _fee_quoted(d: Dict[str, Any]) -> Optional[float]:
+    """一笔成交的手续费（U 口径）：优先 ``fee_quote``（PR-1 写入时折算好的），
+    为 NULL 时回退原始 ``fee``（PR-1 之前的历史行 / 非计价币行）。
+
+    与执行器 ``_fees_since`` 严格同口径（#34 的读侧语义）：面板与净利计算看到同一个
+    手续费数字，否则「面板说 0.35U、净利算 0.21U」永远对不上。
+    """
+    fq = _opt_num(d.get("fee_quote"))
+    if fq is not None:
+        return fq
+    return _opt_num(d.get("fee"))
+
+
+def _pnl_from_fills(cfg: Any) -> bool:
+    """面板净额口径开关（hl_pnl_from_fills，默认关 = 交易所 closedPnl 口径）。
+
+    默认关的理由见 ExecParams.pnl_from_fills：流水口径依赖 hl_fills 已同步完整，
+    上线初期先让差异被记录，再决定是否切换读数。
+    """
+    try:
+        return bool(getattr(cfg, "hl_pnl_from_fills", False))
+    except Exception:                                            # noqa: BLE001
+        return False
+
+
 def _utc_day_start(ts: float) -> float:
     """当日 0 点（北京时间，与展示层「今日」一致；名字保留以免破坏调用方）。"""
     tz = _display_tz()
@@ -535,7 +560,9 @@ def status_payload(deps: DashboardDeps) -> dict:
         d = _rowd(r)
         cp = _num(d.get("closed_pnl"))
         total_realized += cp
-        fees_total += _num(d.get("fee"))
+        # 费用口径统一走 fee_quote（NULL 回退 fee）：非计价币行的 fee 是「币的数量」，
+        # 直接当 U 累加会把 0.2 ARB 记成 0.2U（#34 修的就是这个，读侧漏了这里）。
+        fees_total += _fee_quoted(d) or 0.0
         t_s = _to_seconds(d.get("ts"))
         if t_s is not None and day_start <= t_s < day_start + _DAY:
             today_realized += cp
@@ -545,7 +572,9 @@ def status_payload(deps: DashboardDeps) -> dict:
             "side": d.get("side"),
             "sz": _opt_num(d.get("sz")),
             "px": _opt_num(d.get("px")),
-            "fee": _opt_num(d.get("fee")),
+            # 逐笔也走 fee_quote（口径同 fees_total，逐笔加起来等于合计）
+            "fee": _fee_quoted(d),
+            "fee_token": d.get("fee_token"),
             "dir": d.get("dir"),
             "closed_pnl": _opt_num(d.get("closed_pnl")),
             "reduce_only": bool(d.get("reduce_only")),
@@ -560,6 +589,7 @@ def status_payload(deps: DashboardDeps) -> dict:
 
     # ---------------- 信号 ----------------
     signals: List[dict] = []
+    pnl_from_fills = _pnl_from_fills(cfg)      # 净额口径开关（默认关）
     for r in db_rows:
         d = _rowd(r)
         entry = d.get("actual_entry")
@@ -568,7 +598,7 @@ def status_payload(deps: DashboardDeps) -> dict:
         stop = d.get("actual_stop")
         if stop in (None, ""):
             stop = d.get("stop_price")
-        signals.append({
+        sig = {
             "symbol": d.get("symbol"),          # 内部键（信号层 MEXC 名），保留不变
             "coin": _disp(d.get("symbol")),     # 展示用：HL 侧合约名
             "status": d.get("status"),
@@ -582,7 +612,15 @@ def status_payload(deps: DashboardDeps) -> dict:
             "qty": _opt_num(posfields.qty(d)),
             "qty_unit": posfields.qty_unit(d),
             "bar_ms": _opt_num(d.get("signal_bar_ms")),
-        })
+        }
+        if pnl_from_fills:
+            # 流水口径净额（PR-3）：**只在开关打开时才给出这些键** —— 记录表以
+            # 「有没有 net_pnl 键」作为「要不要多显示一列净额」的依据，关掉时表格结构
+            # 与老版本逐字相同（不新增空列，也不改 _signals_html 的默认形态）。
+            # 值为 NULL = 没算过/查不到成交（不知道），不是 0。
+            sig["net_pnl"] = _opt_num(d.get("net_pnl"))
+            sig["pnl_source"] = d.get("pnl_source")
+        signals.append(sig)
 
     # ---------------- 权益曲线 ----------------
     snaps = _db_call(deps.db, "hl_snapshots", now - 30 * _DAY, 20000) or []
@@ -948,17 +986,29 @@ def _signals_html(signals: list) -> str:
     2026-10-18 从总览迁到 /admin?tab=records（用户要求：总览只看当下，历史表格归记录页）。
     渲染逻辑原样保留：状态文案走 _ST_TXT，open=pos / pending=warn 着色，
     数量用 _fmt_sz（HL 仓是真实币量 0.00084，不能显示成 0.00）。
+
+    PR-3：payload 里带 ``net_pnl`` 键时（只在 hl_pnl_from_fills 打开时才有）多显示
+    一列「净额（流水）」。**按行探测而不是按全局开关**：这样本函数保持纯渲染、不依赖
+    config，关掉开关时表格结构与老版本完全一致。
     """
     o: List[str] = []
+    rows = _as_list(signals)
+    dicts = [_as_dict(x) for x in rows]
+    with_pnl = any("net_pnl" in d for d in dicts)
     o.append("<h2>信号</h2>")
     o.append("<div class='tablewrap'><table><thead><tr>"
              "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
-             "<th class='num'>止损</th><th class='num'>数量</th><th>信号 bar</th>"
+             "<th class='num'>止损</th><th class='num'>数量</th>"
+             + ("<th class='num'>净额（流水）</th>" if with_pnl else "")
+             + "<th>信号 bar</th>"
              "</tr></thead><tbody>")
-    rows = _as_list(signals)
-    for sg in (_as_dict(x) for x in rows):
+    for sg in dicts:
         st = str(sg.get("status") or "—")
         st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
+        pnl_cell = ""
+        if with_pnl:
+            # net_pnl 为 NULL 时显示「—」：没算过/查不到成交 ≠ 0 收益
+            pnl_cell = _td(_fmt(sg.get("net_pnl")), "num")
         o.append("<tr>"
                  + _td(_esc(sg.get("coin") or _disp(sg.get("symbol")) or "—"))
                  + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>")
@@ -966,10 +1016,12 @@ def _signals_html(signals: list) -> str:
                  + _td(_fmt(sg.get("entry")), "num")
                  + _td(_fmt(sg.get("stop")), "num")
                  + _td(_fmt_sz(sg.get("qty")), "num")
+                 + pnl_cell
                  + _td(_fmt_dt(sg.get("bar_ms")), "num")
                  + "</tr>")
     if not rows:
-        o.append("<tr><td colspan='7' class='muted'>暂无信号</td></tr>")
+        span = 8 if with_pnl else 7
+        o.append(f"<tr><td colspan='{span}' class='muted'>暂无信号</td></tr>")
     o.append("</tbody></table></div>")
     return "".join(o)
 

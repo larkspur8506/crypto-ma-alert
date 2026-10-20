@@ -37,7 +37,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
-                        _kv, _render_body, _signals_html, normalize_rows, status_payload)
+                        _fee_quoted, _kv, _render_body, _signals_html, normalize_rows,
+                        status_payload)
 from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
 
@@ -118,6 +119,12 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
     ("agent_expiry_cleanup", "到期前自动清仓（≤3 天）",
      "开 = API 快到期（剩余 3 天以内）时自动撤单平仓，避免到期后想平也平不了；"
      "关 = 只提醒不清仓（需要自己盯）", True, "AGENT_EXPIRY_CLEANUP"),
+    # PR-3：净额口径切换。默认关 —— 先让「本地 vs 流水」的差异被记录和核对，
+    # 再决定要不要让面板改读流水口径（net_pnl 两态都写，随时可切回）。
+    ("hl_pnl_from_fills", "记录页净额改用流水口径",
+     "开 = 记录页「净额（流水）」列显示按真实成交聚合的净额；"
+     "关 = 不显示该列（面板仍用交易所已实现口径）。两种状态下净额都会照常计算入库",
+     False, "HL_PNL_FROM_FILLS"),
 )
 
 
@@ -873,12 +880,15 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
         d = str(r.get("dir") or "")
         bs = _FILL_BS.get(d, "—")
+        # 手续费走 views._fee_quoted（fee_quote 优先、NULL 回退 fee）：与总览的
+        # 「净手续费」和净利计算同口径，否则同一笔成交在两处显示不同的数字。
+        fee_txt = _fmt(_fee_quoted({"fee": r.get("fee"), "fee_quote": r.get("fee_quote")}), 4)
         rows += (f"<tr><td class='num'>{_ts(r.get('ts') or r.get('created_at'))}</td>"
                  f"<td>{_esc(r.get('coin') or _coin('', r.get('symbol')))}</td>"
                  f"<td>{bs}</td>"
                  f"<td class='num'>{_fmt(r.get('sz'), 4)}</td>"
                  f"<td class='num'>{_fmt(r.get('px'))}</td>"
-                 f"<td class='num'>{_fmt(r.get('fee'), 4)}</td>"
+                 f"<td class='num'>{fee_txt}</td>"
                  f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
                  f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
     o.append(_table("<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
@@ -1327,8 +1337,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                               enable_long: Optional[str] = Form(None),
                               enable_shorts: Optional[str] = Form(None),
                               agent_expiry_cleanup: Optional[str] = Form(None),
+                              hl_pnl_from_fills: Optional[str] = Form(None),
                               k: str = Form("")):
-        """保存「策略与保护」三个开关。
+        """保存「策略与保护」的开关。
 
         语义铁律（2026-10-19 事故回归）：
           - **字段完全缺失（None）= 保持原值，不写库** —— 脚本/旧书签只带一个键时
@@ -1338,7 +1349,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         """
         token = _auth(deps, request, k or None)
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
-                    "agent_expiry_cleanup": agent_expiry_cleanup}
+                    "agent_expiry_cleanup": agent_expiry_cleanup,
+                    "hl_pnl_from_fills": hl_pnl_from_fills}
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1359,11 +1371,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                     status_code=303)
         word = {1: "开", 0: "关"}
         deps.log_event("decision",
-                       "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s）"
+                       "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
-                          if "agent_expiry_cleanup" in vals else "不变"))
+                          if "agent_expiry_cleanup" in vals else "不变",
+                          word[vals["hl_pnl_from_fills"]]
+                          if "hl_pnl_from_fills" in vals else "不变"))
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 推送开关 ----------------
