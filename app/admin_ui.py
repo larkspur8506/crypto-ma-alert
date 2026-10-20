@@ -1062,9 +1062,9 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
     「更新 API（续期）」表单**不在这里** —— 它是写操作入口，留在「参数」页
     （:func:`render_agent_renew_block`）。2026-10-19 只搬走表单，状态卡回原位。
 
-    「为什么没开仓」（/why）由 views._render_body 自己渲染，数据源是这里现算并注入
-    payload["why"] —— 见 PR-5：面板不重算判定，只喂数据；`why_rows_fn` 可注入
-    （测试用固定行，绝不触网）。
+    「为什么没开仓」（/why）已经并进 views._render_body 的「三标的动态」板块（原因行 /
+    闸门异常行），数据源是这里现算并注入 payload["why"] —— 见 PR-5：面板不重算判定，
+    只喂数据；`why_rows_fn` 可注入（测试用固定行，绝不触网）。
     """
     if "why" not in payload:
         payload = dict(payload)

@@ -723,7 +723,7 @@ class TestWhyRows(WhyRowsBase):
 
 
 class TestPanels(WhyRowsBase):
-    """面板渲染：`/why` 区块出现在总览里，每标的一行，闸门徽章可见。"""
+    """面板渲染：/why 的数据现在长在「三标的动态」卡片里（原「为什么没开仓」表格已合并掉）。"""
 
     @classmethod
     def setUpClass(cls):
@@ -738,26 +738,38 @@ class TestPanels(WhyRowsBase):
                              address_fn=lambda: "", mode_fn=lambda: "off",
                              now_fn=lambda: 1_760_000_000.0)
 
-    def test_why_block_renders_each_symbol(self):
-        from app.hl.views import _why_block
+    def test_merged_block_renders_each_symbol(self):
+        """每标的一张卡，且只有一个区块标题（旧的两块不能同时出现）。"""
+        from app.hl.views import _symbol_dynamics
         bars = _squeezed_breakout()[0]
         rows = why_mod.build_rows(self.db, self.cfg, symbols=["BTC_USDT", "ETH_USDT"],
                                   fetch=lambda sym, now=None: self._feed(bars))
-        html = _why_block(rows)
-        self.assertIn("为什么没开仓", html)
-        self.assertIn("<th>标的</th>", html)
-        self.assertIn("BTC", html)
-        self.assertIn("ETH", html)
-        self.assertIn("闸门", html)
-        self.assertEqual(html.count("<tr>"), 3, "表头 + 两个标的数据行")
+        html = _symbol_dynamics({"why": rows})
+        self.assertIn("三标的动态", html)
+        self.assertNotIn("为什么没开仓", html)
+        self.assertIn('class="nm">BTC', html)
+        self.assertIn('class="nm">ETH', html)
+        self.assertEqual(html.count('class="sym"'), 2)
 
-    def test_why_block_shows_block_reason_and_gate_badge(self):
-        from app.hl.views import _why_block
-        bars = flat_then_trend()                                  # 不密集
-        html = _why_block(why_mod.build_rows(self.db, self.cfg, fetch=lambda s, now=None: self._feed(bars)))
+    def test_block_reason_comes_from_strategy_and_ok_gate_is_silent(self):
+        """不密集：原因行用人话讲拦截原因；闸门全正常 → 连「放行」字样都不出现。"""
+        from app.hl.views import _symbol_dynamics
+        html = _symbol_dynamics({"why": self.rows(flat_then_trend())})
         self.assertIn("均线不密集", html)
-        self.assertIn("闸门放行", html)
-        self.assertIn("静置剩余", html)
+        self.assertNotIn("闸门放行", html)
+        self.assertNotIn("静置剩余", html)
+
+    def test_fired_signal_reason_has_entry_and_stop(self):
+        from app.hl.views import _symbol_dynamics
+        row = {"symbol": "BTC_USDT", "coin": "BTC", "price": 100.0, "sma20": 96.0,
+               "why": {"fired": True, "side": 1, "blocked_by": "ok", "reason": "信号成立：做多",
+                       "signal": {"side": 1, "entry_price": 100.0, "stop_price": 96.0,
+                                  "stop_dist": 0.04},
+                       "values": {}},
+               "position": None, "error": None, "gates": {}, "gate_side": 1, "gate": None}
+        html = _symbol_dynamics({"why": [row]})
+        self.assertIn("信号成立（多）", html)
+        self.assertIn("信号成立：入场 100.00、止损 96.00（4.00%）", html)
 
     def test_json_endpoint_returns_rows(self):
         """`/api/hl/why`：每标的一行的 JSON（运维 curl 用；与会话面板同一份数据）。"""
@@ -782,31 +794,42 @@ class TestPanels(WhyRowsBase):
         finally:
             why_mod.build_rows = orig
 
-    def test_why_block_empty_returns_empty(self):
-        from app.hl.views import _why_block
-        self.assertEqual(_why_block([]), "")
+    def test_merged_block_empty_returns_empty(self):
+        from app.hl.views import _symbol_dynamics
+        self.assertEqual(_symbol_dynamics({}), "")
+        self.assertEqual(_symbol_dynamics({"why": [], "symbol_state": []}), "")
 
-    def test_why_block_fail_soft_on_dirty_rows(self):
-        """脏行（缺字段/None/非 dict）不得抛异常 —— 诊断区块不能弄挂总览。"""
-        from app.hl.views import _why_block
-        html = _why_block([{}, {"symbol": None}, {"coin": "BTC", "why": {"blocked_by": "regime"},
-                                                  "gates": {"long": {}}, "gate": {}},
-                           {"error": "boom", "coin": "ETH"}])
-        self.assertIn("为什么没开仓", html)
-        self.assertIn("—", html)
-        self.assertIn("行情读取失败", html)
+    def test_merged_block_fail_soft_on_dirty_rows(self):
+        """脏行（缺字段/None/非 dict）不得抛异常 —— 诊断不能弄挂总览。"""
+        from app.hl.views import _symbol_dynamics
+        html = _symbol_dynamics({
+            "why": [{}, {"symbol": None}, {"error": "boom", "coin": "ETH"},
+                    {"coin": "BTC", "why": {"blocked_by": "regime", "reason": "MA200 过滤拦下"},
+                     "gates": {"long": {}}, "gate": {}}],
+            "symbol_state": [{"symbol": "SOL_USDT", "coin": "SOL", "price": 150.0,
+                              "dense_cnt": None, "sma20": None, "sma200": None,
+                              "long_trigger": None, "short_trigger": None,
+                              "updated_at": None, "position_side": None}],
+        })
+        self.assertIn("三标的动态", html)
+        self.assertIn("行情读取失败", html)      # error 行退了缓存/或标红，但整块照常
+        self.assertIn("SOL", html)               # symbol_state 补上的标的也在
+        self.assertIn("MA200 过滤拦下", html)
 
-    def test_render_body_includes_why_section_after_dynamics(self):
-        """位置：紧接「三标的动态」（同一个问题的两半）。"""
+    def test_render_body_has_single_dynamics_section(self):
+        """总览只留一个区块：旧的「为什么没开仓」标题与表格结构都不该再出现。"""
         from app.hl.views import _render_body
         payload = {"mode": "off", "ts": 1_760_000_000.0, "position": [], "symbol_state": [],
                    "why": [{"symbol": "BTC_USDT", "coin": "BTC", "price": 100.0,
                             "why": {"fired": False, "blocked_by": "breakout",
-                                    "reason": "收盘价没破线", "steps": []},
+                                    "reason": "收盘价没破线：100.00 落在上轨 105.00 / 下轨 95.00 之间",
+                                    "steps": []},
                             "gates": {}, "gate": {}}]}
         html = _render_body(payload)
-        self.assertIn("为什么没开仓", html)
-        self.assertIn("收盘没破线", html)
+        self.assertIn("<h2>三标的动态", html)
+        self.assertNotIn("为什么没开仓", html)
+        self.assertNotIn("闸门（动作前置）", html)
+        self.assertIn("收盘价没破线", html)
 
     def test_admin_overview_renders_why_rows(self):
         """合并面板总览：注入的 why_rows_fn 必须被真正渲染（不是只传给 payload）。"""
@@ -828,13 +851,13 @@ class TestPanels(WhyRowsBase):
                          mode_fn=lambda: "off", token_fn=lambda: "t",
                          why_rows_fn=lambda: rows)
         html = _overview_body(deps, {"mode": "off", "ts": 1_760_000_000.0})
-        self.assertIn("为什么没开仓", html)
-        self.assertIn("止损距离越界", html)
-        self.assertIn("静置中", html)
-        self.assertIn("12s", html.split("静置剩余")[1][:12])
+        self.assertIn("三标的动态", html)
+        self.assertNotIn("为什么没开仓", html)
+        self.assertIn("止损距离 12.00% 不在 1.5%~10.0% 之间", html)
+        self.assertIn("⚠️ 静置剩余 12s", html)
 
     def test_admin_overview_survives_why_source_failure(self):
-        """数据源抛异常 → 区块整体略去，页面照常渲染（不能 500）。"""
+        """数据源抛异常 → 诊断行整体略去（有 symbol_state 就只少了原因行），页面照常渲染。"""
         from app.admin_ui import AdminDeps, _overview_body
 
         def boom():
@@ -842,19 +865,20 @@ class TestPanels(WhyRowsBase):
         deps = AdminDeps(db=self.db, config_fn=lambda: self.cfg, hl_deps=self._deps(),
                          mode_fn=lambda: "off", token_fn=lambda: "t", why_rows_fn=boom)
         html = _overview_body(deps, {"mode": "off", "ts": 1_760_000_000.0})
-        self.assertNotIn("为什么没开仓", html)
+        self.assertNotIn("三标的动态", html)        # 没有任何标的读数 → 整块略去
         self.assertIn("账户", html, "总览其余部分照常渲染")
 
-    def test_churn_badge_when_tripped(self):
-        from app.hl.views import _why_block
-        html = _why_block([{"symbol": "BTC_USDT", "coin": "BTC", "price": 100.0,
-                            "why": {"fired": False, "blocked_by": "squeeze", "reason": "不密集"},
-                            "gates": {}, "gate_side": 1,
-                            "gate": {"verdict": "churn", "settle_remaining_s": 0,
-                                     "churn_count": 5, "churn_limit": 5,
-                                     "churn_tripped": True}}])
-        self.assertIn("churn 熔断", html)
-        self.assertIn("churn 5/5", html)
+    def test_churn_line_says_how_it_trips(self):
+        from app.hl.views import _symbol_dynamics
+        html = _symbol_dynamics({"why": [{"symbol": "BTC_USDT", "coin": "BTC", "price": 100.0,
+                                          "why": {"fired": False, "blocked_by": "squeeze",
+                                                  "reason": "不密集"},
+                                          "gates": {}, "gate_side": 1,
+                                          "gate": {"verdict": "churn", "settle_remaining_s": 0,
+                                                   "churn_count": 5, "churn_limit": 5,
+                                                   "churn_tripped": True}}]})
+        self.assertIn("⚠️ churn 5/5", html)
+        self.assertIn("10 分钟内 5 次撤挂即熔断", html)
 
 
 if __name__ == "__main__":

@@ -147,11 +147,20 @@ def why_row(db: Any, cfg: Any, symbol: str, bars: Sequence[strategy.Bar]) -> Dic
                                  min_squeeze_bars=cfg.min_squeeze_bars,
                                  squeeze_raw=raw)
     pos, note = _position_part(db, symbol)
+    # sma20 = 最后一根**已收盘** bar 的 SMA20，与触发线 / SMA200 同索引（i = len(bars)-2）。
+    # 只作展示字段：面板合并后「距自动离场线 ①」用的是这条线，而 why 行是唯一同时带着
+    # 现价与六步结论的数据源 —— 不补这个字段，面板就得再去读 symbol_state 才能画 ①，
+    # 又会回到「同一屏两个数据源」的老问题。**不参与任何判定**。
+    sma20: Optional[float] = None
+    sma_seq = ind.get("sma20") or []
+    if 0 <= i < len(sma_seq) and sma_seq[i] is not None:
+        sma20 = float(sma_seq[i])
     row: Dict[str, Any] = {
         "symbol": symbol,
         "coin": _coin_of(symbol) or symbol,
         "price": float(bars[-1].close) if bars else None,
         "bars": len(bars),
+        "sma20": sma20,
         "why": why,
         "position": pos,
         "note": note,
@@ -238,7 +247,7 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
             e = bars if isinstance(bars, Exception) else RuntimeError("未取到行情")
             logger.warning("[why] %s 取行情失败：%s", symbol, e)
             rows.append({"symbol": symbol, "coin": coin, "price": None, "bars": 0,
-                         "why": None, "position": None, "note": "",
+                         "sma20": None, "why": None, "position": None, "note": "",
                          "error": f"{type(e).__name__}: {e}",
                          "gates": gates_for(db, cfg, coin), "gate_side": 0, "gate": None})
             continue
@@ -258,7 +267,8 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
             except Exception as e:                                # noqa: BLE001
                 logger.exception("[why] %s 诊断计算失败：%s", symbol, e)
                 rows.append({"symbol": symbol, "coin": coin, "price": None,
-                             "bars": len(bars), "why": None, "position": None, "note": "",
+                             "bars": len(bars), "sma20": None, "why": None,
+                             "position": None, "note": "",
                              "error": f"{type(e).__name__}: {e}",
                              "gates": {}, "gate_side": 0, "gate": None})
                 continue

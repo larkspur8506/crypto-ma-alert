@@ -262,8 +262,12 @@ class TestRenderBlock(unittest.TestCase):
         # 手机（iOS Safari 无 title 悬停）唯一能看到 ①②③ 口径的地方 → 必须是可见文字
         # 注意：CSS 里也有 .sym-legend（在 <head>），所以用 div 标签定位，别用裸类名
         html = self.render([self.row()])
-        legend = '<div class="sym-legend">① 离场按 4h 收盘判定 · ' \
-                 '② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空</div>'
+        # 面板合并后只剩一条脚注：原「为什么没开仓」的「信号 / 闸门」口径并进同一句
+        legend = ('<div class="sym-legend">① 离场按 4h 收盘判定 · '
+                  '② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空 · '
+                  '信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）· '
+                  '闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），'
+                  '只影响「什么时候动手」，不改变信号本身；闸门正常时不显示</div>')
         self.assertIn(legend, html)
         # 图例在 grid 之后、区块 card 收尾之前（即仍在「三标的动态」区块内）
         mark = '<div class="sym-legend">'
@@ -271,7 +275,7 @@ class TestRenderBlock(unittest.TestCase):
         self.assertLess(html.index(mark), html.index("<h2>交易所挂单</h2>"))
         # 三段口径逐条可见
         for frag in ("① 离场按 4h 收盘判定", "② 破线+密集满 6 根开多",
-                     "③ 破线+MA200 下方才开空"):
+                     "③ 破线+MA200 下方才开空", "闸门 = 执行器动作前的附加保护"):
             self.assertIn(frag, html)
         # 样式类随页面下发（只用现有 CSS 变量，两主题自动适配）；
         # 本轮起 .legend 与 .sym-legend 合组同规则（账户/系统/数据源三条注脚共用）
@@ -613,8 +617,11 @@ class TestPayloadSymbolState(unittest.TestCase):
         html = render_dashboard(p)
         self.assertIn('<span class="st hot" title="6 均线已连续 4 根密集，满 6 根后收盘突破即入场">'
                       "密集酝酿 4/6</span>", html)
-        self.assertIn("持仓中（多）", html)
-        self.assertIn("均线未密集", html)
+        # 合并后状态词按优先级只讲一件事：ETH 没有 symbol_state 行（无现价）→「行情读取失败」，
+        # 但仓位事实仍要出现在原因行里（position_side 的接线不能丢）。
+        self.assertIn("持仓中，本轮不评估新入场", html)
+        # 无数据不再谎报「均线未密集」（旧样式的兜底词），一律说行情读取失败
+        self.assertEqual(html.count('<span class="st neg">行情读取失败</span>'), 2)  # ETH + SOL
 
     def test_pending_position_is_not_position(self):
         self.db.create_position(symbol="ETH_USDT", signal_bar_ms=1, entry_price=3_000.0,
