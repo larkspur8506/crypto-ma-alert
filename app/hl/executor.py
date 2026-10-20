@@ -25,6 +25,7 @@ from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, 
                     ST_FAILED, ST_FILLED, ST_INTENT, ST_PLANNED, ST_RESTING, ST_SENT, ST_SKIPPED,
                     EV_DECISION, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
+from app.hl import pnl as hl_pnl
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
@@ -47,6 +48,16 @@ QUOTE_FEE_TOKENS = frozenset({"USDC", "USDT", "USD"})
 FEE_UNQUOTED_KEY = "hl_fee_unquoted_tids"
 FEE_UNQUOTED_MAX = 200
 
+# 数量对账（PR-3）的「两击」阈值：一位小数 tick 的容差不够 —— HL 的数量是
+# 10^-szDecimals 的整数倍，浮点往返（字符串→float→SQLite REAL）本身就会差几十个
+# 末位，所以按「≤1 tick 视为一致」，并额外给一个相对噪声容差兜住大数量。
+SIZE_DIFF_STRIKES_TO_KILL = 2
+
+# pnl_source 取值（positions.pnl_source，面板/报告据此判断该不该采信 net_pnl）
+PNL_SRC_FILLS = "fills"          # 有成交，net_pnl 来自 hl_fills 聚合
+PNL_SRC_NO_FILLS = "no_fills"    # 窗内查不到成交（net_pnl 为 NULL，不猜 0）
+PNL_SRC_NO_EXIT_FILLS = "no_exit_fills"   # 只有入场腿（平仓成交还没同步），不写半截净额
+
 
 # ---------------------------------------------------------------- 推送文案（人类可读）
 
@@ -56,6 +67,16 @@ def _fmt_u(x, nd: int = 2) -> str:
 
 def _side_word(side: int) -> str:
     return "做多" if int(side or 1) >= 0 else "做空"
+
+
+def _fmt_num(v, nd: int = 2) -> str:
+    """可空数字格式化：None（算不出来）显示 '—'，不要把 None 当 0 打出去。"""
+    if v is None:
+        return "—"
+    try:
+        return f"{float(v):+.{nd}f}"
+    except (TypeError, ValueError):
+        return "—"
 
 
 def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: float,
@@ -156,6 +177,11 @@ class ExecParams:
     min_notional: float = 10.0
     snapshot_min_interval_s: float = 240.0
     stop_max_hard: float = 0.10           # 执行时止损距离超此值直接放弃
+    # 净 PnL 口径开关（PR-3）：**默认关** = 只用流水口径**观测**（照算 net_pnl、
+    # 照记差异事件），面板/统计仍读本地价差口径；开 = 面板逐仓净额改读 net_pnl。
+    # 默认关的理由：流水口径依赖 hl_fills 已同步完整，上线初期两边数字不一致时，
+    # 先让差异被记录、被人工核对，再决定要不要切换读数（切换是可回滚的一行配置）。
+    pnl_from_fills: bool = False
     code_rev: str = ""
 
     @property
@@ -183,12 +209,23 @@ class Executor:
     # 的序列在整个进程里串行。
     _op_lock = threading.Lock()
 
+    # 数量对账「两击」的 strike 计数（PR-3）。**必须放类属性**：执行器每轮 tick 由
+    # build_executor() 新建实例，实例属性活不过一轮，永远数不到第二次。
+    # 只存进程内存（重启清零可接受）：重启后至少还要重新连续超差两次才 fail-closed，
+    # 代价是晚一轮动作，而写进 DB 会引入「僵尸 strike」（几天不重启就误平仓）的风险。
+    _size_strikes: Dict[str, int] = {}
+    _size_strikes_lock = threading.Lock()
+
     def __init__(self, db, params: ExecParams, info, exchange, notifier=None):
         self.db = db
         self.p = params
         self.info = info
         self.ex = exchange
         self.notifier = notifier
+        # 最近一次成功同步成交的时刻（实例级）。关账路径里「同步 → 算净额」会与
+        # _on_exit 自己的那次同步撞车，10s 内不重复打同一个接口（同一实例内判断，
+        # 跨实例本来就会重新同步，语义不变）。
+        self._last_sync_at = 0.0
 
     # ------------------------------------------------------------ 工具
     def _coin_or_none(self, symbol: str) -> Optional[str]:
@@ -277,8 +314,14 @@ class Executor:
         return snap
 
     # ------------------------------------------------------------ 对账
-    def reconcile(self, snap: Optional[dict] = None) -> dict:
-        """以交易所为权威核对本地状态。返回 {"ok":bool,"problems":[str,...]}。"""
+    def reconcile(self, snap: Optional[dict] = None,
+                  kill_before: Optional[bool] = None) -> dict:
+        """以交易所为权威核对本地状态。返回 {"ok":bool,"problems":[str,...]}。
+
+        ``kill_before``：**本轮开始前**的 kill 状态（见 ``_run_locked``）。数量对账的
+        fail-closed 用它判断「要不要动手」—— 进来时就已 kill 说明人工正在核对，
+        这边再去改 kill/推告警只会互相打架（与 ``_repair_missing_stop`` 同一口径）。
+        """
         snap = snap if snap is not None else self._snapshot()
         if snap is None:
             return {"ok": False, "problems": ["读不到账户状态（info 失败）"], "unknown": True}
@@ -306,6 +349,8 @@ class Executor:
                       and (r["status"] == "open" or self._entry_issued(r))
                       and (r["hl_status"] or "") in ("open", "mismatch", "")]
         seen = set()
+        size_problems: List[str] = []
+        size_warn: List[str] = []
         for r in local_open:
             # coin 解析不出（未注册）：无法与交易所仓比对，也不许拿猜的名字去补挂/平仓
             # → 记成问题（fail-closed，走既有告警/停手口径），但不抛异常打断整轮对账。
@@ -318,6 +363,11 @@ class Executor:
                 problems.append(f"{r['symbol']} 本地有仓（#{r['id']}）但交易所无仓位")
                 self.db.set_pos_hl(r["id"], hl_status="mismatch")
                 continue
+            # 数量对账（PR-3）：以前只比「有没有仓」，数量错了（部分成交、IOC 只成一半、
+            # 手工加减仓）会一路带进 PnL。两击规则见 _size_check。
+            # 传 dict(r)：_size_* 里用 .get()，而 sqlite3.Row 没有 get（会 AttributeError）。
+            if tx := self._size_check(dict(r), ex_pos[coin], kill_before=kill_before):
+                (size_problems if tx["kill"] else size_warn).append(tx["message"])
             if not self._has_stop(snap, coin):
                 if trusted:
                     problems.append(f"{r['symbol']} 有仓但**没有止损挂单**")
@@ -328,8 +378,208 @@ class Executor:
         for coin in ex_pos:
             if coin not in seen:
                 problems.append(f"交易所有 {coin} 仓位但本地无记录（人工单？）")
+        # 数量对账的「要不要动作」在 _size_check 里已经判过 kill_before：
+        # kill 分支并入 problems（走既有告警口径），真正置 kill 放在这里一次完成 ——
+        # 于是直接调 reconcile() 的路径（agent 到期保护等）也同样是 fail-closed，
+        # 不依赖调用方是否走了 _run_locked。
+        problems.extend(size_problems)
+        if size_problems:
+            if kill_before is None:
+                kill_before = bool(self.db.hl_kill())
+            if not kill_before:
+                self.db.hl_set_kill(True, "持仓数量对账连续不一致")
+                self._event(EV_KILL, "持仓数量对账连续不一致 → 自动 kill switch",
+                            data={"problems": size_problems})
+        # 清掉已经不在 open 列表里的 strike 键：仓位关掉后没人会再走「数量一致」分支，
+        # 留着就是内存泄漏（长期运行的容器会慢慢攒，每标的一行）。
+        self._strike_prune({int(r["id"]) for r in local_open})
         return {"ok": not problems, "problems": problems, "unknown": False,
-                "missing_stop": missing_stop, "unconfirmed": unconfirmed}
+                "missing_stop": missing_stop, "unconfirmed": unconfirmed,
+                "size_warn": size_warn, "size_kill": bool(size_problems)}
+
+    # ------------------------------------------------------------ 数量对账（PR-3）
+    def _size_tick(self, coin: str) -> Optional[float]:
+        """该合约 1 tick 的数量（10^-szDecimals）。读不到规格返回 None → 由调用方跳过。
+
+        不猜精度：拿一个默认 szDecimals 去当容差，等于用一个可能差 100 倍的尺子判
+        「数量一致/不一致」，两种结论都不可信。
+        """
+        try:
+            specs = self.info.specs([coin]).get(coin) or {}
+            dec = specs.get("sz_decimals")
+            if dec is None:
+                return None
+            return 10.0 ** -int(dec)
+        except (HlInfoError, TypeError, ValueError) as e:              # noqa: BLE001
+            logger.warning("[hl-exec] 数量对账读不到 %s 规格，本轮跳过：%s", coin, e)
+            return None
+
+    def _agg_window(self, coin: str, opened_at: Any, closed_at: Any,
+                    side: Any) -> Dict[str, Any]:
+        """按时间窗读出该标的成交并聚合（读库失败 → 空聚合，不抛）。"""
+        lo, hi = hl_pnl.window_bounds(opened_at, closed_at)
+        fills: List[Any] = []
+        if lo is not None or opened_at is not None:
+            try:
+                fills = self.db.hl_fills_window(coin, lo, hi)
+            except Exception as e:                                    # noqa: BLE001
+                logger.warning("[hl-exec] 取成交失败（按无成交处理）：%s", e)
+        return hl_pnl.aggregate_fills(fills, opened_at, closed_at, coin, side)
+
+    def _size_agg(self, row: dict, coin: str) -> Optional[dict]:
+        """本地 open 仓的成交流水聚合（窗口 = opened_at−300s 至今）。
+
+        「至今」而不是到某个 closed_at：仓位还开着，出场腿随时可能只有一半。
+        查不到任何成交返回 None（没有依据就不判 —— 首次同步还没跑完时不该报不一致）。
+        """
+        if row.get("opened_at") is None:
+            return None
+        agg = self._agg_window(coin, row.get("opened_at"), None, row.get("side"))
+        return agg if agg["n_fills"] > 0 else None
+
+    def _size_check(self, row: dict, ex_pos: dict,
+                    kill_before: Optional[bool] = None) -> Optional[dict]:
+        """本地开仓 vs 交易所仓位的**数量**对账，两击规则。返回 None = 一切正常。
+
+        规则（为什么是两击）
+        -------------------
+        数量差可能来自「成交还没同步完」「回捞窗口漏了一笔」，也可能真的错了。第一次
+        超差只做**一次全量回捞**（userFillsByTime 从 opened_at−300s 起）并重算 ——
+        实测多数差异是本地流水缺腿，回捞即自愈；回捞后仍超差才计一击，连续两击才
+        fail-closed（等价于 _repair_missing_stop 的「先修、修不好才停手」）。
+        这样一次同步延迟不会把执行器打成 kill（误停的代价：错过合法信号 + 人工介入）。
+
+        kill_before：**本轮开始前**的 kill 状态。已置位说明人工正在核对，这里只提示、
+        不再触发 kill（判据用「本轮开始前」而不是「现在」，理由同 _repair_missing_stop）。
+        """
+        coin = self._coin_or_none(row["symbol"])
+        pid = int(row["id"])
+        if coin is None:
+            return None                                   # 上层已记 problem，不重复
+        tick = self._size_tick(coin)
+        if tick is None:
+            return None                                   # 规格不可读 → 本轮不判（下轮重试）
+        agg = self._size_agg(row, coin)
+        if agg is None:
+            return None                                   # 没有任何成交：无从判断
+
+        def _diff(a: dict) -> float:
+            return abs(hl_pnl.net_size(a) - float(ex_pos.get("size") or 0.0))
+
+        def _within(a: dict) -> bool:
+            net = hl_pnl.net_size(a)
+            # 容差 = 1 tick + 相对噪声（float→SQLite REAL 往返在数量大时会掉末位）
+            noise = 1e-9 * max(abs(net), abs(float(ex_pos.get("size") or 0.0)))
+            return _diff(a) <= tick + noise
+
+        key = f"{pid}:{coin}"
+        if _within(agg):
+            self._strike_clear(key)
+            return None
+
+        # 第一次超差：先回捞一次，别急着记账
+        first = _diff(agg)
+        self._event(EV_RECONCILE,
+                    f"{row['symbol']} 数量对账首次超差：流水净量 {hl_pnl.net_size(agg):g} vs "
+                    f"交易所 {float(ex_pos.get('size') or 0.0):g}（差 {first:g}，tick {tick:g}）"
+                    f" → 全量回捞重算",
+                    symbol=row["symbol"],
+                    data={"pid": pid, "coin": coin, "flow_sz": hl_pnl.net_size(agg),
+                          "ex_sz": ex_pos.get("size"), "diff": first, "tick": tick})
+        refetched = self._refetch_fills(row.get("opened_at"))
+        if refetched:
+            agg2 = self._size_agg(row, coin)
+            if agg2 is not None and _within(agg2):
+                # 回捞修好了差异：清零 strike，本轮不采取任何动作
+                self._strike_clear(key)
+                self._event(EV_RECONCILE,
+                            f"{row['symbol']} 数量对账经回捞后一致"
+                            f"（{hl_pnl.net_size(agg2):g} vs {float(ex_pos.get('size') or 0.0):g}），"
+                            f"strike 已清零", symbol=row["symbol"])
+                return None
+            if agg2 is not None:
+                agg = agg2
+
+        strikes = self._strike_add(key)
+        detail = (f"{row['symbol']} 持仓数量对账不一致（第 {strikes} 次）："
+                  f"流水净量 {hl_pnl.net_size(agg):g} vs 交易所 "
+                  f"{float(ex_pos.get('size') or 0.0):g}（差 {_diff(agg):g} > tick {tick:g}）")
+        if strikes < SIZE_DIFF_STRIKES_TO_KILL:
+            self._event(EV_RECONCILE, detail + f"，未达 {SIZE_DIFF_STRIKES_TO_KILL} 次，继续观察",
+                        symbol=row["symbol"],
+                        data={"pid": pid, "strikes": strikes, "flow_sz": hl_pnl.net_size(agg),
+                              "ex_sz": ex_pos.get("size")})
+            return {"kill": False, "message": detail}
+
+        # 连续两击 → fail-closed。置 kill 的动作留在 reconcile 里统一做（一处写、
+        # 一处追责），这里只把「该停手」这个结论交上去 —— 于是直接调 reconcile 的
+        # 路径（agent 到期保护等）也同样是 fail-closed，不依赖走没走 _run_locked。
+        # kill_before 已置位：人工在处理，只提示不动它（判据用本轮开始前的值）。
+        if kill_before is None:
+            kill_before = bool(self.db.hl_kill())
+        if kill_before:
+            self._event(EV_DECISION, detail + "；kill 早已置位，本轮不重复触发（等人工核对）",
+                        symbol=row["symbol"])
+            return {"kill": False, "message": detail}
+        self._event(EV_ERROR,
+                    detail + f" → 连续 {strikes} 次不一致，fail-closed（暂停自动交易，等人工核对）",
+                    symbol=row["symbol"],
+                    data={"pid": pid, "strikes": strikes, "flow_sz": hl_pnl.net_size(agg),
+                          "ex_sz": ex_pos.get("size"), "tick": tick})
+        return {"kill": True, "message": detail + f" → 连续 {strikes} 次不一致，已 fail-closed"}
+
+    # strike 计数（进程内存，见类属性注释）
+    def _strike_clear(self, key: str) -> None:
+        with self._size_strikes_lock:
+            self._size_strikes.pop(key, None)
+
+    def _strike_add(self, key: str) -> int:
+        with self._size_strikes_lock:
+            self._size_strikes[key] = int(self._size_strikes.get(key, 0)) + 1
+            return self._size_strikes[key]
+
+    def _strike_prune(self, alive_pids: set) -> None:
+        """丢掉已关仓位（不在本轮 open 列表里）的 strike 键，避免进程内存无界增长。"""
+        with self._size_strikes_lock:
+            for key in [k for k in self._size_strikes if int(k.split(":")[0]) not in alive_pids]:
+                self._size_strikes.pop(key, None)
+
+    def _refetch_fills(self, since_ts: Any) -> int:
+        """从 opened_at−300s 起全量回捞该账户成交并落库（按 tid 幂等）。
+
+        与 `_sync_fills` 的区别：后者只取最近 100 笔（`userFills` 的滑动窗口），
+        持仓跨日/多标的并行时**入场腿早就滑出去了**，回捞窗口必须显式从开仓前取。
+        失败返回 0（不抛）：回捞失败只是「这次没修好」，不该打断整轮对账。
+        """
+        if not self.p.account_address:
+            return 0
+        try:
+            since = float(since_ts)
+        except (TypeError, ValueError):
+            return 0
+        start_ms = int((since - hl_pnl.ENTRY_LOOKBACK_S) * 1000)
+        rows: List[dict] = []
+        try:
+            fn = getattr(self.info, "user_fills_by_time", None)
+            if callable(fn):
+                got = fn(self.p.account_address, start_ms) or []
+            else:                                        # 桩/老客户端：退回滑动窗口
+                got = self.info.user_fills(self.p.account_address) or []
+            if isinstance(got, list):
+                rows = [x for x in got if isinstance(x, dict)]
+        except Exception as e:                                         # noqa: BLE001
+            # 广口径兜住：回捞是**修复手段**，它失败只能说明这次没修好，绝不能把
+            # 整轮对账/熔断/心跳带崩（那才是最危险的连锁反应）。
+            logger.warning("[hl-exec] 全量回捞成交失败（忽略）：%s", e)
+            return 0
+        if not rows:
+            return 0
+        try:
+            return self._sync_fills(limit=len(rows), fills=rows)
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 回捞成交落库失败（忽略）：%s", e)
+            return 0
+
 
     def _repair_missing_stop(self, row: dict, snap: dict,
                              kill_before: Optional[bool] = None) -> None:
@@ -1036,6 +1286,81 @@ class Executor:
         self._event(EV_DECISION, f"下单基数 {last:g} → {now:g} U（跟随实时权益）",
                     data={"prev": last, "now": now, "config_base": prev})
 
+    def _record_fill_pnl(self, position_id: int) -> None:
+        """用 hl_fills 聚合出该仓的**流水口径**净额，落库并与本地口径比对。
+
+        口径（与 scripts/fill_recon_report.py 同源，见 app/hl/pnl.py）：
+          net_fill  = Σclosed_pnl − fee_total（时间窗 [opened_at−300s, closed_at+300s]）
+          net_local = (exit_px − entry) × side × sz − fee_total
+        `net_local` 用**同一份** fee_total：这样 Δnet 只反映价差/数量的出入（本地记录
+        最容易错的地方），不会因为两侧手续费口径不同而恒有差（PR-2 报告同款取舍）。
+
+        **必须有出场腿才写净额**：关账那一刻平仓成交往往还没落库（同步是另一条路径），
+        只有入场腿时 net = 0 − 入场费 ≈「亏了一笔手续费」，这比留空更误导。缺出场腿
+        时只标 `no_exit_fills` 等下一轮/报告补（不写半截数字）。
+        完全没有成交（人工 MEXC 流、首次同步未跑完）→ net_pnl=NULL + `no_fills`，
+        绝不写 0 —— 「0 收益」和「不知道」在统计里是完全不同的两件事。
+        """
+        row = self.db.position_by_id(position_id)
+        if row is None:
+            return
+        coin = self._coin_or_none(str(row["symbol"]))
+        if coin is None:
+            return
+        lo, hi = hl_pnl.window_bounds(row["opened_at"], row["closed_at"])
+        if lo is None:
+            return                                   # 没有 opened_at：无法定窗口
+        # 平仓成交通常在关账后几十秒才进库：先同步一次再算，否则必然只有入场腿。
+        # 10s 内已经同步过就不再打接口（_on_exit 刚同步过一次，重复拉只会拖慢关账）。
+        if time.time() - float(getattr(self, "_last_sync_at", 0.0) or 0.0) > 10.0:
+            try:
+                self._sync_fills()
+            except Exception as e:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 关账后同步成交失败（净额可能缺出场腿）：%s", e)
+        agg = self._agg_window(coin, row["opened_at"], row["closed_at"], row["side"])
+        if agg["n_fills"] <= 0:
+            self.db.set_pos_pnl(position_id, None, PNL_SRC_NO_FILLS)
+            return
+        if agg["exit_sz"] <= 0:
+            self.db.set_pos_pnl(position_id, None, PNL_SRC_NO_EXIT_FILLS)
+            return
+        net_fill = float(agg["net"])
+        self.db.set_pos_pnl(position_id, net_fill, PNL_SRC_FILLS)
+
+        # ---- 与本地口径对比（纯观测，不阻断任何流程）
+        entry = float(row["actual_entry"] or row["entry_price"] or 0.0)
+        exit_px = float(row["exit_price"] or 0.0)
+        side = int(row["side"] or 1)
+        sz = float(row["hl_sz"] or row["actual_contracts"] or 0.0)
+        stop = float(row["actual_stop"] or row["stop_price"] or 0.0)
+        if not (entry and exit_px and sz):
+            return
+        gross_local = (exit_px - entry) * (1 if side == 1 else -1) * sz
+        net_local = gross_local - float(agg["fee_total"])
+        risk = abs(entry - stop)
+        r_local = (((exit_px - entry) * (1 if side == 1 else -1)) / risk) if risk > 0 else None
+        r_fill = (net_fill / (risk * sz)) if (risk > 0 and sz > 0) else None
+        notional = entry * sz
+        diff = hl_pnl.pnl_diff(r_local, r_fill, net_local, net_fill, notional)
+        if not (diff["r_diff"] or diff["net_diff"]):
+            return
+        # 用 EV_RECONCILE：这是「本地记录 vs 交易所流水」的对账差异，不是下单动作，
+        # 也不该混进 kill/error 的语义里（不新增枚举，看护与面板的现有分类照旧）。
+        self._event(EV_RECONCILE,
+                    f"{row['symbol']} 关账口径差异：R 本地 {_fmt_num(r_local)} / 流水 "
+                    f"{_fmt_num(r_fill)}（Δ{_fmt_num(diff['d_r'], 3)}，阈值 "
+                    f"{diff['r_threshold']:.3f}）；净额 本地 {net_local:+.2f} / 流水 "
+                    f"{net_fill:+.2f}（Δ{diff['d_net']:+.2f}，阈值 "
+                    f"{diff['net_threshold']:.2f}）",
+                    symbol=str(row["symbol"]),
+                    data={"pid": int(position_id), "coin": coin,
+                          "r_local": r_local, "r_fill": r_fill,
+                          "net_local": net_local, "net_fill": net_fill,
+                          "fee_total": agg["fee_total"], "entry_sz": agg["entry_sz"],
+                          "exit_sz": agg["exit_sz"], "sz_local": sz,
+                          "unresolved_fee_cnt": agg["unresolved_fee_cnt"],
+                          "diff": diff})
+
     def _fees_since(self, coin: str, since_ts) -> float:
         """该仓位开仓以来累计手续费（读本地 hl_fills；读不到就返回 0，不影响主流程）。
 
@@ -1104,15 +1429,21 @@ class Executor:
                     f"未能折算成 U 已跳过计入净利，请人工核对",
                     data={"tid": tid, "fee_token": fee_token, "fee": fee})
 
-    def _sync_fills(self, limit: int = 100) -> int:
+    def _sync_fills(self, limit: int = 100,
+                    fills: Optional[List[dict]] = None) -> int:
         """把交易所的成交同步进 hl_fills（按 tid 去重，幂等）。返回新增条数。
 
         fee_quote 在写入时就算好（见 ``_fee_quote``）：读侧（``_fees_since``、
         面板净利）不该重复做币种判断，否则每多一个读点就多一处漏判的机会。
+
+        ``fills``：调用方已取到的成交列表（数量对账的**全量回捞**用，见
+        ``_refetch_fills``）。不传 = 走原来的 ``user_fills`` 滑动窗口。
         """
         if not self.p.account_address:
             return 0
-        fills = self.info.user_fills(self.p.account_address) or []
+        if fills is None:
+            fills = self.info.user_fills(self.p.account_address) or []
+        self._last_sync_at = time.time()
         known = {str(r["tid"]) for r in self.db.hl_recent_fills(500)}
         added = 0
         reverse = {v: k for k, v in (self.p.coin_map or {}).items()}
@@ -1151,8 +1482,21 @@ class Executor:
         return move / risk
 
     def _close_local(self, position_id: int, px: float, reason: str, sz: float) -> None:
+        """本地关账（所有关账路径的唯一出口）。
+
+        PR-3：关账前后各做一件事（都在关账**之后**算，因为要先有 closed_at）：
+          - 用 hl_fills 聚合出流水口径净额写进 `positions.net_pnl`（`pnl_source` 标注
+            来源）—— 无论开关开没开都写，纯观测；
+          - 与本地价差口径 `r_multiple` 比一遍，差异超阈值记一条事件（不阻断、不告警）：
+            这类偏差既可能是本地记错价、也可能是手续费/部分成交，先让它被看见。
+        任何一步失败都不影响关账本身（关账是主流程，观测是附加）。
+        """
         self.db.close_position(position_id, px, reason, auto=False)
         self.db.set_pos_hl(position_id, hl_status="closed")
+        try:
+            self._record_fill_pnl(position_id)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 关账后计算流水口径净利失败（忽略）：%s", e)
 
     def _last_fill_px(self, coin: str) -> Tuple[Optional[float], List[dict]]:
         """从交易所成交里取最近一笔该 coin 的**平仓**成交价（用于止损已触发的关账）。
@@ -1225,7 +1569,7 @@ class Executor:
             return alerts
 
         # 1) 对账
-        rec = self.reconcile(snap)
+        rec = self.reconcile(snap, kill_before=kill_before)
         if not rec["ok"]:
             problems = rec["problems"]
             self._event(EV_RECONCILE, "对账异常：" + "；".join(problems), data=rec)
@@ -1266,7 +1610,14 @@ class Executor:
                 self.db.set_config("hl_recon_alert_at", "0")
                 if not rec.get("unconfirmed"):
                     alerts.append("【HL执行】✅ 对账已恢复正常")
-            self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
+            # 数量对账处于「观察期」（首次超差、已回捞、未到两击）→ 不写「对账一致」：
+            # 明明有未解释的数量差，日志说一致会误导事后复盘。
+            if rec.get("size_warn"):
+                self.db.hl_log_event(EV_RECONCILE,
+                                     "数量对账观察中：" + "；".join(rec["size_warn"]),
+                                     code_rev=self.p.code_rev)
+            else:
+                self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
 
         # 2) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
         day0 = _today_start_ts()
