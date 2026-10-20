@@ -49,6 +49,12 @@ CREATE TABLE IF NOT EXISTS positions (
     exit_reason TEXT,                  -- stop | ma20 | manual
     auto_closed INTEGER DEFAULT 0,     -- 1 = 系统按参考价自动关（用户可覆盖真实成交价）；0 = 用户已确认
     r_multiple REAL,
+    -- PR-3：流水口径的净 PnL（Σclosed_pnl − 手续费），关账那一刻由执行器用
+    -- hl_fills 聚合写入。pnl_source 说明来源：fills（有成交）/ no_fills（查不到
+    -- 成交，net_pnl 为 NULL，绝不猜一个 0）。与 r_multiple（本地价差口径）并存，
+    -- 差异超阈值会记 hl_events 事件。
+    net_pnl REAL,
+    pnl_source TEXT,
     equity_at_entry REAL,
     created_at REAL NOT NULL,
     opened_at REAL,
@@ -185,6 +191,13 @@ class DB:
                           ("hl_entry_oid", "ALTER TABLE positions ADD COLUMN hl_entry_oid INTEGER"),
                           ("hl_stop_oid", "ALTER TABLE positions ADD COLUMN hl_stop_oid INTEGER"),
                           ("hl_sz", "ALTER TABLE positions ADD COLUMN hl_sz REAL")):
+            if name not in cols:
+                self.conn.execute(ddl)
+                logger.info("[db] 迁移：positions 新增 %s 列", name)
+        # 流水口径净 PnL（PR-3）：老库没有这两列。历史已关仓位的 net_pnl 保持 NULL
+        # ——「当时没算」是事实，回填一个用今天的代码算出来的数会掩盖当时的偏差。
+        for name, ddl in (("net_pnl", "ALTER TABLE positions ADD COLUMN net_pnl REAL"),
+                          ("pnl_source", "ALTER TABLE positions ADD COLUMN pnl_source TEXT")):
             if name not in cols:
                 self.conn.execute(ddl)
                 logger.info("[db] 迁移：positions 新增 %s 列", name)
@@ -548,6 +561,27 @@ class DB:
             "SELECT * FROM hl_fills WHERE created_at >= ? ORDER BY id", (since_ts,)))
 
     @_locked
+    def hl_fills_window(self, coin: str, lo: Optional[float] = None,
+                        hi: Optional[float] = None) -> List[sqlite3.Row]:
+        """按**成交时间 ts** 取某标的的成交（不是入库时间 created_at）。
+
+        为什么不能用 ``hl_fills_since``：它按 created_at 过滤 —— 首次同步会把几个月前
+        的历史成交一次写进来（created_at=今天、ts=三个月前），按入库时间取窗口等于
+        「把整段历史都算进当前这一仓」。聚合必须按 ts（见 app/hl/pnl.py）。
+        ts 为 NULL 的行无法定位归属，一律不返回（宁可少算，不串仓）。
+        """
+        sql = "SELECT * FROM hl_fills WHERE coin=? AND ts IS NOT NULL"
+        args: List[Any] = [str(coin)]
+        if lo is not None:
+            sql += " AND ts >= ?"
+            args.append(float(lo))
+        if hi is not None:
+            sql += " AND ts <= ?"
+            args.append(float(hi))
+        sql += " ORDER BY ts ASC, id ASC"
+        return list(self.conn.execute(sql, args))
+
+    @_locked
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "") -> None:
         self.conn.execute(
@@ -631,6 +665,15 @@ class DB:
             return
         vals.append(pid)
         self.conn.execute(f"UPDATE positions SET {', '.join(sets)} WHERE id=?", vals)
+        self.conn.commit()
+
+    @_locked
+    def set_pos_pnl(self, pid: int, net_pnl: Optional[float], source: str) -> None:
+        """写流水口径净额（PR-3）。`net_pnl=None` 是合法值（查不到成交），
+        但那时 `source` 必须写明原因（no_fills），读侧据此区分「0 收益」与「不知道」。"""
+        self.conn.execute(
+            "UPDATE positions SET net_pnl=?, pnl_source=? WHERE id=?",
+            (None if net_pnl is None else float(net_pnl), str(source or ""), int(pid)))
         self.conn.commit()
 
     # ---------------- kill switch（存 configuration 表，DB 优先）

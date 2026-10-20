@@ -60,6 +60,11 @@ class Config:
     # 失去下单能力，仓位想平也平不了；这个开关存在的意义是让用户能主动关掉。
     # 语义与推送开关一致：识别不了一律按「开」（见 app.hl.agent.cleanup_enabled）。
     agent_expiry_cleanup: bool = _env("AGENT_EXPIRY_CLEANUP", "1").lower() in ("1", "true", "yes", "on")
+    # 净 PnL 口径（PR-3）：关 = 面板/记录表仍用交易所 closedPnl 口径（本地价差），
+    # 开 = 逐仓净额改读 net_pnl（由 hl_fills 聚合的流水口径）。**默认关**，理由见
+    # app/hl/executor.py:ExecParams.pnl_from_fills（先观测差异、再切换读数）。
+    # net_pnl 列两态都写，开关只影响「读哪个数」，不丢数据、可回滚。
+    hl_pnl_from_fills: bool = _env("HL_PNL_FROM_FILLS", "0").lower() in ("1", "true", "yes", "on")
     # extraAgents 查不到有效期时的手工兜底（毫秒时间戳字符串；空=没有）
     hl_agent_valid_until_ms: str = _env("HL_AGENT_VALID_UNTIL_MS", "")
 
@@ -92,7 +97,7 @@ class Config:
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
-                   "hl_agent_valid_until_ms")
+                   "hl_agent_valid_until_ms", "hl_pnl_from_fills")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
