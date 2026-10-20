@@ -325,5 +325,42 @@ class TestRunLogging(Base):
         self.assertFalse(any(e["message"] == "对账一致" for e in recent))
 
 
+class TestEntrySizeCheck(Base):
+    """开仓确认点的数量核对（_check_entry_size）：差异只记事件、不阻断下单结果。"""
+
+    def _open(self, fills=()):
+        self.info._fills = list(fills)
+        pid = self.db.create_position(
+            symbol="BTC_USDT", signal_bar_ms=BAR, side=1, entry_price=83000.0,
+            stop_price=80600.0, stop_dist=0.029, contracts=1, coin_qty=0.001,
+            notional=83.0, risk_u=20.0, equity_at_entry=1000.0)
+        self.assertTrue(self.executor().on_entry(pid))
+        return pid
+
+    def _fill(self, sz, dir_="Open Long", px=83000.0):
+        return ex_fill("e1", dir_=dir_, sz=sz, px=px)
+
+    def test_matching_flow_is_quiet(self):
+        pid = self._open([self._fill("0.00833")])          # 与计划量同（假交易所全成）
+        row = self.db.position_by_id(pid)
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "open")
+        evs = [e for e in self.events() if "开仓数量与流水不一致" in e["message"]]
+        # 假交易所的成交回报 sz = plan.sz（_pos 未参与），这里只要有成交且一致就不报
+        self.assertEqual(evs, [], f"正常成交不该报警：{evs}")
+
+    def test_partial_fill_records_event(self):
+        """成交流水只有回报量的一半 → 立刻记一条，且**不影响**开仓结果。"""
+        pid = self._open([self._fill("0.004")])
+        row = self.db.position_by_id(pid)
+        self.assertEqual(row["hl_status"], "open")         # 开仓照常完成（不改下单逻辑）
+        evs = [e for e in self.events() if "开仓数量与流水不一致" in e["message"]]
+        self.assertEqual(len(evs), 1, evs)
+        self.assertIn("止损按", evs[0]["message"])
+
+    def test_no_fill_yet_is_silent(self):
+        self._open([])
+        self.assertEqual([e for e in self.events() if "开仓数量与流水不一致" in e["message"]], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

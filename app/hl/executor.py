@@ -964,7 +964,51 @@ class Executor:
             leverage=float(self.p.leverage or 5.0)))
         self._event(EV_ORDER, f"{symbol} 开仓完成：{filled_sz} @ {avg_px:,.2f}，止损单已挂",
                     symbol=symbol, data={"risk_u": plan2.risk_u, "notional": plan2.notional})
+        # 5) 开仓确认时的数量核对（PR-3）：下单前算的 sz 与真实成交可能差一个 tick
+        #    （IOC 部分成交时差得更多），而对账要等下一轮才跑。这里同步一次成交、比对
+        #    一次，差异只记事件不动作 —— 下一轮 reconcile 的两击规则才是真正兜底的手。
+        try:
+            self._check_entry_size(position_id, coin, filled_sz, avg_px)
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 开仓后数量核对失败（忽略，下一轮对账兜底）：%s", e)
         return True
+
+    def _check_entry_size(self, position_id: int, coin: str, filled_sz: float,
+                          avg_px: float) -> None:
+        """开仓成交确认后比一次「本地记账量 vs 交易所成交流水量」。
+
+        为什么在开仓点就要比：止损单是按下单计划量挂的，若真实成交只成了一半，
+        那一刻就已经是「止损覆盖量 > 持仓量」（平不掉的部分裸奔）。这里不修（修要
+        改下单/止损逻辑，PR-3 明确不动），只把差异**立刻**记成事件，让它在下一次
+        5 分钟对账之前就可见；两击规则的正式判定留给 reconcile。
+        """
+        if filled_sz <= 0 or not self.p.account_address:
+            return
+        row = self.db.position_by_id(position_id)
+        if row is None:
+            return
+        tick = self._size_tick(coin)
+        if tick is None:
+            return
+        try:
+            self._sync_fills()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 开仓后同步成交失败（数量核对跳过）：%s", e)
+            return
+        agg = self._size_agg(dict(row), coin)
+        if agg is None:
+            return                                    # 成交还没进库：交给下一轮对账
+        flow = hl_pnl.net_size(agg)
+        if abs(flow - float(filled_sz)) <= tick:
+            return
+        self._event(EV_RECONCILE,
+                    f"{row['symbol']} 开仓数量与流水不一致：成交回报 {float(filled_sz):g} vs "
+                    f"流水净量 {flow:g}（差 {abs(flow - float(filled_sz)):g}，tick {tick:g}）"
+                    f"—— 止损按 {float(filled_sz):g} 挂的，请核对；下一轮对账会继续跟进",
+                    symbol=str(row["symbol"]),
+                    data={"pid": int(position_id), "coin": coin, "filled_sz": float(filled_sz),
+                          "flow_sz": flow, "entry_vwap": agg["entry_vwap"],
+                          "reported_entry": float(avg_px), "tick": tick})
 
     def _entry_failed(self, symbol: str, bar_ms: int, msg: str) -> bool:
         # 文案用 HL 合约名（解析不出就退回 symbol，仅影响文案，不影响落库/状态）
