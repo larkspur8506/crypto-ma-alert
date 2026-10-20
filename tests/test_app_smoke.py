@@ -39,7 +39,7 @@ class TestAppAssembly(unittest.TestCase):
         for p in ("/health", "/admin", "/admin/rules", "/admin/logs", "/c/{pid}"):
             self.assertIn(p, paths, f"路由 {p} 未注册")
         # HL 监控面板（feat/hl-executor）也要在
-        for p in ("/hl", "/api/hl/status"):
+        for p in ("/hl", "/api/hl/status", "/api/hl/why"):
             self.assertIn(p, paths, f"HL 路由 {p} 未注册")
         # 到期保护：清空手工兜底的显式入口
         self.assertIn("/admin/hl/agent/fallback/clear", paths)

@@ -163,6 +163,9 @@ class AdminDeps:
     # renew_fn(新私钥) -> (ok, 人话文案)；校验/写库/推送都在 app.hl.agent.renew_key 里
     renew_fn: Optional[Callable[[str], Any]] = None
     cleanup_enabled_fn: Optional[Callable[[], bool]] = None
+    # 「为什么没开仓」（PR-5 /why）：可注入的行数据源，便于测试固定输出（不触网）。
+    # 缺省时总览会走 app.why.build_rows（现取 4h K 线、只读）。
+    why_rows_fn: Optional[Callable[[], Any]] = None
 
     def __post_init__(self) -> None:
         if self.set_config is None:
@@ -1058,7 +1061,14 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
 
     「更新 API（续期）」表单**不在这里** —— 它是写操作入口，留在「参数」页
     （:func:`render_agent_renew_block`）。2026-10-19 只搬走表单，状态卡回原位。
+
+    「为什么没开仓」（/why）由 views._render_body 自己渲染，数据源是这里现算并注入
+    payload["why"] —— 见 PR-5：面板不重算判定，只喂数据；`why_rows_fn` 可注入
+    （测试用固定行，绝不触网）。
     """
+    if "why" not in payload:
+        payload = dict(payload)
+        payload["why"] = _why_rows_for(deps)
     body = _render_body(payload)
     body = re.sub(r"<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)
     body = re.sub(r"<div class='bar'>.*?</div>\s*", "", body, count=1, flags=re.S)
@@ -1067,6 +1077,27 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[admin] API 有效期卡片渲染失败：%s", e)
     return body
+
+
+def _why_rows_for(deps: AdminDeps) -> List[Dict[str, Any]]:
+    """总览的 /why 行：优先用注入的函数，否则走 app.why.build_rows（只读）。
+
+    单独一层的原因：运维只想看面板时不该因为「取行情失败」看到 500 —— 任何异常都
+    退回空列表（区块整体不渲染），与三标的动态的 fail-soft 同口径。
+    """
+    fn = getattr(deps, "why_rows_fn", None)
+    if callable(fn):
+        try:
+            return list(fn() or [])
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[admin] 注入的 /why 数据源失败（区块略去）：%s", e)
+            return []
+    try:
+        from app.hl.views import _why_rows
+        return _why_rows(deps.hl_deps)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] /why 诊断失败（区块略去）：%s", e)
+        return []
 
 
 # ---------------------------------------------------------------- API 有效期卡片

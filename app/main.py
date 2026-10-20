@@ -549,9 +549,21 @@ def _admin_deps():
         agent_state_fn=lambda: _agent_state(),
         renew_fn=lambda key: _renew_agent_key(key),
         cleanup_enabled_fn=lambda: _cleanup_on(),
+        # /why 诊断（只读）：面板每次刷新现取 4h K 线算六步 + 读闸门类状态
+        why_rows_fn=lambda: _why_rows(),
         # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
         price_fallback=0.0,
     )
+
+
+def _why_rows() -> list:
+    """面板「为什么没开仓」的数据源（只读；异常一律退回空列表，别弄挂总览）。"""
+    try:
+        from app import why as why_mod
+        return why_mod.build_rows(db, current_config())
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning("/why 诊断失败（面板区块略去）：%s", e)
+        return []
 
 
 def _agent_state() -> dict:

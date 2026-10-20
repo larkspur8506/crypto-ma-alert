@@ -18,6 +18,7 @@ import math
 import time
 import threading
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 
 from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, PURPOSE_EXIT_REHANG,
@@ -758,6 +759,64 @@ class Executor:
     def _churn_tripped(self, coin: str, side: Any) -> bool:
         limit = self._churn_limit()
         return limit > 0 and self._churn_count(coin, side) >= limit
+
+    # ------------------------------------------------------------ 只读闸门状态（/why）
+    def gate_state(self, coin: str, side: Any = 1) -> Dict[str, Any]:
+        """该 coin-side 的闸门状态快照（`/why` 诊断用，**纯只读**）。
+
+        只回答「现在被哪道闸挡着」，绝不做任何动作、不记事件、不告警、不置 kill：
+        诊断接口会在面板每次刷新时被调用，任何副作用（哪怕只是记一条事件）都会被
+        调成新的噪音源。
+
+        实现上**复用 `_settle_remaining` / `_churn_count`**（不是重算一遍时间差），
+        原因：这两个函数各自带锁、带「过期即清」的回收逻辑，且与 `_gate_check` 读的是
+        同一份类属性状态 —— 另写一份读法就会出现「诊断说还剩 3s、闸门其实已放行」这种
+        最误导人的情形。二者的共同点是都只**收紧垃圾**（清过期键），不续期、不加数：
+
+        - `_settle_remaining` 过期即 pop（注释已写明「只读，绝不续期」）；
+        - `_churn_count` 只把滑出窗口的旧记录丢掉（窗口语义本来就该这样）。
+        """
+        left = float(self._settle_remaining(coin, side) or 0.0)
+        n = int(self._churn_count(coin, side) or 0)
+        limit = int(self._churn_limit())
+        # 熔断阈值 <=0 = 熔断关闭（只留静置闸门），此时 tripped 恒 False 且文案要说清
+        tripped = bool(limit > 0 and n >= limit)
+        if tripped:
+            verdict = GATE_CHURN
+        elif left > 0:
+            verdict = GATE_SETTLE
+        else:
+            verdict = GATE_OK
+        return {
+            "coin": str(coin),
+            "side": int(side if side is not None else 1),
+            "settle_remaining_s": round(left, 1),
+            "churn_count": n,
+            "churn_limit": limit,
+            "churn_tripped": tripped,
+            "verdict": verdict,
+            "settle_window_s": SETTLE_WINDOW_S,
+            "churn_window_s": CHURN_WINDOW_S,
+        }
+
+    @classmethod
+    def gate_state_for(cls, db, coin: str, side: Any = 1,
+                       churn_max: Optional[int] = None) -> Dict[str, Any]:
+        """**不建实例**读闸门状态（面板/诊断用）。
+
+        build_executor() 每轮 tick 新建实例、且装配失败会返回 None（mode=off），可面板
+        只想知道「现在有没有闸」—— 它不该因为没装配执行器就拿不到答案。闸门状态全部是
+        类属性，所以这里造一个只带 `_gate_scope` 与 `p.churn_max` 的轻量载体，
+        真正读值的仍是 `gate_state` → `_settle_remaining`/`_churn_count`
+        （同一份实现、同一把锁，没有第二条读法）。
+
+        `_gate_scope` 必须与生产执行器一致（= db.path），否则同一个库里两套键互不相干。
+        """
+        probe = cls.__new__(cls)
+        probe._gate_scope = str(getattr(db, "path", "") or "")
+        probe.p = SimpleNamespace(churn_max=(CHURN_MAX_DEFAULT if churn_max is None
+                                            else int(churn_max)))
+        return probe.gate_state(coin, side)
 
     def _gate_check(self, action: str, coin: str, side: Any,
                     symbol: Optional[str] = None) -> Tuple[str, str]:
