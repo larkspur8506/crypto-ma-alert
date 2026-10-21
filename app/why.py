@@ -155,12 +155,30 @@ def why_row(db: Any, cfg: Any, symbol: str, bars: Sequence[strategy.Bar]) -> Dic
     sma_seq = ind.get("sma20") or []
     if 0 <= i < len(sma_seq) and sma_seq[i] is not None:
         sma20 = float(sma_seq[i])
+    # 当下 bar（ind[i]）的带宽与门槛：面板原因行要按「现在」说人话——strategy 的
+    # values 只带判定口径（i-1）的 band_prev/band_thr，其模板「未压到门槛以内」
+    # 在「已压进但根数不够」时会变成假话（2026-10-21 用户实测：带宽 1.62% <
+    # 门槛 1.73% 却显示「未压到」）。加在装配层，**不碰 strategy.py 的 values**
+    # （口径区禁改），**不参与任何判定**。
+    band_cur: Optional[float] = None
+    thr_cur: Optional[float] = None
+    band_seq = ind.get("band") or []
+    if 0 <= i < len(band_seq) and band_seq[i] is not None:
+        band_cur = float(band_seq[i])
+        lo = i - cfg.band_window
+        if lo >= 0:
+            hist = [float(v) for v in band_seq[lo:i] if v is not None]
+            if len(hist) >= cfg.band_window:
+                thr_cur = strategy.quantile(hist, cfg.band_quantile)
     row: Dict[str, Any] = {
         "symbol": symbol,
         "coin": _coin_of(symbol) or symbol,
         "price": float(bars[-1].close) if bars else None,
         "bars": len(bars),
         "sma20": sma20,
+        "band_cur": band_cur,
+        "thr_cur": thr_cur,
+        "min_squeeze_bars": int(cfg.min_squeeze_bars),
         "why": why,
         "position": pos,
         "note": note,

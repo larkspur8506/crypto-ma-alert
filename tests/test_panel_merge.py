@@ -56,8 +56,10 @@ def _st(symbol="BTC_USDT", coin="BTC", **kw):
 
 
 def _why(symbol="BTC_USDT", coin="BTC", **kw):
-    """why 行（app.why.build_rows 的形状，面板主源）。"""
+    """why 行（app.why.build_rows 的形状，面板主源）。band_cur/thr_cur 是装配层
+    2026-10-21 新增的「当下 bar 带宽/门槛」，原因行按真拦截点组句用。"""
     base = {"symbol": symbol, "coin": coin, "price": 81_516.0, "sma20": 79_500.0,
+            "band_cur": 0.0162, "thr_cur": 0.0173, "min_squeeze_bars": 6,
             "why": {"fired": False, "side": 0, "blocked_by": "squeeze", "drift": False,
                     "reason": "均线不密集：带宽 1.02% 未压到门槛 0.80% 以内，或连续不足 6 根（现 2 根）",
                     "values": {"ma_max_prev": 81_990.0, "ma_min_prev": 79_010.0,
@@ -145,8 +147,9 @@ class TestDenseCountConsistency(PanelMergeBase):
     「（现 N 根）」改写成卡片自己的 dense_cnt，否则同一张卡上下两个数打架。
     """
 
-    def test_reason_line_uses_card_dense_count(self):
-        row = _why()
+    def test_fallback_count_replacement_when_band_cur_missing(self):
+        # 旧缓存/降级路径没有 band_cur → 回落 strategy 原文 + 根数替换（PR#42 行为）
+        row = _why(band_cur=None, thr_cur=None)
         row["why"]["reason"] = ("均线不密集：带宽 1.73% 未压到门槛 1.73% 以内，"
                                 "或连续不足 6 根（现 1 根）")
         html = self.render({"symbol_state": [_st(dense_cnt=2)], "why": [row]})
@@ -156,13 +159,47 @@ class TestDenseCountConsistency(PanelMergeBase):
         self.assertNotIn("（现 1 根）", card)
 
     def test_missing_dense_keeps_strategy_text(self):
-        # 没有 symbol_state（降级路径）时 dense_cnt 缺失 → 不硬改 strategy 原文
-        row = _why()
+        # dense_cnt 缺失 → 不硬改 strategy 原文
+        row = _why(band_cur=None, thr_cur=None)
         row["why"]["reason"] = "均线不密集：带宽 1.73% 未压到门槛 1.73% 以内，或连续不足 6 根（现 1 根）"
         row["why"]["values"]["dense_cnt"] = None
         html = self.render({"why": [row]})
         card = _card(html, "BTC")
         self.assertIn("（现 1 根）", card)
+
+
+# ================================================================ 2c. 按真拦截点组句
+class TestSqueezeReasonAccuracy(PanelMergeBase):
+    """strategy 的密集拦截模板把「带宽没压进」与「根数不够」用「或」并列，
+    已压进门槛时「未压到门槛以内」半句是假话（2026-10-21 用户实测：带宽 1.62% <
+    门槛 1.73% 却显示「未压到」）。渲染层按当下 bar 的真拦截点组句。"""
+
+    def test_compressed_band_reports_run_blocker(self):
+        # 带宽已压进门槛（1.62% ≤ 1.73%）→ 拦截点只剩根数，不许再说「未压到」
+        html = self.render({"symbol_state": [_st(dense_cnt=3)], "why": [_why()]})
+        card = _card(html, "BTC")
+        self.assertIn("密集酝酿 3/6", card)
+        self.assertIn("带宽 1.62% 已压到门槛 1.73% 以内", card)
+        self.assertIn("连续密集 3 根、满 6 根才具备开仓条件", card)
+        self.assertNotIn("未压到门槛", card)
+
+    def test_uncompressed_band_reports_band_blocker(self):
+        row = _why(band_cur=0.0180, thr_cur=0.0173)
+        html = self.render({"symbol_state": [_st(dense_cnt=0)], "why": [row]})
+        card = _card(html, "BTC")
+        self.assertIn("带宽 1.80% 未压到门槛 1.73% 以内", card)
+        self.assertIn("连续密集 0 根", card)
+
+    def test_custom_min_squeeze_bars_in_sentence(self):
+        row = _why(min_squeeze_bars=8)
+        html = self.render({"symbol_state": [_st(dense_cnt=3)], "why": [row]})
+        self.assertIn("满 8 根才具备开仓条件", _card(html, "BTC"))
+
+    def test_drift_marker_on_new_sentence(self):
+        row = _why()
+        row["why"]["drift"] = True
+        html = self.render({"symbol_state": [_st(dense_cnt=3)], "why": [row]})
+        self.assertIn("⚠️口径漂移", _card(html, "BTC"))
 
 
 # ================================================================ 3. 闸门正常不渲染
