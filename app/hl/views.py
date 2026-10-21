@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import os
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
@@ -1005,12 +1006,19 @@ def _reason_line(r: Dict[str, Any]) -> str:
             pct = f"（{sd * 100:.2f}%）" if sd is not None else ""
             return _whyline(f"信号成立：入场 {_fmt(ep)}、止损 {_fmt(sp)}{pct}", "pos")
         return _whyline(str(why.get("reason") or "信号成立"), "pos")
-    # reason 由 strategy.explain_entry 给（带带宽/门槛数字的人话），面板只做两件展示层的事：
+    # reason 由 strategy.explain_entry 给（带带宽/门槛数字的人话），面板只做三件展示层的事：
     # ① 词面统一：strategy 的文案是「均线不密集」，而本卡状态词与图例统一用「均线未密集」——
     #    同一张卡上下两种说法等于又回到合并前「两套状态词」的老毛病。只替换展示文本，
     #    不动 strategy 的文案与判定（信号口径禁止改），/api/hl/why 仍返回 strategy 原文。
-    # ② 漂移标记：六步推导与 evaluate_entry 不一致时如实标出来。
+    # ② 密集根数口径统一：strategy 报的是「本轮判定所用那根」（squeeze[i-1]）的连续根数，
+    #    而状态词与距离行取的是最后一根已收盘 bar（ind[i]）——两者**恒差一根**，同一张卡
+    #    上下两个数打架（用户实测：状态词 2/6、原因行「现 1 根」）。同样只改展示文本，
+    #    把「（现 N 根）」换成卡片自己的 dense_cnt；/api/hl/why 仍是 strategy 原文。
+    # ③ 漂移标记：六步推导与 evaluate_entry 不一致时如实标出来。
     txt = str(why.get("reason") or "—").replace("均线不密集", "均线未密集")
+    dense = _opt_int(r.get("dense_cnt"))
+    if dense is not None:
+        txt = re.sub(r"（现 \d+ 根）", f"（现 {dense} 根）", txt)
     if why.get("drift"):
         txt += " ⚠️口径漂移"
     return _whyline(txt, "muted")

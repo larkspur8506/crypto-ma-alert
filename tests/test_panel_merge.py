@@ -136,6 +136,35 @@ class TestSinglePrice(PanelMergeBase):
         self.assertEqual(html.count("81,516.00"), 1)
 
 
+# ================================================================ 2b. 密集根数同口径
+class TestDenseCountConsistency(PanelMergeBase):
+    """状态词与原因行的密集根数必须同口径。
+
+    strategy 的 reason 报的是「本轮判定所用那根」（squeeze[i-1]）的连续根数，而卡片
+    状态词/距离行取最后一根已收盘 bar（ind[i]）——两者恒差一根。展示层要把原因行里的
+    「（现 N 根）」改写成卡片自己的 dense_cnt，否则同一张卡上下两个数打架。
+    """
+
+    def test_reason_line_uses_card_dense_count(self):
+        row = _why()
+        row["why"]["reason"] = ("均线不密集：带宽 1.73% 未压到门槛 1.73% 以内，"
+                                "或连续不足 6 根（现 1 根）")
+        html = self.render({"symbol_state": [_st(dense_cnt=2)], "why": [row]})
+        card = _card(html, "BTC")
+        self.assertIn("密集酝酿 2/6", card)
+        self.assertIn("（现 2 根）", card)
+        self.assertNotIn("（现 1 根）", card)
+
+    def test_missing_dense_keeps_strategy_text(self):
+        # 没有 symbol_state（降级路径）时 dense_cnt 缺失 → 不硬改 strategy 原文
+        row = _why()
+        row["why"]["reason"] = "均线不密集：带宽 1.73% 未压到门槛 1.73% 以内，或连续不足 6 根（现 1 根）"
+        row["why"]["values"]["dense_cnt"] = None
+        html = self.render({"why": [row]})
+        card = _card(html, "BTC")
+        self.assertIn("（现 1 根）", card)
+
+
 # ================================================================ 3. 闸门正常不渲染
 class TestGateSilentWhenOk(PanelMergeBase):
     def test_ok_gate_produces_no_dom(self):
