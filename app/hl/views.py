@@ -1014,7 +1014,26 @@ def _reason_line(r: Dict[str, Any]) -> str:
     #    而状态词与距离行取的是最后一根已收盘 bar（ind[i]）——两者**恒差一根**，同一张卡
     #    上下两个数打架（用户实测：状态词 2/6、原因行「现 1 根」）。同样只改展示文本，
     #    把「（现 N 根）」换成卡片自己的 dense_cnt；/api/hl/why 仍是 strategy 原文。
-    # ③ 漂移标记：六步推导与 evaluate_entry 不一致时如实标出来。
+    # ③ 按真拦截点组句：strategy 的密集拦截模板把「带宽没压进」与「根数不够」用「或」
+    #    并列、从不区分——已压进门槛时「未压到门槛以内」半句是假话（2026-10-21 用户实测：
+    #    带宽 1.62% < 门槛 1.73% 却显示「未压到」）。装配层（app/why.py）给了**当下 bar**
+    #    的带宽/门槛（band_cur/thr_cur），拦截点是密集时按真话组句；字段缺失（旧缓存/
+    #    降级路径）回落 strategy 原文 + ①②的替换。
+    if str(why.get("blocked_by") or "") == "squeeze":
+        band_cur, thr_cur = _opt_num(r.get("band_cur")), _opt_num(r.get("thr_cur"))
+        dense = _opt_int(r.get("dense_cnt"))
+        need = _opt_int(r.get("min_squeeze_bars")) or _SQUEEZE_CAP
+        if band_cur is not None and thr_cur is not None and dense is not None:
+            if band_cur <= thr_cur:
+                txt = (f"均线未密集：带宽 {band_cur * 100:.2f}% 已压到门槛 "
+                       f"{thr_cur * 100:.2f}% 以内，连续密集 {dense} 根、"
+                       f"满 {need} 根才具备开仓条件")
+            else:
+                txt = (f"均线未密集：带宽 {band_cur * 100:.2f}% 未压到门槛 "
+                       f"{thr_cur * 100:.2f}% 以内（连续密集 {dense} 根）")
+            if why.get("drift"):
+                txt += " ⚠️口径漂移"
+            return _whyline(txt, "muted")
     txt = str(why.get("reason") or "—").replace("均线不密集", "均线未密集")
     dense = _opt_int(r.get("dense_cnt"))
     if dense is not None:
@@ -1103,6 +1122,9 @@ def _merge_one(w: Dict[str, Any], st: Dict[str, Any]) -> Dict[str, Any]:
         "price": price, "sma20": sma20, "sma200": ma200,
         "long_trigger": long_trig, "short_trigger": short_trig,
         "dense_cnt": dense,
+        "band_cur": _opt_num(w.get("band_cur")),
+        "thr_cur": _opt_num(w.get("thr_cur")),
+        "min_squeeze_bars": _opt_int(w.get("min_squeeze_bars")),
         "position": _as_dict(w.get("position")),
         "position_side": st.get("position_side"),
         "why": why, "error": err or None,
