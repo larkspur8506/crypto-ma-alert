@@ -349,8 +349,17 @@ class HlInfo:
                 logger.warning("[hl-info] 现货状态读取失败（统一账户余额将显示为 0）：%s", e)
         perp_equity = self._num(ms.get("accountValue"))
         upnl = sum(p["unrealized_pnl"] for p in positions)
-        # 统一账户：账户总值 = 抵押品（现货 USDC）+ 未实现盈亏；标准账户：永续 accountValue 已含盈亏
-        equity_total = (spot_usdc + upnl) if self.unified else perp_equity
+        # 统一账户：**现货 USDC 已经包含持仓的浮动盈亏**，不能再加一次 upnl。
+        # 2026-10-22 用交易所 `portfolio` 接口对账确认（两次独立样本）：
+        #   06:55 我方 spot 988.11 + upnl(−12.86) = 975.25，交易所同期 accountValue ≈ 988.5；
+        #   12:20 我方 spot 986.48 + upnl(−0.50) = 985.98，交易所 accountValue = 986.28。
+        # 也就是说 accountValue ≈ spot_usdc，旧式 `spot + upnl` 会把浮亏算两遍 —— 权益、
+        # 最大回撤、当日亏损熔断、定仓基数（equity_mode=follow）全部跟着偏。
+        # 标准账户（非 unified）的 accountValue 本身就含盈亏，保持原样。
+        equity_total = spot_usdc if self.unified else perp_equity
+        if self.unified and positions:
+            logger.debug("[hl-info] 统一账户权益口径：spot=%.4f upnl=%.4f（upnl 已含在 spot 里）",
+                         spot_usdc, upnl)
         return {
             "ts": time.time(),
             "address": address,
