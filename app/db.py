@@ -234,6 +234,11 @@ class DB:
         if fcols and "fee_quote" not in fcols:
             self.conn.execute("ALTER TABLE hl_fills ADD COLUMN fee_quote REAL")
             logger.info("[db] 迁移：hl_fills 新增 fee_quote 列")
+        # 统一账户权益口径修正的幂等标记（见 app/hl/equity_fix.py）：只在一次性迁移里写 1。
+        scols = {r["name"] for r in self.conn.execute("PRAGMA table_info(hl_snapshots)")}
+        if scols and "equity_fixed" not in scols:
+            self.conn.execute("ALTER TABLE hl_snapshots ADD COLUMN equity_fixed INTEGER NOT NULL DEFAULT 0")
+            logger.info("[db] 迁移：hl_snapshots 新增 equity_fixed 列")
         # 成交所属订单号（2026-10-22 事故修复）：老库补列，历史行保持 NULL ——
         # 「当时没记」是事实，回填一个猜出来的 oid 会让对账把平仓归错单。
         if fcols and "oid" not in fcols:

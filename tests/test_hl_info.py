@@ -203,7 +203,13 @@ class TestUnifiedAccount(unittest.TestCase):
         self.assertTrue(snap["unified"])
         self.assertEqual([b["coin"] for b in snap["spot_balances"]], ["USDC", "HYPE"])
 
-    def test_unified_total_adds_unrealized_pnl(self):
+    def test_unified_total_does_not_double_count_unrealized_pnl(self):
+        """统一账户：现货 USDC 已含浮动盈亏，不能再加一次 upnl（2026-10-22 实测口径）。
+
+        对账依据（交易所 portfolio.accountValueHistory）：
+          06:55 我方 spot 988.11 + upnl(−12.86) = 975.25，交易所 ≈988.5；
+          12:20 我方 spot 986.48 + upnl(−0.50) = 985.98，交易所 986.28。
+        """
         state = dict(self.STATE)
         state["assetPositions"] = [{"position": {"coin": "BTC", "szi": "0.01", "entryPx": "83000",
                                                 "positionValue": "830", "liquidationPx": "70000",
@@ -213,8 +219,11 @@ class TestUnifiedAccount(unittest.TestCase):
         f = _FakeOpener([state, [], {"balances": [{"coin": "USDC", "total": "100.79", "hold": "83.0"}]}])
         info = HlInfo(base_url="https://api.test", opener=f, unified=True)
         snap = info.snapshot("0xabc", mids={"BTC": 82500.0})
-        self.assertAlmostEqual(snap["equity_total"], 100.79 - 7.5, places=6)
+        self.assertAlmostEqual(snap["equity_total"], 100.79, places=6,
+                               msg="浮亏已含在现货里，总权益就是现货 USDC")
         self.assertAlmostEqual(snap["spot_balances"][0]["hold"], 83.0)   # 占用照实显示
+        # 浮亏仍要能从持仓明细里读到（风控/展示需要），只是不重复计入权益
+        self.assertAlmostEqual(snap["positions"][0]["unrealized_pnl"], -7.5)
 
     def test_standard_mode_keeps_perp_equity_and_skips_spot_call(self):
         state = dict(self.STATE)
