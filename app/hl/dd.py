@@ -42,9 +42,17 @@ NEG_REPLAY_STREAK = 3
 # hl_snapshots 只留 30 天，TWR 锚点会被清掉；若每轮从快照重算，回撤会「忘记」
 # 历史峰值、从 100 重新起算 → 回撤被系统性低估。
 STATE_KEY = "hl_dd_state"          # {"anchor_ts", anchor_eq, anchor_cumflow, index, peak_index, last_ts, last_eq, twr_skipped, updated_at}
+# ⚠️ `anchor_cumflow`（锚点建立时的累计净入金）**只写不读**：留痕用（规格 §4.2 要求把
+# 锚点的上下文一起存下来，事后能复算「这个锚点是在多少累计入金下建的」），判据**不依赖
+# 它** —— 指数链用的是每格的 flow_k（见模块 docstring 的 r_k 公式），从不读这个字段。
+# 所以：不要因为它没有读方就删掉（历史 state 里还有它，删了 parse 也没坏处但会丢留痕）。
 ALERT_KEY = "hl_dd_alert_at"       # L2 告警节流（推送成功才写）
 KILL_KEY = "hl_dd_kill_at"         # L3「仍在熔断中」重复提醒节流（推送成功才写）
 UNAVAIL_KEY = "hl_dd_unavail_at"   # 「口径暂不可用/等待流水同步」节流（规格要求每 24h 一次）
+# 【低6·v3】事件侧的节流键：与 UNAVAIL_KEY **分开**。UNAVAIL_KEY 只在推送成功后才写
+# （推送失败要下轮重推），事件若也挂它，推送一失败就每轮多一条 dd 事件（288 条/天）。
+# 这个键在「尝试写事件」时就写，与推送成败无关。
+UNAVAIL_EV_KEY = "hl_dd_unavail_ev_at"
 STUCK_KEY = "hl_dd_stuck_at"       # 【v2·低2】「口径卡死，请人工核对」节流（24h 一次）
 WAIT_KEY = "hl_dd_wait_note"       # 【v2·高1】上一次「本轮没判」的原因（面板展示用；空 = 正常）
 
@@ -373,6 +381,7 @@ def make_state(*, anchor_ts: float, anchor_eq: float, anchor_cumflow: float,
     last_eq = float(anchor_eq) if last_eq is None else float(last_eq)
     return {
         "anchor_ts": float(anchor_ts), "anchor_eq": float(anchor_eq),
+        # 【低7】只写不读：留痕用，判据不依赖它（见 STATE_KEY 处的注释）。
         "anchor_cumflow": float(anchor_cumflow),
         "index": idx,
         "peak_index": max(peak, idx),

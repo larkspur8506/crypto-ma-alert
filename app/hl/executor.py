@@ -2843,10 +2843,23 @@ class Executor:
         时它也不判（旧口径会把提现当亏损误杀）。这里必须说清「两条线本轮都没判」，
         否则用户会以为还有一条兜底在看着。
         """
+        # 【低6·v3】事件与告警各有一个 24h 窗口，**挂在不同的键上**：
+        #   - 告警：键只在**推送成功**后回写（_run_locked 末尾的 tuple 机制）→ 推送失败
+        #     下轮重推，用户最终一定看得到；
+        #   - 事件：键在**尝试**时就写（与推送成败无关）→ 否则推送一失败（电报挂了/网络
+        #     抖动），告警键永远是 0，下一轮 _dd_due 又放行，hl_events 里每轮多一条一模
+        #     一样的 dd 事件，一天 288 条把记录页刷满，真正要看的告警被淹没。
+        #     v2 只是把事件和告警塞进**同一个**窗口，所以「推送失败」这条路径上事件仍然
+        #     每轮重复（tests/test_dd_guard_remaining.py 里有回归用例钉住）。
+        if self._dd_due(hl_dd.UNAVAIL_EV_KEY, hl_dd.UNAVAIL_THROTTLE_S, now):
+            try:
+                self.db.set_config(hl_dd.UNAVAIL_EV_KEY, str(int(float(now))))
+            except Exception as ex:                               # noqa: BLE001
+                logger.warning("[hl-exec] dd 事件节流键写入失败（忽略）：%s", ex)
+            self._event(EV_DD, f"回撤口径暂不可用（{reason}），本轮未做回撤/当日亏损判断",
+                        data={"reason": reason, "ts": now})
         if not self._dd_due(hl_dd.UNAVAIL_KEY, hl_dd.UNAVAIL_THROTTLE_S, now):
             return
-        self._event(EV_DD, f"回撤口径暂不可用（{reason}），本轮未做回撤/当日亏损判断",
-                    data={"reason": reason, "ts": now})
         alerts.append((hl_dd.UNAVAIL_KEY,
                        f"【HL执行】ℹ️ 回撤口径暂不可用（{reason}），本轮未做回撤判断；"
                        f"当日亏损熔断同样未判（它也要本轮流水才算得准）。"
@@ -3565,7 +3578,19 @@ class Executor:
         # 4) 死手开关（HL 原生 scheduleCancel）：**默认关闭**，见 ExecParams.use_schedule_cancel。
         #    关闭时这一步完全不碰交易所；即使在开启状态下调用失败/抛异常，也绝不外泄 ——
         #    后面的心跳、看守判活等主流程一步都不能被它拖累。
-        if self.p.live and not self.db.hl_kill() and getattr(self.p, "use_schedule_cancel", False):
+        #
+        #    【高3 附加路径】kill 态**也要续期**（旧代码在这里写了 `not self.db.hl_kill()`）。
+        #    先想清楚这个接口的语义：`scheduleCancel(minutes)` = 「N 分钟内没有新的
+        #    scheduleCancel 调用，就撤掉该地址**全部**挂单」——包括 reduce-only 止损单。
+        #    对**有持仓**的账户，「撤全部挂单」不是保护动作，而是**撤掉止损 = 裸奔**。
+        #    所以一旦 kill 置位就不再续期，后果是：定时器照常到期 → 止损被撤 → 裸仓，
+        #    而 dd/manual 的 kill 永不自解，人不在时这个窗口可以持续几天。
+        #    因此这里**不再区分 kill**：只要 live 且开关开着就续期（续期本身不动任何
+        #    挂单，只是把「撤单」这个动作再往后推一个窗口）。死手开关的本意是「执行器
+        #    停摆才撤单」，而 kill 是「停止开新仓」——两件事，不该让后者触发前者。
+        #    ⚠️ 它的副作用（执行器真停摆时仍会连止损一起撤）没有消失：这个功能默认关闭，
+        #    开启前必须读 docs/HL_RUNBOOK.md 的「真机验证发现 #3」。
+        if self.p.live and getattr(self.p, "use_schedule_cancel", False):
             try:
                 r = self.ex.schedule_cancel(minutes=self.p.deadman_minutes)
             except Exception as ex:                                   # noqa: BLE001
