@@ -262,11 +262,39 @@ class TestCurveMath(unittest.TestCase):
         self.assertAlmostEqual(c["meta"]["max_dd_pnl"], 50.0, places=6,
                                msg="权益从 1000 掉到 950 不是回撤 950，只有真实亏损 50")
 
-    def test_twr_skips_step_when_previous_equity_non_positive(self):
-        snaps = [snap(NOW - 2 * DAY, 0.0), snap(NOW - DAY, 100.0)]
+    def test_leading_zero_equity_snapshots_are_trimmed(self):
+        """入金到账前的 0 权益快照不是「亏 100%」：整段裁掉，曲线从第一笔本金开始。
+
+        2026-10-22 上线后实测：10-14 02:59 起有一批 equity=0 的快照，03:44 入金 100.79，
+        旧算法把这段算成「回撤 100.79」——本用例钉住新口径（裁剪 + 期初权益为基线）。
+        """
+        t0 = NOW - 2 * DAY
+        snaps = [snap(t0, 0.0), snap(t0 + 300, 0.0), snap(t0 + 2700, 100.79),
+                 snap(t0 + 3000, 100.79)]
+        flows = [flow(t0 + 2700, 100.79, "send_in")]     # 入金与首个 >0 快照同一时刻
+        c = hl_flows.curve(snaps, flows, now=NOW)
+        self.assertEqual(len(c["pnl"]), 2, "0 权益快照被裁掉")
+        self.assertEqual([p[1] for p in c["pnl"]], [0.0, 0.0], "入金不能变成盈亏")
+        self.assertAlmostEqual(c["meta"]["max_dd_pnl"], 0.0, places=6,
+                               msg="不能再出现 100.79 的假回撤")
+        self.assertAlmostEqual(c["meta"]["equity_base"], 100.79)
+        self.assertEqual(c["meta"]["twr_skipped"], 0)
+
+    def test_twr_skips_step_when_equity_hits_zero_midseries(self):
+        """中途被清空（权益归零）再有钱进来：那一步不猜，指数原地不动。"""
+        snaps = [snap(NOW - 3 * DAY, 100.0), snap(NOW - 2 * DAY, 0.0),
+                 snap(NOW - DAY, 100.0)]
         c = hl_flows.curve(snaps, [], now=NOW)
+        # 归零那一步是真实的 -100%（没有任何流水，钱是亏没的），指数归 0；
+        # 之后 prev_eq=0，下一步不猜 → 指数原地不动、twr_skipped +1。
+        self.assertEqual(c["twr"][1][1], 0.0)
         self.assertEqual(c["meta"]["twr_skipped"], 1)
-        self.assertEqual(c["twr"][-1][1], 100.0, "不猜：指数原地不动")
+        self.assertEqual(c["twr"][-1][1], 0.0, "不猜：指数原地不动")
+
+    def test_no_positive_equity_returns_empty_curve(self):
+        c = hl_flows.curve([snap(NOW - DAY, 0.0), snap(NOW, 0.0)], [], now=NOW)
+        self.assertEqual(c["pnl"], [])
+        self.assertEqual(c["meta"]["points"], 0)
 
     def test_window_filters_snapshots_but_not_flows(self):
         snaps = [snap(NOW - 90 * DAY, 999.0), snap(NOW - DAY, 120.0),
@@ -274,8 +302,11 @@ class TestCurveMath(unittest.TestCase):
         flows = [flow(NOW - 120 * DAY, 100.0)]
         c = hl_flows.curve(snaps, flows, now=NOW, window_s=30 * DAY)
         self.assertEqual(len(c["pnl"]), 2, "30 天窗口外的快照不画")
-        self.assertAlmostEqual(c["pnl"][-1][1], 20.0, places=6,
-                               msg="120 天前的入金仍是本金：120 − 100 = 20")
+        # 窗口外的本金被折进「期初权益」基线（equity_base=120），窗口内盈亏 = 110−120。
+        # 窗口内两点按时间升序是 110（−2D）→ 120（−1D），期初权益 = 110。
+        self.assertAlmostEqual(c["pnl"][-1][1], 10.0, places=6,
+                               msg="窗口内盈亏 = 期末权益 − 期初权益（本金已在基线里）")
+        self.assertAlmostEqual(c["meta"]["equity_base"], 110.0, places=6)
         self.assertAlmostEqual(c["meta"]["net_deposit"], 100.0)
 
 
