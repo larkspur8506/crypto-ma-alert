@@ -671,6 +671,33 @@ class DB:
     def hl_latest_snapshot(self) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
 
+    @_locked
+    def hl_snapshots_recent(self, limit: int = 20000) -> List[sqlite3.Row]:
+        """**最近** N 张快照，仍按 ts 升序返回（回撤 bootstrap 专用）。
+
+        为什么不能复用 `hl_snapshots(0, N)`：那个是 `ORDER BY ts ASC LIMIT N`，
+        表里超过 N 张时取到的是**最老**的 N 张 —— 最近的一段快照被丢掉，bootstrap
+        的最后一步落后于真实最新（实测 20005 张时落后 0.3h），那一段被压成一步算，
+        正是「把跨过的入金当亏损」要防的形态。先 DESC 取最近 N 张再反转。
+        """
+        rows = list(self.conn.execute(
+            "SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT ?", (int(limit),)))
+        rows.reverse()
+        return rows
+
+
+    @_locked
+    def hl_first_positive_snapshot(self) -> Optional[sqlite3.Row]:
+        """全表**最早一张 equity>0** 的快照（回撤熔断的 TWR 锚点，见 app/hl/dd.py）。
+
+        为什么另起一个方法而不是 `hl_snapshots(0, 1)`：执行器先跑起来、钱后到账时，
+        最前面会有一批 equity=0 的快照（本账户实测 100.79U 到账前就是），按 LIMIT 1
+        取到的是「还没有本金」那一张 —— 拿它做锚点等于把入金当收益。
+        也不带 30 天窗口：锚点可能比窗口更老，而 bootstrap 正是要用全表重放。
+        """
+        return self.conn.execute(
+            "SELECT * FROM hl_snapshots WHERE equity > 0 ORDER BY ts ASC LIMIT 1").fetchone()
+
     # ---------------- 出入金流水（feat/pnl-curve）
     @_locked
     def hl_add_flow(self, flow: Dict[str, Any]) -> bool:

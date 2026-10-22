@@ -36,6 +36,7 @@ from fastapi import APIRouter, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
+from app.hl import dd as hl_dd
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
                         _fee_quoted, _kv, _render_body, _signals_html, normalize_rows,
                         status_payload)
@@ -99,7 +100,7 @@ _PURPOSE_TXT = {"entry": "开仓", "stop": "止损", "exit": "平仓"}
 _ORDER_ST_TXT = {"intent": "待发", "planned": "计划", "sent": "已发", "resting": "挂单",
                  "filled": "成交", "cancelled": "撤单", "failed": "失败", "skipped": "跳过"}
 _EV_TXT = {"decision": "决策", "order": "下单", "reconcile": "对账", "kill": "熔断",
-           "error": "错误", "heartbeat": "心跳"}
+           "error": "错误", "heartbeat": "心跳", "dd": "回撤"}
 
 # 推送开关：key -> (中文标签, 说明, 缺省值)
 # report_push / fill_push 是新键（首次保存即落 DB）。
@@ -148,6 +149,14 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
      "到期保护除外），且连续 2 轮对账干净（无本地持仓、无挂单、挂单接口可信）时，"
      "自动解除停手并推一条提醒；关 = 永远等人工解除",
      True, "HL_KILL_AUTOCLEAR"),
+    # 回撤熔断（DD Guard）：判据是**策略口径**峰谷回撤（剔除出入金的 TWR 链）。
+    # 与日内 5% 那条线互补：日内线每天重置，抓不到「每天亏 4%」的温水煮青蛙。
+    # 熔断只停开新仓、不平仓，且 origin='dd' 永不自解（人工解）。
+    ("hl_dd_guard", "回撤熔断（策略口径峰谷回撤）",
+     "开 = 策略回撤达告警线推一条提醒、达熔断线停止开新仓（持仓按既有规则离场，"
+     "不强制平仓，需人工到本页解除）；阈值按当前「单笔风险」档位自动选"
+     "（1.5% 档 25/30、2.5% 档 30/40、3% 档 40/50），下面两个框可覆盖。"
+     "关 = 只保留日内 5% 那条线", True, "HL_DD_GUARD"),
 )
 
 
@@ -564,6 +573,41 @@ def _manual_kill(deps: Any, on: bool, reason: str = "") -> None:
         fn(on, reason)
 
 
+def _kill_origin(deps: Any) -> str:
+    """当前 kill 的来源（manual/reconcile/dd/daily_loss/size/expiry/auto）。读不到 → 空串。"""
+    try:
+        return str(deps.db.hl_kill_origin() or "").strip()
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 读 kill 来源失败（按未知来源处理）：%s", e)
+        return ""
+
+
+def _reset_dd_peak(deps: Any, now: Optional[float] = None) -> tuple:
+    """把回撤基线（peak_index）重置为**当前 index**；返回 (ok, 人话)。
+
+    【v2·高2】这是两个**独立**动作，不要合并：
+      - 「解除 DD 熔断」：必须顺带重置基线（否则下一轮 DD 仍是 31% → 立刻又熔断，
+        「人工解」形同虚设）。触发点在 `/admin/switch/kill`（on=0 且 origin=='dd'），
+        且必须在**同一个请求**里完成 —— 分两次点，中间那一轮 tick 会抢先置 kill。
+      - 「重置回撤基线」按钮：只重置峰值，**不**解除 kill。自动重置等于绕过熔断，
+        所以这条路必须人显式点。
+    """
+    try:
+        st = hl_dd.load_state(deps.db)
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"读回撤状态失败：{type(e).__name__}: {e}"
+    if st is None:
+        return False, "还没有回撤锚点（执行器还没算过一轮），无需重置"
+    try:
+        new = hl_dd.reset_peak(deps.db, now=now)
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"重置回撤基线失败：{type(e).__name__}: {e}"
+    if new is None:
+        return False, "当前回撤指数不可用（权益可能已亏光），基线未重置 —— 请人工核对交易所"
+    return True, (f"回撤基线已重置：当前指数 {new['index']:.2f}，"
+                  f"回撤从 0% 重新计量")
+
+
 def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "",
                attrs: str = "") -> str:
     st = f" step='{step}'" if step else ""
@@ -853,6 +897,78 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
     return out, errs
 
 
+def _dd_threshold_fields(cfg: Any, raw: Dict[str, Any]) -> str:
+    """回撤告警线/熔断线两个**可选**输入框（留空 = 按 risk_pct 档位自动）。
+
+    输入框里只回填「覆盖值」，不回填自动推导出来的数字：把自动算出的 0.25 填进框里，
+    用户下次一保存就变成「显式覆盖 0.25」，以后改 risk_pct 线就不跟着走了 —— 那正是
+    §3.4 要避免的坑。当前**生效**值写在提示文字里，供对照。
+    """
+    risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
+    th = hl_dd.thresholds(risk, _num(getattr(cfg, "hl_dd_warn_pct", 0.0), 0.0),
+                          _num(getattr(cfg, "hl_dd_kill_pct", 0.0), 0.0))
+
+    def _val(key: str) -> str:
+        v = _num(getattr(cfg, key, 0.0), 0.0)
+        return "" if v <= 0 else f"{v:g}"
+
+    hint = (f"当前生效：告警 {th['warn'] * 100:g}% / 熔断 {th['kill'] * 100:g}%"
+            f"（按单笔风险 {risk * 100:g}% 档位自动）。留空 = 保持原值；"
+            f"填 0 = 回到档位自动；改「单笔风险」时两条线会自动跟着走")
+    if th["rejected"]:
+        hint += "。⚠️ 当前配置自相矛盾（告警线须小于熔断线、熔断线 ≤95%），已按档位默认值执行"
+    return ("<div class='field'><div class='lbl'>回撤阈值覆盖（可选，小数，如 0.25 = 25%）"
+            f"<span class='src'>&nbsp;来源 {_source(raw, 'hl_dd_warn_pct', 'HL_DD_WARN_PCT')}"
+            f" / {_source(raw, 'hl_dd_kill_pct', 'HL_DD_KILL_PCT')}</span></div>"
+            "<label class='chk'>告警线 <input type='text' inputmode='decimal' "
+            f"name='hl_dd_warn_pct' value='{_esc(_val('hl_dd_warn_pct'))}' "
+            "placeholder='自动'></label>"
+            "<label class='chk'>熔断线 <input type='text' inputmode='decimal' "
+            f"name='hl_dd_kill_pct' value='{_esc(_val('hl_dd_kill_pct'))}' "
+            "placeholder='自动'></label>"
+            f"<div class='hint'>{_esc(hint)}</div></div>")
+
+
+def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
+    """解析两个可选回撤阈值 → ({key: value}, 提示文案)。
+
+    规则（§6）：
+      - 字段缺失 / 空白 → 不写库（保持原值），**绝不**把空串写成 0；
+      - 非数字 / 越界 / 与另一条线自相矛盾 → **两个都拒收**（保留原值），并给一句人话说明。
+    范围（0 或 5%~95%）与「warn < kill」全部由 `app/hl/dd.py` 判（`pct_ok` /
+    `thresholds`，含档位联动）—— 这里不再抄一遍区间（§6 低4）。
+    """
+    if warn_raw is None and kill_raw is None:
+        return {}, ""
+    cur = {"hl_dd_warn_pct": _num(getattr(cfg, "hl_dd_warn_pct", 0.0), 0.0),
+           "hl_dd_kill_pct": _num(getattr(cfg, "hl_dd_kill_pct", 0.0), 0.0)}
+    out: Dict[str, float] = {}
+    range_txt = f"{hl_dd.MIN_PCT * 100:g}%~{hl_dd.MAX_KILL * 100:g}%"
+    for key, raw in (("hl_dd_warn_pct", warn_raw), ("hl_dd_kill_pct", kill_raw)):
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if s == "":
+            continue                     # 留空 = 保持原值（不是 0）
+        try:
+            v = float(s)
+        except (TypeError, ValueError):
+            return {}, "回撤阈值被拒收（不是数字），两条都保留原值"
+        if v != v:                       # NaN
+            return {}, "回撤阈值被拒收（不是数字），两条都保留原值"
+        if not hl_dd.pct_ok(v):
+            return {}, f"回撤阈值被拒收（须在 {range_txt} 之间，或留空按档位自动），两条都保留原值"
+        out[key] = v
+    if not out:
+        return {}, ""
+    risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
+    if hl_dd.thresholds(risk, out.get("hl_dd_warn_pct", cur["hl_dd_warn_pct"]),
+                        out.get("hl_dd_kill_pct", cur["hl_dd_kill_pct"]))["rejected"]:
+        return {}, (f"回撤阈值被拒收（告警线必须小于熔断线、熔断线 ≤{hl_dd.MAX_KILL * 100:g}%），"
+                    f"两条都保留原值")
+    return out, ""
+
+
 # ---------------------------------------------------------------- 开关 Tab
 def render_switch(deps: AdminDeps, cfg: Any) -> str:
     mode = str(_call(deps.mode_fn, "off") or "off")
@@ -904,6 +1020,10 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
         cur = getattr(cfg, key, dflt)
         on = _b(cur) if not isinstance(cur, bool) else cur
         o.append(_bool_field(key, label, bool(on), hint, _source(raw, key, env_key)))
+    # 回撤阈值覆盖（可选）：留空 = 按 risk_pct 档位自动。
+    # 数值项的铁律（与开关相反）：**留空不许写成 0** —— 0 在这个键上是「自动档位」
+    # 的意思，把「没填」当 0 写进去会把用户在别的入口设的覆盖值静默清掉。
+    o.append(_dd_threshold_fields(cfg, raw))
     o.append("<button type='submit'>保存策略与保护</button></form></div>")
 
     # ---- 推送开关 ----
@@ -928,8 +1048,19 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
              f"<button class='{'red' if not kill else 'gray'}' type='submit' name='on' value='1'>"
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
-             "解除（恢复正常）</button></form></div>")
+             "解除（恢复正常）</button></form>")
+    # 【v2·高2】「重置回撤基线」独立入口：只把 peak_index 归到当前 index（回撤从此刻
+    # 重新计量），**不**解除 kill。为什么要单开一个按钮：用户可能只想重新起算、或者
+    # kill 已经因为别的原因停着（对账/当日亏损），这时不该被迫先解 kill 再重置。
+    # 反过来「解除 DD 熔断」会顺带重置基线（§4.6），那条路径在 POST 里做。
+    o.append("<form method='post' action='/admin/switch/dd_reset'>"
+             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             "<button class='gray' type='submit'>重置回撤基线</button>"
+             "<div class='hint'>把峰值（peak_index）改成当前指数：回撤从 0% 重新计量，"
+             "下次熔断要再跌一个熔断线。<b>不解除</b> kill；也不作用于账户权益回撤口径。</div>"
+             "</form></div>")
     return "".join(o)
+
 
 
 # ---------------------------------------------------------------- 记录 Tab
@@ -1472,6 +1603,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                               hl_fill_close: Optional[str] = Form(None),
                               hl_close_grace: Optional[str] = Form(None),
                               hl_kill_autoclear: Optional[str] = Form(None),
+                              hl_dd_guard: Optional[str] = Form(None),
+                              hl_dd_warn_pct: Optional[str] = Form(None),
+                              hl_dd_kill_pct: Optional[str] = Form(None),
                               k: str = Form("")):
         """保存「策略与保护」的开关。
 
@@ -1487,7 +1621,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                     "hl_pnl_from_fills": hl_pnl_from_fills,
                     "hl_fill_close": hl_fill_close,
                     "hl_close_grace": hl_close_grace,
-                    "hl_kill_autoclear": hl_kill_autoclear}
+                    "hl_kill_autoclear": hl_kill_autoclear,
+                    "hl_dd_guard": hl_dd_guard}
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1499,17 +1634,23 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                 vals[key] = 0 if str(val).strip().lower() in ("0", "false", "no", "off") else 1
             else:
                 vals[key] = _flag(val)
+        # 回撤阈值（§6）：留空 = 保持原值（**不写 0**）；越界/自相矛盾 → 两条都拒收。
+        # 与开关分开处理：开关的语义是「缺字段=不变、显式 0=关」，数值项的 0 是
+        # 「回到档位自动」，两者不能共用一个解析器。
+        dd_vals, dd_msg = _parse_dd_thresholds(hl_dd_warn_pct, hl_dd_kill_pct, deps.config_fn())
+        vals.update(dd_vals)
         put_errs = [e for e in (deps.put(key, val) for key, val in vals.items()) if e]
         if put_errs:
             raise HTTPException(400, "策略与保护保存失败：" + "；".join(put_errs))
         if not vals:
             # 什么都没带：不写库、不记事件，也不报「已保存」（审查中危：假横幅）
-            return RedirectResponse(_back(token, "switch", "无改动（未提交任何开关）"),
-                                    status_code=303)
+            return RedirectResponse(
+                _back(token, "switch", dd_msg or "无改动（未提交任何开关）"), status_code=303)
         word = {1: "开", 0: "关"}
         deps.log_event("decision",
                        "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s"
-                       " · 交易所已平仓自动关账=%s · 证据不足先进宽限=%s · 对账异常可自动恢复=%s）"
+                       " · 交易所已平仓自动关账=%s · 证据不足先进宽限=%s · 对账异常可自动恢复=%s"
+                       " · 回撤熔断=%s%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
@@ -1521,8 +1662,13 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                           word[vals["hl_close_grace"]]
                           if "hl_close_grace" in vals else "不变",
                           word[vals["hl_kill_autoclear"]]
-                          if "hl_kill_autoclear" in vals else "不变"))
-        return RedirectResponse(_back(token, "switch"), status_code=303)
+                          if "hl_kill_autoclear" in vals else "不变",
+                          word[vals["hl_dd_guard"]] if "hl_dd_guard" in vals else "不变",
+                          (" · 阈值 " + " / ".join(
+                              f"{k.replace('hl_dd_', '').replace('_pct', '')}={vals[k]:g}"
+                              for k in ("hl_dd_warn_pct", "hl_dd_kill_pct") if k in vals))
+                          if any(k in vals for k in ("hl_dd_warn_pct", "hl_dd_kill_pct")) else ""))
+        return RedirectResponse(_back(token, "switch", dd_msg or "已保存"), status_code=303)
 
     # ---------------- 推送开关 ----------------
     @router.post("/admin/switch/notify")
@@ -1552,13 +1698,42 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         want = str(on or "") in ("1", "true", "on")
         if deps.hl_set_kill is not None:
+            # 【v2·高2】解除**回撤熔断**时必须同时把回撤基线重置掉：
+            # dd 熔断永不自解，但 peak 不重置的话，下一轮 DD 仍是 31% → 立刻又置 kill
+            # （实测解除后 60s kill 就回来了）⇒「人工解」形同虚设。
+            # 必须在本请求内先重置、再解锁：分两步做的话，中间那一轮 tick 会抢先置 kill。
+            # 其它 origin（manual/reconcile/daily_loss/size/expiry）**不**重置基线：
+            # 那些停手与回撤无关，顺手把基线抹掉等于替用户绕过回撤熔断。
+            note = ""
+            if not want and _kill_origin(deps) == "dd":
+                ok, msg = _reset_dd_peak(deps)
+                note = (("；" + msg) if ok else
+                        ("；⚠️ 回撤基线未能重置（" + msg + "）"))
+                deps.log_event("kill", f"解除回撤熔断（origin=dd）→ {'重置基线成功' if ok else '重置基线失败'}：{msg}")
             _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
-        else:
-            # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
-            deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
-                                   "但执行器未接线（无动作）")
+            return RedirectResponse(
+                _back(token, "switch", (f"已解除 kill switch{note}" if not want
+                                        else "已触发 kill switch")),
+                status_code=303)
+        # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
+        deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
+                               "但执行器未接线（无动作）")
         return RedirectResponse(_back(token, "switch"), status_code=303)
+
+    # ---------------- 重置回撤基线（§6 高2 的第二个入口） ----------------
+    @router.post("/admin/switch/dd_reset")
+    def admin_switch_dd_reset(request: Request, k: str = Form("")):
+        """只把 peak_index 重置为当前 index；**不**动 kill（两条动作互相独立）。
+
+        自动重置 = 绕过熔断，所以必须人显式点这个按钮；每次动作都记一条 kill 事件，
+        事后能追「谁在什么时候把基线挪了」。
+        """
+        token = _auth(deps, request, k or None)
+        ok, msg = _reset_dd_peak(deps)
+        deps.log_event("kill", f"面板{'重置回撤基线' if ok else '请求重置回撤基线（未生效）'}：{msg}")
+        return RedirectResponse(_back(token, "switch", msg), status_code=303)
+
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
     @router.post("/admin/hl/agent/fallback/clear")

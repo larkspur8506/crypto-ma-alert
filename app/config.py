@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import Any, List
 
 from app import strategy
 
@@ -28,6 +28,27 @@ def _env_i(key: str, default: int) -> int:
         return int(_env(key, str(default)))
     except ValueError:
         return default
+
+
+def _as_dd_float(v: Any) -> float:
+    """回撤阈值的宽松解析：脏值/None → 0.0（= 按档位自动）。
+
+    这里**不抛错**：库里的配置可能被人手工改坏，一个读不出来的阈值不该让整份配置
+    装配失败（那样连交易都起不来）；退回 0 = 用档位默认线，保护还在。
+    """
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if f != f or f in (float("inf"), float("-inf")):
+        return 0.0
+    return f
+
+
+def _dd_thresholds(risk_pct: float, warn: float, kill: float):
+    """薄封装：延迟 import，避免 config 在模块导入期就拖上 app.hl（循环依赖）。"""
+    from app.hl import dd as hl_dd
+    return hl_dd.thresholds(risk_pct, warn, kill)
 
 
 @dataclass
@@ -94,6 +115,16 @@ class Config:
     # 只有参数、**没有面板开关**（用户明确要求）：正常情况不需要人管它。
     hl_flow_sync_s: int = _env_i("HL_FLOW_SYNC_S", 1800)
 
+    # 回撤熔断（DD Guard，规格见分支 feat/dd-guard）：判据是**策略口径**峰谷回撤
+    # （TWR 链、剔除了出入金），而不是账户权益回撤 —— 后者天生被入金/提现污染。
+    # 总开关默认**开**：它是「温水煮青蛙」唯一的兜底，关掉等于只剩日内 5% 那条线
+    # （每天亏 4% 的系统永远不会触发它）。
+    hl_dd_guard: bool = _env("HL_DD_GUARD", "1").lower() in ("1", "true", "yes", "on")
+    # 阈值覆盖：0 = 按当前 risk_pct 档位自动（§3.4：1.5% 档 25/30、2.5% 档 30/40、
+    # 3% 档 40/50）。留 0 而不是把默认值抄进来，是为了「改 risk_pct 线自动跟着走」。
+    hl_dd_warn_pct: float = _env_f("HL_DD_WARN_PCT", 0.0)
+    hl_dd_kill_pct: float = _env_f("HL_DD_KILL_PCT", 0.0)
+
     # 服务
     base_url: str = _env("BASE_URL", "https://ma.222677.xyz")
     admin_token: str = _env("ADMIN_TOKEN")
@@ -125,7 +156,8 @@ class Config:
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
                    "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max",
                    "hl_fill_close", "hl_close_grace", "hl_close_grace_s",
-                   "hl_kill_autoclear", "hl_flow_sync_s")
+                   "hl_kill_autoclear", "hl_flow_sync_s",
+                   "hl_dd_guard", "hl_dd_warn_pct", "hl_dd_kill_pct")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
@@ -199,10 +231,24 @@ class Config:
             if k in parsed:
                 try:
                     v = float(parsed[k])
-                    if not (lo <= v <= hi):
-                        parsed.pop(k, None)
                 except (TypeError, ValueError):
                     parsed.pop(k, None)
+                    continue
+                if not (lo <= v <= hi):
+                    parsed.pop(k, None)
+        # 回撤阈值覆盖（hl_dd_warn_pct / hl_dd_kill_pct）**故意不在 _RANGES 里**：
+        # 范围（0 or 0.05~0.95）与「warn < kill」的唯一真相是 `app/hl/dd.py:thresholds()`
+        # （规格 §6 低4）。v1 把它抄在四处（_RANGES / dd.thresholds / admin_ui / main._dd_pct），
+        # 只要有一处漂移，同一个数字就会「面板放行、装配拒收」。
+        # 这里只负责把「判定结果」落成「两条一起退回档位自动 = 保留原值」。
+        # 显式 0 是合法值（= 回到档位自动），不会被判拒收。
+        dw = _as_dd_float(parsed.get("hl_dd_warn_pct", getattr(self, "hl_dd_warn_pct", 0.0)))
+        dk = _as_dd_float(parsed.get("hl_dd_kill_pct", getattr(self, "hl_dd_kill_pct", 0.0)))
+        if "hl_dd_warn_pct" in parsed or "hl_dd_kill_pct" in parsed:
+            risk = _as_dd_float(parsed.get("risk_pct", getattr(self, "risk_pct", 0.02)))
+            if _dd_thresholds(risk, dw, dk)["rejected"]:
+                parsed.pop("hl_dd_warn_pct", None)
+                parsed.pop("hl_dd_kill_pct", None)
         # 一致性：stop_min 必须小于 stop_max（两者都存在且至少一方本次被改过才判）
         smin, smax = parsed.get("stop_min", getattr(self, "stop_min", None)), \
             parsed.get("stop_max", getattr(self, "stop_max", None))

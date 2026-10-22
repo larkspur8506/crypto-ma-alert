@@ -31,10 +31,15 @@ logger = logging.getLogger(__name__)
 #                             destination == 本账户 → 流入 send_in
 #                             user        == 本账户 → 流出 send_out
 #                             金额优先 usdcValue，缺失回落 amount
-#   accountClassTransfer    现货 ↔ 合约内部划转：钱没离开本账户，**忽略**
-#   internalTransfer        账户内部划转 → 忽略
-#   spotTransfer            现货内部转账 → 忽略
-#   subAccountTransfer      子账户之间 → 忽略
+#   accountClassTransfer    现货 ↔ 合约内部划转：钱没离开本账户（同一账户的两个
+#                            钱包之间挪，权益的「账户总值」口径不变），**忽略**
+#   internalTransfer        账户内部划转（交易所内部记账，钱留在本账户）→ 忽略
+#   spotTransfer            现货钱包内部转账（同上，仍在账户总值里）→ 忽略
+#   subAccountTransfer      **子账户之间转账**（v2 修正，§4.8）：钱是真的离开/进入
+#                            本账户 —— 以前当成内部划转忽略掉，于是「转出 300U」
+#                            表现为权益下降但没有流水 = 假亏损 30% → 假熔断。
+#                            按方向计入：destination == 本账户 → 流入 sub_in；
+#                            user == 本账户 → 流出 sub_out；两边都不是本账户 → 忽略。
 #   vaultDeposit            存进金库：钱离开交易账户，权益同步下降 → 流出 vault_out
 #   vaultWithdraw           从金库取回：钱回到交易账户 → 流入 vault_in
 #   其它未知类型             按**外部出入金**计入（符号沿用交易所给的数，缺符号按流入），
@@ -44,7 +49,8 @@ logger = logging.getLogger(__name__)
 # 注：withdraw 的交易所提现手续费（固定 1 USDC）**不计入流水** —— 它不是为了投资而
 # 转入/转出的钱，而是真金白银的成本，留在盈亏里才诚实。
 IGNORED_TYPES = frozenset({"accountClassTransfer", "internalTransfer",
-                           "spotTransfer", "subAccountTransfer"})
+                           "spotTransfer"})
+
 
 SIMPLE_TYPES = {
     "deposit": ("deposit", 1),          # kind, 方向（+1 流入 / -1 流出）
@@ -124,20 +130,23 @@ def classify(row: Any, address: str) -> Optional[Dict[str, Any]]:
         return {"ts": ts_ms / 1000.0, "kind": kind, "amount": sign * abs(amt),
                 "hash": hash_, "counterparty": cp, "dex": dex, "type": typ}
 
-    if typ == "send":
+    if typ == "send" or typ == "subAccountTransfer":
         amt = _amount(delta, _SEND_AMOUNT_KEYS)
         if amt is None:
             return None
         if who and user == who and dest == who:
             return None                     # 自己转自己：钱没动
+        # 子账户转账单独留一个 kind：面板/排查时能看出「这笔是子账户挪的」，
+        # 而且不与 send 的去重键语义混在一起。金额方向与 send 同一套判据。
+        k_in, k_out = ("sub_in", "sub_out") if typ != "send" else ("send_in", "send_out")
         if who and dest == who:
-            return {"ts": ts_ms / 1000.0, "kind": "send_in", "amount": abs(amt),
+            return {"ts": ts_ms / 1000.0, "kind": k_in, "amount": abs(amt),
                     "hash": hash_, "counterparty": user, "dex": dex, "type": typ}
         if who and user == who:
-            return {"ts": ts_ms / 1000.0, "kind": "send_out", "amount": -abs(amt),
+            return {"ts": ts_ms / 1000.0, "kind": k_out, "amount": -abs(amt),
                     "hash": hash_, "counterparty": dest, "dex": dex, "type": typ}
         # 两边都不是本账户（防御：账本本该只返回本账户的流水）→ 与本账户权益无关，不计
-        logger.debug("[hl-flows] 跳过与本账户无关的 send：user=%s dest=%s", user, dest)
+        logger.debug("[hl-flows] 跳过与本账户无关的 %s：user=%s dest=%s", typ, user, dest)
         return None
 
     # 未知类型：按外部出入金计入，符号沿用交易所给的数（缺符号则按流入）

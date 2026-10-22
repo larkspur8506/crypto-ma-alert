@@ -41,3 +41,7 @@ EV_RECONCILE = "reconcile"
 EV_KILL = "kill"
 EV_ERROR = "error"
 EV_HEARTBEAT = "heartbeat"
+# 回撤熔断（DD Guard）：锚点建立/口径不可用/指数异常这类「口径自身」的事件。
+# 单独一个 kind，而不是塞进 error —— 看守按 error 数问题，「没有正权益快照」在
+# 刚上线/刚清库时是正常的过渡态，不该被当成故障。
+EV_DD = "dd"
