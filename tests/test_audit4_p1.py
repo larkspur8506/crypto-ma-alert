@@ -180,14 +180,25 @@ class TestP1PendingNotRealPosition(Base):
         self.assertEqual([a for a in alerts if "对账异常" in a], [])
 
     def test_issued_entry_still_checked(self):
-        """P1-b：已发出（sent/filled）的入场单 + pending 行 → 仍按真实仓位对账。"""
+        """P1-b：已发出（sent/filled）的入场单 + pending 行 → 仍按真实仓位对账。
+
+        2026-10-22 起首轮先进宽限（`closing`，最多 900s）：账实不符仍会被发现，
+        只是先给「成交可能还在路上」一个重试窗口。超过宽限必须**照样**报出来 ——
+        这里把两段都钉住，避免宽限把真矛盾永久静音。
+        """
         pid = self.add_pending()
         self.db.hl_record_intent("BTC_USDT", "BTC", BAR, PURPOSE_ENTRY, -1, 0.005,
                                  px=81603.0, status=ST_SENT)
         ex = self.executor()
         rec = ex.reconcile(_snap())                       # 交易所已经什么都没有
-        self.assertFalse(rec["ok"], "成交后崩溃的裸仓必须仍被报出来")
-        self.assertIn("本地有仓", rec["problems"][0])
+        self.assertTrue(rec["ok"], "首轮只应进宽限，不立刻判 mismatch")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "closing")
+
+        # 宽限超时 → 必须仍被报出来（原意：成交后崩溃的裸仓不能没人管）
+        self.db.set_config(f"hl_close_grace:{pid}", f"{time.time() - 1000:.3f}:3")
+        rec2 = ex.reconcile(_snap())
+        self.assertFalse(rec2["ok"], "宽限超时后必须报异常")
+        self.assertIn("未拿到成交证据", rec2["problems"][0])
         self.assertEqual(self.db.position_by_id(pid)["hl_status"], "mismatch")
 
 

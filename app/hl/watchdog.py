@@ -116,6 +116,14 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
         for r in db.recent_positions(20):
             if (r["hl_status"] or "") == "mismatch":
                 add(f"仓位 #{r['id']} {r['symbol']} 处于 mismatch（本地与交易所不一致）")
+        # L4（对抗审查）：closing（平仓成交待核对）以前**两头都不报** —— mismatch 分行
+        # 不收它，下面的「本地有仓但交易所查不到」只认 hl_status='open'，于是宽限期里
+        # 的仓在看守报告里完全消失（用户以为没仓，其实账还挂着）。它是**已知的、自动
+        # 重试中的**状态，不是异常：按 ok 行报一行，`--dry-run` 能看见，cron 静默不喊。
+        for r in db.recent_positions(20):
+            if (r["hl_status"] or "") == "closing" and r["status"] in ("open", "pending"):
+                add(f"仓位 #{r['id']} {r['symbol']} 平仓待核对（宽限期自动重试中，暂不开新仓）",
+                    ok=True)
         local_open = [r for r in db.recent_positions(20)
                       if r["status"] == "open" and (r["hl_status"] or "") == "open"]
         for r in local_open:

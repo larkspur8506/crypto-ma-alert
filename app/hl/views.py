@@ -66,6 +66,14 @@ _MODE_CLS = {"off": "muted", "dry": "warn", "live": "neg"}
 # 信号表状态 → 中文（_signals_html 用；记录页复用同一映射）
 _ST_TXT = {"pending": "待确认", "open": "持仓中", "closed": "已平仓", "ignored": "已忽略"}
 
+# hl_status（执行器侧的账实状态）→ 中文。只在「不是 open」时才显示在状态列第二行 ——
+# open 就是「持仓中」，再写一遍纯噪音。未知值兜底原文（不编一个看着像结论的词）。
+_HL_ST_TXT = {"closing": "平仓待核对", "mismatch": "账实不符", "aborted": "开仓中止"}
+# 宽限期（hl_close_grace_s）：与 Config/Executor 同一默认与范围（面板不 import main，
+# 也不 import executor —— 这里只要一个「读配置 + 兜底」的小工具）。
+_GRACE_DEFAULT_S = 900.0
+_GRACE_MIN_S, _GRACE_MAX_S = 300.0, 3600.0
+
 # 成交「买卖」列的四向推导（side 是多空方向不是买卖方向 —— 平多其实是卖出）。
 # 总览的成交表 2026-10-18 迁到记录页后，这里是唯一口径源，记录页 import 复用
 # （别在 admin_ui 里再抄一份）。
@@ -614,6 +622,18 @@ def status_payload(deps: DashboardDeps) -> dict:
             "qty_unit": posfields.qty_unit(d),
             "bar_ms": _opt_num(d.get("signal_bar_ms")),
         }
+        # hl_status（执行器侧账实状态）：只在「有必要说」的时候进 payload ——
+        # 空/open 意味着「一切正常」或「不是 HL 仓」，面板不必多一行字。
+        hl_st = str(d.get("hl_status") or "")
+        if hl_st and hl_st != "open":
+            sig["hl_status"] = hl_st
+            sig["hl_status_text"] = hl_status_text(hl_st)
+            if hl_st == "closing":
+                # 剩余宽限：留出「超时前不留空白」——读不到起点就按「刚进入」算满额。
+                total = _grace_seconds_cfg(cfg)
+                first = _grace_first_seen(deps.db, d.get("id"))
+                left = total if first is None else max(0.0, total - max(0.0, now - first))
+                sig["grace_left_s"] = round(left, 1)
         if pnl_from_fills:
             # 流水口径净额（PR-3）：**只在开关打开时才给出这些键** —— 记录表以
             # 「有没有 net_pnl 键」作为「要不要多显示一列净额」的依据，关掉时表格结构
@@ -1264,6 +1284,43 @@ def _sign(v: Any, unit: str = " U") -> tuple:
     return f"{f:+,.2f}{unit}", cls
 
 
+def _grace_seconds_cfg(cfg: Any) -> float:
+    """面板侧读宽限秒数：脏值/越界一律按 900（与 main._grace_seconds 同口径）。
+
+    这里**不 import** app.main / app.hl.executor：面板是纯渲染层，为了一个数字把
+    建库、SDK 依赖拖进来不值得（历史教训：views 一旦 import 重模块，面板测试就会
+    连带建库）。两个常量各自一份，但都钉在同样的默认与范围上。
+    """
+    try:
+        v = float(getattr(cfg, "hl_close_grace_s", _GRACE_DEFAULT_S))
+    except (TypeError, ValueError):
+        return _GRACE_DEFAULT_S
+    return v if _GRACE_MIN_S <= v <= _GRACE_MAX_S else _GRACE_DEFAULT_S
+
+
+def _grace_first_seen(db: Any, pid: Any) -> Optional[float]:
+    """读该仓宽限期的起点（configuration 的 `hl_close_grace:<pid>`，格式 "<ts>:<rounds>"）。
+
+    读不到/读不懂 → None（调用方按「刚进入宽限」算剩余，绝不因为读不到就显示空白）。
+    """
+    try:
+        raw = str(_db_call(db, "get_config_str", f"hl_close_grace:{int(pid)}", "") or "").strip()
+    except Exception:                                            # noqa: BLE001
+        return None
+    head = raw.split(":", 1)[0]
+    try:
+        ts = float(head)
+    except (TypeError, ValueError):
+        return None
+    return ts if ts > 0 else None
+
+
+def hl_status_text(status: Any) -> str:
+    """hl_status → 中文（未知值兜底原文；空串 → 空串）。"""
+    s = str(status or "")
+    return _HL_ST_TXT.get(s, s)
+
+
 def _signals_html(signals: list) -> str:
     """「信号」表（仓位历史）的 HTML 片段：标题 + 表格，仅此一块。
 
@@ -1289,13 +1346,26 @@ def _signals_html(signals: list) -> str:
     for sg in dicts:
         st = str(sg.get("status") or "—")
         st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
+        hl_st = str(sg.get("hl_status") or "")
+        hl_note = ""
+        if hl_st:
+            # 第二行：执行器侧的账实状态（closing/mismatch/...）。宽限期额外给剩余时间，
+            # 「超时前不留空白」—— 剩 0 分钟也要写出来（那正是「马上要升级成异常」）。
+            extra = ""
+            if hl_st == "closing":
+                left = _opt_num(sg.get("grace_left_s"))
+                if left is not None:
+                    mins = max(0, int(math.ceil(max(0.0, left) / 60.0)))
+                    extra = f" · 剩 {mins} 分钟"
+            hl_note = (f"<div class='muted'>{_esc(hl_status_text(hl_st))}"
+                       f"{_esc(extra)}</div>")
         pnl_cell = ""
         if with_pnl:
             # net_pnl 为 NULL 时显示「—」：没算过/查不到成交 ≠ 0 收益
             pnl_cell = _td(_fmt(sg.get("net_pnl")), "num")
         o.append("<tr>"
                  + _td(_esc(sg.get("coin") or _disp(sg.get("symbol")) or "—"))
-                 + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>")
+                 + _td(f"<span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span>" + hl_note)
                  + _td("多" if _num(sg.get("side"), 1) >= 0 else "空")
                  + _td(_fmt(sg.get("entry")), "num")
                  + _td(_fmt(sg.get("stop")), "num")
