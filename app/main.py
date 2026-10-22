@@ -216,18 +216,14 @@ def _flow_sync_s(cfg) -> int:
 def _dd_pct(cfg, key: str) -> float:
     """回撤阈值覆盖（0 = 按 risk_pct 档位自动）。脏值/缺键/越界一律退回 0（自动）。
 
+    规则**不在这里**：范围和「不符合就退回自动」的唯一真相是
+    `app/hl/dd.py:norm_override`（规格 §6 低4）。这里只是装配时的一个读入口。
     为什么不退回一个具体数字：档位是「跟着 risk_pct 走」的，抄一个 0.30 进这里
     等于把 3% 档的账户钉在 2.5% 档的线上（那档 P(DD>30%)=96%，必然误触发）。
     越界值退回 0 而不是钳到边界：钳值会造出一个用户没写过的阈值。
     """
-    raw = getattr(cfg, key, None)
-    try:
-        v = float(str(raw).strip().strip('"').strip("'"))
-    except (TypeError, ValueError):
-        return 0.0
-    if v != v or v <= 0.0:                      # NaN / 0 / 负 → 自动档位
-        return 0.0
-    return v if 0.05 <= v <= 0.95 else 0.0
+    from app.hl import dd as hl_dd
+    return hl_dd.norm_override(getattr(cfg, key, None))
 
 
 
@@ -1070,9 +1066,23 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
 
     origin 显式写 'manual'：这是**人**按的按钮，绝不能被「连续 N 轮对账干净」自动解除
     —— 人按下去通常正因为它看到了机器看不出的东西（见 Executor._maintain_kill_autoclear）。
+
+    【v2·高2】解除**回撤熔断**（origin=='dd'）时，必须在本请求内把回撤基线（peak_index）
+    重置为当前 index：否则下一轮 DD 仍是 31% → 立刻又置 kill，「人工解」形同虚设。
+    这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条）。
     """
     _require_admin(request, k or None)
     want = on in ("1", "true", "on")
+    if not want and db.hl_kill_origin() == "dd":
+        from app.hl import dd as hl_dd
+        try:
+            new = hl_dd.reset_peak(db)
+            db.hl_log_event("kill", "解除回撤熔断 → 回撤基线已重置"
+                            + (f"（当前指数 {new['index']:.2f}）" if new else "（失败：状态不可用）"))
+        except Exception as e:                                       # noqa: BLE001
+            # 重置失败不能挡住解锁：宁可由下一轮重新熔断（用户会看到提示），也不要
+            # 让一次 DB 写失败把 kill 卡死。
+            db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
     return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)

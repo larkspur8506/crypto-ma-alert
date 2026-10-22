@@ -183,11 +183,6 @@ class Config:
         # 没有宽限（第一轮没证据立刻 kill）；上界 3600 = 一小时，再长就是「忘了这回事」，
         # 期间该标的还禁止开新仓。越界保留原值（不静默关功能）。
         "hl_close_grace_s": (300.0, 3600.0),
-        # 回撤阈值覆盖（0 = 按 risk_pct 档位自动，见 app/hl/dd.py 的 TIERS）：
-        # 下界 0.05 保证「覆盖值」不会是 5% 这种一碰就响的噪音线，上界 0.95 与
-        # 规格 §6 的 kill <= 0.95 同值（见 apply_db 里对 kill 的二次校验）。
-        "hl_dd_warn_pct": (0.05, 0.95),
-        "hl_dd_kill_pct": (0.05, 0.95),
     }
 
     # 字符串配置允许「显式清空」的键。
@@ -239,21 +234,17 @@ class Config:
                 except (TypeError, ValueError):
                     parsed.pop(k, None)
                     continue
-                # 回撤阈值：0 = 「按 risk_pct 档位自动」（规格 §6 明写 0 是合法值）。
-                # 它不在 0.05~0.95 里，若被通用范围校验拒收，「清掉覆盖/回到自动档位」
-                # 就变成只能改库的操作 —— 面板上留空又等于「不改」，用户没有出路。
-                if k in ("hl_dd_warn_pct", "hl_dd_kill_pct") and v == 0.0:
-                    continue
                 if not (lo <= v <= hi):
                     parsed.pop(k, None)
-        # 一致性：回撤告警线必须严格小于熔断线，否则两条线自相矛盾（告警永远晚于
-        # 熔断）。规格 §6：不成立时**两者一起**拒收、保留原值。
-        # 用 app/hl/dd.py 的同一份解析（含 risk_pct 档位联动）：只填告警线 0.35 而熔断线
-        # 走 2.5% 档的 0.40 是合法的，填 0.45 就不合法 —— 这个判断不能在这里另抄一份，
-        # 否则面板/装配/写入三处会慢慢分叉。
+        # 回撤阈值覆盖（hl_dd_warn_pct / hl_dd_kill_pct）**故意不在 _RANGES 里**：
+        # 范围（0 or 0.05~0.95）与「warn < kill」的唯一真相是 `app/hl/dd.py:thresholds()`
+        # （规格 §6 低4）。v1 把它抄在四处（_RANGES / dd.thresholds / admin_ui / main._dd_pct），
+        # 只要有一处漂移，同一个数字就会「面板放行、装配拒收」。
+        # 这里只负责把「判定结果」落成「两条一起退回档位自动 = 保留原值」。
+        # 显式 0 是合法值（= 回到档位自动），不会被判拒收。
         dw = _as_dd_float(parsed.get("hl_dd_warn_pct", getattr(self, "hl_dd_warn_pct", 0.0)))
         dk = _as_dd_float(parsed.get("hl_dd_kill_pct", getattr(self, "hl_dd_kill_pct", 0.0)))
-        if ("hl_dd_warn_pct" in parsed or "hl_dd_kill_pct" in parsed) and (dw > 0 or dk > 0):
+        if "hl_dd_warn_pct" in parsed or "hl_dd_kill_pct" in parsed:
             risk = _as_dd_float(parsed.get("risk_pct", getattr(self, "risk_pct", 0.02)))
             if _dd_thresholds(risk, dw, dk)["rejected"]:
                 parsed.pop("hl_dd_warn_pct", None)

@@ -573,6 +573,41 @@ def _manual_kill(deps: Any, on: bool, reason: str = "") -> None:
         fn(on, reason)
 
 
+def _kill_origin(deps: Any) -> str:
+    """当前 kill 的来源（manual/reconcile/dd/daily_loss/size/expiry/auto）。读不到 → 空串。"""
+    try:
+        return str(deps.db.hl_kill_origin() or "").strip()
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 读 kill 来源失败（按未知来源处理）：%s", e)
+        return ""
+
+
+def _reset_dd_peak(deps: Any, now: Optional[float] = None) -> tuple:
+    """把回撤基线（peak_index）重置为**当前 index**；返回 (ok, 人话)。
+
+    【v2·高2】这是两个**独立**动作，不要合并：
+      - 「解除 DD 熔断」：必须顺带重置基线（否则下一轮 DD 仍是 31% → 立刻又熔断，
+        「人工解」形同虚设）。触发点在 `/admin/switch/kill`（on=0 且 origin=='dd'），
+        且必须在**同一个请求**里完成 —— 分两次点，中间那一轮 tick 会抢先置 kill。
+      - 「重置回撤基线」按钮：只重置峰值，**不**解除 kill。自动重置等于绕过熔断，
+        所以这条路必须人显式点。
+    """
+    try:
+        st = hl_dd.load_state(deps.db)
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"读回撤状态失败：{type(e).__name__}: {e}"
+    if st is None:
+        return False, "还没有回撤锚点（执行器还没算过一轮），无需重置"
+    try:
+        new = hl_dd.reset_peak(deps.db, now=now)
+    except Exception as e:                                        # noqa: BLE001
+        return False, f"重置回撤基线失败：{type(e).__name__}: {e}"
+    if new is None:
+        return False, "当前回撤指数不可用（权益可能已亏光），基线未重置 —— 请人工核对交易所"
+    return True, (f"回撤基线已重置：当前指数 {new['index']:.2f}，"
+                  f"回撤从 0% 重新计量")
+
+
 def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "",
                attrs: str = "") -> str:
     st = f" step='{step}'" if step else ""
@@ -899,15 +934,16 @@ def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
 
     规则（§6）：
       - 字段缺失 / 空白 → 不写库（保持原值），**绝不**把空串写成 0；
-      - 非数字 / 越界（0.05~0.95，0 是合法值 = 自动）/ 与另一条线自相矛盾
-        → **两个都拒收**（保留原值），并给一句人话说明。
-    自相矛盾用 `app/hl/dd.py:thresholds` 判（含档位联动），不在这里另写一份规则。
+      - 非数字 / 越界 / 与另一条线自相矛盾 → **两个都拒收**（保留原值），并给一句人话说明。
+    范围（0 或 5%~95%）与「warn < kill」全部由 `app/hl/dd.py` 判（`pct_ok` /
+    `thresholds`，含档位联动）—— 这里不再抄一遍区间（§6 低4）。
     """
     if warn_raw is None and kill_raw is None:
         return {}, ""
     cur = {"hl_dd_warn_pct": _num(getattr(cfg, "hl_dd_warn_pct", 0.0), 0.0),
            "hl_dd_kill_pct": _num(getattr(cfg, "hl_dd_kill_pct", 0.0), 0.0)}
     out: Dict[str, float] = {}
+    range_txt = f"{hl_dd.MIN_PCT * 100:g}%~{hl_dd.MAX_KILL * 100:g}%"
     for key, raw in (("hl_dd_warn_pct", warn_raw), ("hl_dd_kill_pct", kill_raw)):
         if raw is None:
             continue
@@ -920,15 +956,16 @@ def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
             return {}, "回撤阈值被拒收（不是数字），两条都保留原值"
         if v != v:                       # NaN
             return {}, "回撤阈值被拒收（不是数字），两条都保留原值"
-        if v != 0.0 and not (0.05 <= v <= 0.95):
-            return {}, "回撤阈值被拒收（须在 5%~95% 之间，或留空按档位自动），两条都保留原值"
+        if not hl_dd.pct_ok(v):
+            return {}, f"回撤阈值被拒收（须在 {range_txt} 之间，或留空按档位自动），两条都保留原值"
         out[key] = v
     if not out:
         return {}, ""
     risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
     if hl_dd.thresholds(risk, out.get("hl_dd_warn_pct", cur["hl_dd_warn_pct"]),
                         out.get("hl_dd_kill_pct", cur["hl_dd_kill_pct"]))["rejected"]:
-        return {}, "回撤阈值被拒收（告警线必须小于熔断线、熔断线 ≤95%），两条都保留原值"
+        return {}, (f"回撤阈值被拒收（告警线必须小于熔断线、熔断线 ≤{hl_dd.MAX_KILL * 100:g}%），"
+                    f"两条都保留原值")
     return out, ""
 
 
@@ -1011,8 +1048,19 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
              f"<button class='{'red' if not kill else 'gray'}' type='submit' name='on' value='1'>"
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
-             "解除（恢复正常）</button></form></div>")
+             "解除（恢复正常）</button></form>")
+    # 【v2·高2】「重置回撤基线」独立入口：只把 peak_index 归到当前 index（回撤从此刻
+    # 重新计量），**不**解除 kill。为什么要单开一个按钮：用户可能只想重新起算、或者
+    # kill 已经因为别的原因停着（对账/当日亏损），这时不该被迫先解 kill 再重置。
+    # 反过来「解除 DD 熔断」会顺带重置基线（§4.6），那条路径在 POST 里做。
+    o.append("<form method='post' action='/admin/switch/dd_reset'>"
+             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             "<button class='gray' type='submit'>重置回撤基线</button>"
+             "<div class='hint'>把峰值（peak_index）改成当前指数：回撤从 0% 重新计量，"
+             "下次熔断要再跌一个熔断线。<b>不解除</b> kill；也不作用于账户权益回撤口径。</div>"
+             "</form></div>")
     return "".join(o)
+
 
 
 # ---------------------------------------------------------------- 记录 Tab
@@ -1650,13 +1698,42 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         want = str(on or "") in ("1", "true", "on")
         if deps.hl_set_kill is not None:
+            # 【v2·高2】解除**回撤熔断**时必须同时把回撤基线重置掉：
+            # dd 熔断永不自解，但 peak 不重置的话，下一轮 DD 仍是 31% → 立刻又置 kill
+            # （实测解除后 60s kill 就回来了）⇒「人工解」形同虚设。
+            # 必须在本请求内先重置、再解锁：分两步做的话，中间那一轮 tick 会抢先置 kill。
+            # 其它 origin（manual/reconcile/daily_loss/size/expiry）**不**重置基线：
+            # 那些停手与回撤无关，顺手把基线抹掉等于替用户绕过回撤熔断。
+            note = ""
+            if not want and _kill_origin(deps) == "dd":
+                ok, msg = _reset_dd_peak(deps)
+                note = (("；" + msg) if ok else
+                        ("；⚠️ 回撤基线未能重置（" + msg + "）"))
+                deps.log_event("kill", f"解除回撤熔断（origin=dd）→ {'重置基线成功' if ok else '重置基线失败'}：{msg}")
             _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
-        else:
-            # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
-            deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
-                                   "但执行器未接线（无动作）")
+            return RedirectResponse(
+                _back(token, "switch", (f"已解除 kill switch{note}" if not want
+                                        else "已触发 kill switch")),
+                status_code=303)
+        # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致
+        deps.log_event("kill", f"面板请求{'触发' if want else '解除'} kill switch，"
+                               "但执行器未接线（无动作）")
         return RedirectResponse(_back(token, "switch"), status_code=303)
+
+    # ---------------- 重置回撤基线（§6 高2 的第二个入口） ----------------
+    @router.post("/admin/switch/dd_reset")
+    def admin_switch_dd_reset(request: Request, k: str = Form("")):
+        """只把 peak_index 重置为当前 index；**不**动 kill（两条动作互相独立）。
+
+        自动重置 = 绕过熔断，所以必须人显式点这个按钮；每次动作都记一条 kill 事件，
+        事后能追「谁在什么时候把基线挪了」。
+        """
+        token = _auth(deps, request, k or None)
+        ok, msg = _reset_dd_peak(deps)
+        deps.log_event("kill", f"面板{'重置回撤基线' if ok else '请求重置回撤基线（未生效）'}：{msg}")
+        return RedirectResponse(_back(token, "switch", msg), status_code=303)
+
 
     # ---------------- 清除手工兜底有效期（M3 的显式入口） ----------------
     @router.post("/admin/hl/agent/fallback/clear")

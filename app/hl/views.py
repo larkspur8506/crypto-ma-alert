@@ -420,7 +420,13 @@ def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
                dd_pct=round(pct, 6), dd_index=round(float(st["index"]), 4),
                dd_peak_index=round(float(st["peak_index"]), 4),
                dd_asof=float(st.get("updated_at") or 0.0) or None)
+    # 【v2·高1】执行器「本轮没判」的说明（只有流水接口失败/无地址时才写，闸门内跳过
+    # 属正常节奏、不写）。这里只读、不自己推断 —— 判据有没有真的跑过只有执行器知道。
+    wait = str(_config_get(deps, hl_dd.WAIT_KEY, "") or "").strip()
+    if wait:
+        out["dd_wait_note"] = wait
     return out
+
 
 
 def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[dict],
@@ -1590,9 +1596,15 @@ def _dd_line_html(meta: Dict[str, Any]) -> str:
     pct_txt = "—" if pct is None else f"{pct * 100:.2f}%"
     cls = "neg" if st == "killed" else ("muted" if st != "warn" else "")
     span = f"<span class='{cls}'>{_esc(txt)}</span>" if cls else _esc(txt)
-    return (f"<div class=\"legend\">策略回撤 {pct_txt}（剔除出入金，峰值以来）· "
+    # 「等待流水同步」只在真的没判过时出现（执行器写的 hl_dd_wait_note）；正常节奏下
+    # 用固定的口径说明「按流水同步节奏更新」——用户必须知道这条线的分辨率是 30 分钟，
+    # 而不是 5 分钟一轮的 tick（§4.4.1 要求把这个取舍说清）。
+    wait = str(meta.get("dd_wait_note") or "").strip()
+    tail = f" · <span class='neg'>{_esc(wait)}</span>" if wait else ""
+    return (f"<div class=\"legend\">策略回撤 {pct_txt}（剔除出入金，峰值以来；按流水同步节奏更新）· "
             f"告警线 {_pct_txt(meta.get('dd_warn_pct'))} · "
-            f"熔断线 {_pct_txt(meta.get('dd_kill_pct'))} · 当前状态：{span}</div>")
+            f"熔断线 {_pct_txt(meta.get('dd_kill_pct'))} · 当前状态：{span}{tail}</div>")
+
 
 
 def _render_body(p: dict) -> str:

@@ -672,6 +672,21 @@ class DB:
         return self.conn.execute("SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
 
     @_locked
+    def hl_snapshots_recent(self, limit: int = 20000) -> List[sqlite3.Row]:
+        """**最近** N 张快照，仍按 ts 升序返回（回撤 bootstrap 专用）。
+
+        为什么不能复用 `hl_snapshots(0, N)`：那个是 `ORDER BY ts ASC LIMIT N`，
+        表里超过 N 张时取到的是**最老**的 N 张 —— 最近的一段快照被丢掉，bootstrap
+        的最后一步落后于真实最新（实测 20005 张时落后 0.3h），那一段被压成一步算，
+        正是「把跨过的入金当亏损」要防的形态。先 DESC 取最近 N 张再反转。
+        """
+        rows = list(self.conn.execute(
+            "SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT ?", (int(limit),)))
+        rows.reverse()
+        return rows
+
+
+    @_locked
     def hl_first_positive_snapshot(self) -> Optional[sqlite3.Row]:
         """全表**最早一张 equity>0** 的快照（回撤熔断的 TWR 锚点，见 app/hl/dd.py）。
 
