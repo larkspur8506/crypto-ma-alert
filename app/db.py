@@ -729,3 +729,8 @@ class DB:
         self.set_config("hl_exec_kill_origin", str(origin or "manual"))
         if reason:
             self.set_config("hl_exec_kill_reason", reason)
+        elif not on:
+            # 解除 kill 时把原因一并清空（对抗审查 L6）：以前只写不清，解除之后
+            # `hl_exec_kill_reason` 还留着上一次的原因，面板/看守/告警正文都会拿它
+            # 去解释一个**已经不存在**的停手（「未暂停自动交易（对账异常）」这种自相矛盾）。
+            self.set_config("hl_exec_kill_reason", "")

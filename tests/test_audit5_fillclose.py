@@ -291,9 +291,9 @@ class TestSyncBeforeReconcile(FillCloseBase):
         seen = {}
         orig = ex._fill_close_proof
 
-        def spy(row, snap=None, consumed=None):
+        def spy(row, snap=None, consumed=None, **kw):
             seen["fills_in_db"] = len(self.db.hl_recent_fills(50))
-            return orig(row, snap, consumed)
+            return orig(row, snap, consumed, **kw)
 
         ex._fill_close_proof = spy            # 实例属性覆盖绑定方法，不碰类
         ex.run()

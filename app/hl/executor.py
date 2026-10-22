@@ -110,18 +110,39 @@ PNL_SRC_NO_EXIT_FILLS = "no_exit_fills"   # 只有入场腿（平仓成交还没
 #   路径上被当成正常持仓去补挂止损），也不是 mismatch（还不是真矛盾，只是时滞）。
 HL_ST_CLOSING = "closing"
 
-# 宽限状态的存储键：`hl_close_grace:<pid>` → "<first_seen>:<rounds>"（configuration 表）。
+# 宽限状态的存储键：`hl_close_grace:<pid>` → "<first_seen>:<rounds>:<escalated>"（configuration 表）。
 # 为什么落在 DB 而不是进程内存：build_executor() 每轮新建实例、容器还会重启，
 # 宽限期必须跨轮/跨重启计时（内存版等于每轮都重新开始等 = 永远不 kill）。
 GRACE_KEY_PREFIX = "hl_close_grace:"
 GRACE_DEFAULT_S = 900.0          # 15 分钟（用户拍板）：≈ 3 个 tick 的时滞余量
 GRACE_MIN_S, GRACE_MAX_S = 300.0, 3600.0
 
+# 第三段 escalated：1 = 这个仓**已经升级过**（problem + mismatch），宽限期到此结束。
+# 为什么需要它（对抗审查 M1）：超时那一轮以前直接**删键**，下一轮键不存在 → 又走
+# 「第一次进入宽限」→ 再等满 900s → 再升级 → 删键。结果是 mismatch/closing 每 15 分钟
+# 来回翻、每轮推一条「进入宽限」、对账恢复文案把 6h 节流清零。升级是一次性判定，
+# 状态必须留在键里；旧格式（无第三段）按 0 解析，老数据照样能读。
+GRACE_ESCALATED = 1
+# 时钟回拨容差（对抗审查 L3）：first_seen 比 now 还大这么多 → 状态不可信（容器重启后
+# 宿主机时钟被校正/换了时区），重置为 now，否则 elapsed 永远是负数 → 永久 closing。
+GRACE_CLOCK_ROLLBACK_S = 60.0
+# 宽限期内**不再每轮回捞**从第几轮开始（对抗审查 L2）：回捞是 2 次交易所调用，
+# 宽限 15 分钟 ≈ 3 轮；前几轮值得试（时滞通常就一两轮），之后每轮都打只会在限频
+# 窗口里给自己找 429，之后只读本地 cache。
+GRACE_REFETCH_MAX_ROUND = 4
+
 # 窄口径自解 kill 的连续干净轮次计数（configuration 表整数）与阈值。
 # 为什么是 2 而不是 1：一轮干净可能只是「这一轮恰好没读到问题」（快照抖动、
 # 挂单接口一时返回空），连干净两轮才说明账真的自己收敛了。
 KILL_CLEAN_KEY = "hl_kill_clean_rounds"
 KILL_CLEAN_ROUNDS = 2
+# 「连续两轮」必须有**时间下限**（对抗审查 M3）：run() 是 5 分钟一轮，但手工触发、
+# 重启后的追赶 tick、脚本调 reconcile 时两次 run() 可以只隔 0.17 秒 —— 那样的「两轮」
+# 只是对同一份快照判了两次，不构成「账自己收敛了」。用上一轮计数的时刻兜住：
+# 间隔不足 KILL_CLEAN_MIN_GAP_S 的轮次**不计数也不归零**（它既不是又干净了一轮，
+# 也不是脏了），等下一个真 tick 再说。
+KILL_CLEAN_TS_KEY = "hl_kill_clean_last_ts"
+KILL_CLEAN_MIN_GAP_S = 60.0
 
 # 定点回捞成交（证据不足那一轮才发，最多 2 次、间隔 1s）：
 #   窗口起点 = opened_at − 120s（与本地 _fill_close_proof 的下界同一口径），
@@ -504,7 +525,9 @@ class Executor:
                 # 所以先用**本轮已同步的平仓成交**证明「这仓确实被交易所平掉了」：
                 # 证据成立 → 按真实成交价关账 + 挂单落终态 + 提醒，且不 kill；
                 # 证据不成立（无成交/数量不足/精度不可知/开关关）→ 严格退回原行为。
-                proof = self._fill_close_proof(r, snap, consumed_tids)
+                proof = self._fill_close_proof(
+                    r, snap, consumed_tids,
+                    allow_refetch=self._allow_refetch(r))
                 if proof is not None:
                     # 「宽限期内终于拿到证据」与「第一轮就有证据」走同一条关账路径，
                     # 唯一的区别是要把宽限键删掉（否则下一轮还会按「仍在宽限」拦开仓）。
@@ -533,6 +556,17 @@ class Executor:
                 if pend is not None:
                     closing_pending.append(pend)
                 continue
+            # 快照抖动（对抗审查 M2）：上一轮交易所没有这个仓（已进宽限），这一轮又出现了
+            # —— 那不是「被平掉了」，只是快照抖了一下。必须**把宽限时钟清零**：否则键里的
+            # first_seen 还在往前走，等它下一次真消失时 elapsed 已接近上限，第一轮就直接
+            # 升级成 mismatch + kill（把一次抖动当成了真矛盾），而这一轮明明已经证明仓还在。
+            if (r["hl_status"] or "") == HL_ST_CLOSING:
+                self._grace_clear(int(r["id"]))
+                self.db.set_pos_hl(int(r["id"]), hl_status="open")
+                self._event(EV_RECONCILE,
+                            f"{r['symbol']} 交易所侧仓位重新出现（快照抖动），"
+                            f"平仓宽限期作废、下一轮重新计时",
+                            symbol=r["symbol"], data={"pid": int(r["id"]), "coin": coin})
             # 数量对账（PR-3）：以前只比「有没有仓」，数量错了（部分成交、IOC 只成一半、
             # 手工加减仓）会一路带进 PnL。两击规则见 _size_check。
             # 传 dict(r)：_size_* 里用 .get()，而 sqlite3.Row 没有 get（会 AttributeError）。
@@ -572,7 +606,8 @@ class Executor:
 
     # ------------------------------------------------------------ 交易所侧已平仓（成交证据）
     def _fill_close_proof(self, row, snap: Optional[dict] = None,
-                          consumed: Optional[set] = None) -> Optional[dict]:
+                          consumed: Optional[set] = None,
+                          allow_refetch: bool = True) -> Optional[dict]:
         """证明该本地仓已在交易所侧被平掉：返回 {"px","sz","reason","tids","oids","source"} 或 None。
 
         **v2（对账失败自动消化）**：先用本轮已同步的 `hl_fills` 判；不够（无平仓腿 /
@@ -624,6 +659,12 @@ class Executor:
         if proof is not None:
             return {**proof, "source": "cache"}
         # ② 不足 → 定点回捞。最多 2 次、每次之后重判（拿到就停，不为「保险」多打一次）。
+        #    `allow_refetch=False`（宽限已经进行到后半程，见 _allow_refetch）→ 只认 cache：
+        #    这一轮立刻按「无证据」返回，交给宽限期继续等下一轮的 _sync_fills。
+        if not allow_refetch:
+            logger.info("[hl-exec] %s 平仓证据不足，宽限后半程不再回捞（只读本地成交）",
+                        symbol)
+            return None
         self._event(EV_RECONCILE,
                     f"{symbol} 平仓证据不足 → 定点回捞成交（最多 {REFETCH_ATTEMPTS} 次）",
                     symbol=symbol, data={"pid": int(row["id"]), "coin": coin, "qty": qty})
@@ -778,31 +819,49 @@ class Executor:
         return v
 
     def _grace_read(self, pid: int) -> Optional[dict]:
-        """读该仓的宽限状态 {"first_seen","rounds"}；没有/读不懂 → None（不抛）。"""
+        """读该仓的宽限状态 {"first_seen","rounds","escalated"}；没有/读不懂 → None（不抛）。
+
+        新格式 `<first_seen>:<rounds>:<escalated>`；**旧格式**（只有两段，宽限期第一版
+        写进生产库的那种）第三段按 0 解析 —— 升级状态只对「本版之后写入的行」有意义，
+        不能让老键在升级后读不出来而重新进宽限（那就成了 M1 的同一个坑）。
+        """
         try:
             raw = str(self.db.get_config_str(self._grace_key(pid), "") or "").strip()
         except Exception as e:                                         # noqa: BLE001
             logger.warning("[hl-exec] 读宽限状态失败（按未进入宽限处理）：%s", e)
             return None
-        if not raw or ":" not in raw:
+        if not raw:
             return None
-        head, _, tail = raw.partition(":")
+        parts = raw.split(":")
+        if len(parts) < 2:
+            return None
         try:
-            first, rounds = float(head), int(float(tail or 0))
+            first, rounds = float(parts[0]), int(float(parts[1] or 0))
         except (TypeError, ValueError):
             return None
         if first <= 0:
             return None
-        return {"first_seen": first, "rounds": max(0, rounds)}
+        escalated = 0
+        if len(parts) >= 3:
+            try:
+                escalated = GRACE_ESCALATED if int(float(parts[2] or 0)) else 0
+            except (TypeError, ValueError):
+                escalated = 0
+        return {"first_seen": first, "rounds": max(0, rounds), "escalated": escalated}
 
-    def _grace_write(self, pid: int, first_seen: float, rounds: int) -> None:
+    def _grace_write(self, pid: int, first_seen: float, rounds: int,
+                     escalated: int = 0) -> None:
         try:
-            self.db.set_config(self._grace_key(pid), f"{float(first_seen):.3f}:{int(rounds)}")
+            self.db.set_config(self._grace_key(pid),
+                               f"{float(first_seen):.3f}:{int(rounds)}:{int(escalated)}")
         except Exception as e:                                         # noqa: BLE001
             logger.warning("[hl-exec] 写宽限状态失败（本轮按未进入宽限处理）：%s", e)
 
     def _grace_clear(self, pid: int) -> None:
-        """删掉宽限键（证明成功 / 超时升级都必须删）。
+        """删掉宽限键（成交证据到位 / 快照抖动 / 关账都必须删）。
+
+        **超时升级不删**（见 `_grace_step`）：那一支改写 escalated 标记，否则下一轮
+        又当成「第一次进入宽限」（对抗审查 M1 的无限循环）。
 
         写法上做了一次兼容：`del_config` 是本轮新加的 db 方法，注入的替身 DB
         （测试/脚本）可能没有 —— 退化成写空串。空串在 `_grace_read` 里同样等于
@@ -817,14 +876,35 @@ class Executor:
         except Exception as e:                                         # noqa: BLE001
             logger.warning("[hl-exec] 清宽限状态失败（下一轮会按已超时处理）：%s", e)
 
-    def _grace_step(self, row, problems: List[str]) -> Optional[dict]:
-        """证据不足时的宽限期一步：进入 / 继续 / 超时升级。返回 closing_pending 条目或 None。
+    def _allow_refetch(self, row) -> bool:
+        """本轮是否允许定点回捞成交（对抗审查 L2）。
 
-        三种情形（规格 §2）：
+        宽限期前几轮值得回捞（时滞通常就一两轮），但**每轮都捞**是每轮多打两次
+        `userFillsByTime`：宽限期一长（我们允许到 1 小时），等于在限频窗口里主动
+        给自己攒 429，最后连对账本身都读不到数。所以第 `GRACE_REFETCH_MAX_ROUND` 轮
+        之后只读本地 cache（每轮 `_sync_fills` 仍在拉 userFills，cache 并不是死的）。
+        不在宽限里的行（第一轮就想证明）一律允许 —— 这时回捞正是该做的事。
+        """
+        if (row["hl_status"] or "") != HL_ST_CLOSING:
+            return True
+        try:
+            st = self._grace_read(int(row["id"]))
+        except Exception:                                              # noqa: BLE001
+            return True
+        if not st:
+            return True
+        return int(st["rounds"]) < GRACE_REFETCH_MAX_ROUND
+
+    def _grace_step(self, row, problems: List[str]) -> Optional[dict]:
+        """证据不足时的宽限期一步：进入 / 继续 / 超时升级 / 已升级再报。返回 closing_pending 条目或 None。
+
+        四种情形（规格 §2 + 对抗审查 M1/L3）：
         - 宽限开关关 → **完全**回到旧行为（problem + mismatch + kill），一格都不改；
         - 键不存在 → 写 first_seen、置 hl_status='closing'、记「进入宽限」事件、不 kill；
         - 键存在未超时 → 只累计轮次，不 kill（**不重复推**「进入宽限」）；
-        - 键存在已超时 → 升级：problem（→ kill）+ mismatch + 删键。
+        - 键存在已超时 → 升级：problem（→ kill）+ mismatch + **写 escalated 标记**
+          （**不删键**：删了下一轮就又「第一次进入宽限」，见下方 M1 注释）；
+        - 键已带 escalated → 只报 problem + mismatch，不重新计时、不重新推送。
         """
         pid = int(row["id"])
         symbol = str(row["symbol"])
@@ -852,7 +932,26 @@ class Executor:
             return {"position_id": pid, "symbol": symbol, "first_seen": now,
                     "elapsed_s": 0.0, "rounds": 1, "new": True, "grace_s": grace_s}
         first = float(st["first_seen"])
-        rounds = int(st["rounds"]) + 1
+        rounds = int(st["rounds"])
+        # L3 时钟回拨：first_seen 在未来（容器重启/宿主机校时/换时区之后）→ elapsed 恒为
+        # 0，这行会永远停在 closing（既不超时也不恢复）。判定状态不可信 → 从此刻重新计时，
+        # 留一条事件让人能查。
+        if first - now > GRACE_CLOCK_ROLLBACK_S:
+            self._event(EV_RECONCILE,
+                        f"{symbol} 宽限起点在 {first - now:.0f} 秒后的未来（时钟回拨），"
+                        f"重置为当前时间重新计时",
+                        symbol=symbol, data={"pid": pid, "first_seen": first, "now": now})
+            first, rounds = now, max(1, rounds)
+            self._grace_write(pid, first, rounds)
+        # M1：已经升级过 → 只报、不再进宽限。以前超时删键，下一轮又「第一次进入宽限」，
+        # 于是 mismatch/closing 每 15 分钟翻一次、每轮推一条、还把 6h 节流清零。
+        if int(st.get("escalated") or 0):
+            elapsed = max(0.0, now - first)
+            self.db.set_pos_hl(pid, hl_status="mismatch")
+            problems.append(f"{symbol} 已探测到交易所无仓，已等待 {elapsed:.0f} 秒仍未拿到"
+                            f"成交证据（{rounds} 轮重试，此前已升级为对账异常）")
+            return None
+        rounds += 1
         elapsed = max(0.0, now - first)
         if elapsed < grace_s:
             self._grace_write(pid, first, rounds)
@@ -862,14 +961,19 @@ class Executor:
                 self.db.set_pos_hl(pid, hl_status=HL_ST_CLOSING)
             return {"position_id": pid, "symbol": symbol, "first_seen": first,
                     "elapsed_s": elapsed, "rounds": rounds, "new": False, "grace_s": grace_s}
-        # 超时：升级成真矛盾 → 交人（problem → _run_locked 里 kill）
-        self._grace_clear(pid)
+        # 超时：升级成真矛盾 → 交人（problem → _run_locked 里 kill）。
+        # **不删键**（M1）：改写成 escalated=1，让这个仓稳定停在「已升级」，而不是下一轮
+        # 再从零开始等 900 秒；证明后来齐了的话，关账路径会顺手把键清掉。
+        self._grace_write(pid, first, rounds, escalated=GRACE_ESCALATED)
         self.db.set_pos_hl(pid, hl_status="mismatch")
-        msg = (f"{symbol} 已探测到交易所无仓，但 {int(grace_s // 60)} 分钟内未拿到成交证据"
-               f"（{rounds} 轮重试）")
+        # 文案用**真实 elapsed**（M2 配套）：硬写「N 分钟内」在快照抖过、时钟被重置过
+        # 的情况下会与事实不符（明明才等 30s 却写「15 分钟内」），事后复盘会被误导。
+        msg = (f"{symbol} 已探测到交易所无仓，已等待 {elapsed:.0f} 秒"
+               f"（宽限上限 {grace_s:g} 秒）仍未拿到成交证据（{rounds} 轮重试）")
         problems.append(msg)
         self._event(EV_RECONCILE, msg + " → 升级为对账异常（停手等人工核对）", symbol=symbol,
-                    data={"pid": pid, "grace_s": grace_s, "rounds": rounds, "elapsed_s": elapsed})
+                    data={"pid": pid, "grace_s": grace_s, "rounds": rounds,
+                          "elapsed_s": elapsed, "escalated": True})
         return None
 
     def closing_symbols(self) -> set:
@@ -2583,6 +2687,11 @@ class Executor:
         """
         self.db.close_position(position_id, px, reason, auto=False)
         self.db.set_pos_hl(position_id, hl_status="closed")
+        # 关账后宽限键必须清掉（对抗审查 L1）：仓已经 closed，再没有人会去读/删这个键，
+        # 它就成了 configuration 表里的永久垃圾（每个仓一条）；面板的「剩余宽限」也会
+        # 拿旧 first_seen 算出一个不存在的倒计时。这里统一清 —— 所有关账路径都走本方法，
+        # 于是「关账 → 键消失」只需要在一个地方保证。
+        self._grace_clear(int(position_id))
         try:
             self._record_fill_pnl(position_id)
         except Exception as e:                                       # noqa: BLE001
@@ -2649,11 +2758,28 @@ class Executor:
         except Exception:                                             # noqa: BLE001
             return 0
 
+    def _kill_clean_ts_read(self) -> float:
+        """上一轮**被计数**的时刻（0 = 还没有计数过）；读不懂按 0。"""
+        try:
+            return max(0.0, float(str(self.db.get_config_str(KILL_CLEAN_TS_KEY, "0") or "0")))
+        except Exception:                                             # noqa: BLE001
+            return 0.0
+
+    def _kill_clean_ts_write(self, ts: float) -> None:
+        try:
+            self.db.set_config(KILL_CLEAN_TS_KEY, f"{max(0.0, float(ts)):.3f}")
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[hl-exec] 写干净轮次时间戳失败（本轮不解除 kill）：%s", e)
+
     def _kill_clean_write(self, n: int) -> None:
         try:
             self.db.set_config(KILL_CLEAN_KEY, str(int(max(0, n))))
         except Exception as e:                                        # noqa: BLE001
             logger.warning("[hl-exec] 写干净轮次计数失败（本轮不解除 kill）：%s", e)
+        # 计数归零 = 新的一段「连续干净」开始了：连同时间戳一起清，否则新一段的第一轮
+        # 会被上一段留下的时间戳挡住（最多白等一个间隔）。
+        if int(n) <= 0:
+            self._kill_clean_ts_write(0.0)
 
     def _round_is_clean(self, rec: dict, snap: Optional[dict]) -> bool:
         """本轮算不算「干净」—— 四条全真才算，任一不满足就归零重数。
@@ -2705,8 +2831,18 @@ class Executor:
         if not self._round_is_clean(rec, snap):
             self._kill_clean_write(0)
             return alerts
+        # M3：两次「干净轮」之间必须有最小间隔。run() 正常 5 分钟一轮，但手工触发/重启
+        # 后的追赶 tick 可以只隔 0.2 秒 —— 那只是对同一份世界判了两次，凑不出「账自己
+        # 收敛了」。间隔不足：**不计数、也不归零**（这一轮既不是新的干净证据，也没脏）。
+        now = time.time()
+        last_ts = self._kill_clean_ts_read()
+        if last_ts > 0 and (now - last_ts) < KILL_CLEAN_MIN_GAP_S:
+            logger.info("[hl-exec] 干净轮间隔 %.1fs < %gs，本轮不计数（避免同一世界凑两轮）",
+                        now - last_ts, KILL_CLEAN_MIN_GAP_S)
+            return alerts
         n = self._kill_clean_read() + 1
         self._kill_clean_write(n)
+        self._kill_clean_ts_write(now)
         if not bool(getattr(self.p, "kill_autoclear", True)):
             return alerts                    # 开关关 = 永不自解（计数照记，便于观测）
         if n < KILL_CLEAN_ROUNDS:
@@ -2764,8 +2900,18 @@ class Executor:
             if not rec.get("unknown"):
                 # origin='reconcile'：只有这类 kill 允许被「连续 N 轮干净」自动解除
                 # （见 _maintain_kill_autoclear）。人工/熔断/数量/到期永不自解。
-                self.db.hl_set_kill(True, "对账异常", origin="reconcile")
-                self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
+                # H1（对抗审查）：**已经在 kill 态时不改写 origin**。以前这里无条件写，
+                # 于是「人工 kill → 某轮对账异常 → origin 被改写成 reconcile → 世界变干净
+                # → 窄口径自解」—— 人工 kill 就这么被悄悄解除了，违反「人工 kill 永不
+                # 自动解」。与数量对账（_size_check 同一守卫）同口径：只告警、不动 kill。
+                if kill_before:
+                    self._event(EV_KILL,
+                                "对账异常（kill 已处于触发状态，保留原 origin=%s，"
+                                "不改写、不自动解除）" % (self.db.hl_kill_origin() or "unknown"),
+                                data={"origin_before": self.db.hl_kill_origin()})
+                else:
+                    self.db.hl_set_kill(True, "对账异常", origin="reconcile")
+                    self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
             # 告警去重：kill 态下每轮 run() 都会走到这里（5 分钟一轮），
             # 同一状态只推送一次 + 每 6 小时提醒一次仍在等人工；恢复由下方 else 分支报告。
             key = "hl_recon_alert_at"
@@ -2798,7 +2944,10 @@ class Executor:
             # 对账恢复正常：清掉告警节流标记（下次异常立即推送），并告知一次
             if float(self.db.get_config_str("hl_recon_alert_at") or 0) > 0:
                 self.db.set_config("hl_recon_alert_at", "0")
-                if not rec.get("unconfirmed"):
+                # L5（对抗审查）：宽限期还在进行（closing_pending 非空）时**不许**报
+                # 「对账已恢复正常」。problems 为空只说明「暂时没有矛盾」，不是「账已对上」：
+                # 对着一个还在等成交证据的仓说恢复，用户刚放心，下一刻就超时 kill。
+                if not rec.get("unconfirmed") and not rec.get("closing_pending"):
                     alerts.append("【HL执行】✅ 对账已恢复正常")
             # 数量对账处于「观察期」（首次超差、已回捞、未到两击）→ 不写「对账一致」：
             # 明明有未解释的数量差，日志说一致会误导事后复盘。
@@ -2818,14 +2967,17 @@ class Executor:
             else:
                 self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
 
-        # 宽限期提醒频控（规格 §2.5）：进入宽限推 1 条；同一仓**不重复推**进入宽限
-        # （`new` 只在第一次写宽限键时为真）；恢复由下面 fill_closed 那条推。
+        # 宽限期提醒（规格 §2.5）：进入宽限**只推 1 条**，且由 `_grace_step` 的
+        # 「第一次写宽限键」那一支负责推 —— 这里以前又拼了一条几乎一样的文案，同一件事
+        # 推两遍（短信箱里两条「已进入宽限」，人会以为是两个仓）。同一仓后续轮次
+        # new=False，本来也不推。保留这段循环只为留一条诊断事件（不推送）。
         for cp in rec.get("closing_pending") or []:
             if not cp.get("new"):
                 continue
-            alerts.append(f"【HL执行】⏳ {cp['symbol']} 交易所侧已无该仓，平仓成交待核对 —— "
-                          f"已进入宽限（最多 {int(cp['grace_s'] // 60)} 分钟，每轮自动重试），"
-                          f"暂不暂停自动交易；该标的宽限期内不开新仓。")
+            self._event(EV_RECONCILE,
+                        f"{cp['symbol']} 宽限开始（最迟 {int(cp['grace_s'] // 60)} 分钟后"
+                        f"升级为对账异常；该标的宽限期内不开新仓）",
+                        symbol=cp["symbol"], data={"pid": cp.get("position_id")})
 
         # 窄口径自动解 kill（规格 §4）：只对**对账自己造成的** kill 生效。
         alerts.extend(self._maintain_kill_autoclear(rec, snap))

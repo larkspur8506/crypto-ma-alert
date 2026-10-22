@@ -871,9 +871,29 @@ def _kill(db: Any, reason: str, log_event: Optional[Callable[..., None]] = None)
 
     origin='expiry'：到期保护清仓造成的 kill 是**人工确认类**的停手
     （钱包快到期，本来就该由人接手），永不自动解除。
+
+    H2（对抗审查）：以前「已 kill 就直接 return」，于是**当时的 origin 说了算**。如果
+    恰好是上一轮对账异常拉起的 kill（origin='reconcile'），到期保护既没把它升级成
+    expiry，又照常清仓把世界弄干净 —— 两轮之后窄口径自动解 kill，一个「该由人接手」
+    的停手被静默解除。所以：已 kill 时**只允许把 origin 从 reconcile 升级为 expiry**，
+    其它来源（manual / size / daily_loss）一律不动（那些本来就永不自解，也不该被
+    到期保护改写归因）。绝不在这里解除 kill。
     """
     try:
         if db.hl_kill():
+            origin = ""
+            try:
+                origin = str(db.hl_kill_origin() or "")
+            except Exception as e:                                # noqa: BLE001
+                logger.warning("[agent] 读 kill 来源失败（按人工 kill 处理，不升级）：%s", e)
+            if origin != "reconcile":
+                # 人工/熔断/数量造成的 kill：不动 origin、不重复写，只留一条日志便于复盘
+                logger.info("[agent] 到期保护：kill 已由 origin=%s 拉起，不升级归因",
+                            origin or "unknown")
+                return
+            db.hl_set_kill(True, reason, origin="expiry")
+            if log_event is not None:
+                log_event("kill", f"agent 到期保护：{reason}（origin reconcile → expiry）")
             return
         db.hl_set_kill(True, reason, origin="expiry")
         if log_event is not None:

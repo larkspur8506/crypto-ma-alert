@@ -142,10 +142,28 @@ class GraceBase(unittest.TestCase):
             f"{GRACE_KEY_PREFIX}{self.pid if pid is None else pid}", "") or "")
 
     def grace_age(self, seconds: float, pid=None) -> None:
-        """把宽限起点改到 `seconds` 秒前（模拟「已经等了一会儿」）。"""
+        """把宽限起点改到 `seconds` 秒前（模拟「已经等了一会儿」）。
+
+        写的是**旧格式**（两段，无 escalated）—— 生产库里上一版留下的键就是这个形状，
+        所以这也是「老键必须还能读」的回归输入。
+        """
         pid = self.pid if pid is None else pid
         first = time.time() - seconds
         self.db.set_config(f"{GRACE_KEY_PREFIX}{pid}", f"{first:.3f}:3")
+
+    def clean_world(self) -> None:
+        """本地无仓、交易所无仓无挂单（对账必然 ok）。"""
+        self.db.conn.execute("DELETE FROM positions")
+        self.db.conn.commit()
+        self.info._snap = _snap(equity=987.3, positions=[], orders=[])
+
+    def bump_clean_gap(self, seconds: float = 61.0) -> None:
+        """把「上一轮计数时刻」拨回 `seconds` 秒前（模拟一个真实的 5 分钟 tick 间隔）。
+
+        M3 之后「连续两轮干净」有 60s 时间下限；测试里两次 run() 相隔毫秒，不拨这个
+        时间戳的话第二轮本来就不该计数（那正是新用例要钉的行为）。
+        """
+        self.db.set_config("hl_kill_clean_last_ts", f"{time.time() - seconds:.3f}")
 
 
 class TestEvidenceV2(GraceBase):
@@ -339,7 +357,12 @@ class TestGracePeriod(GraceBase):
         self.assertNotIn("对账异常", self.alerts_text())
 
     def test_grace_timeout_escalates_to_problem_and_kill(self):
-        """5. 宽限超时（first_seen 改到 1000s 前）→ problem + kill + mismatch + 删键。"""
+        """5. 宽限超时（first_seen 改到 1000s 前）→ problem + kill + mismatch + 升级标记。
+
+        对抗审查 M1 之后**不再删键**：键改写为 `<first_seen>:<rounds>:1`（escalated），
+        否则下一轮又会「第一次进入宽限」，无限循环。文案也改成真实 elapsed（M2 配套），
+        不再是硬写的「15 分钟内」。
+        """
         self.info._fills = []
         ex = self.executor()
         ex.run()
@@ -352,9 +375,12 @@ class TestGracePeriod(GraceBase):
         self.assertEqual(row["hl_status"], "mismatch")
         self.assertEqual(row["status"], "open")
         self.assertTrue(self.db.hl_kill(), "超时必须升级成对账异常")
-        self.assertEqual(self.grace_raw(), "", "升级后宽限键必须删掉")
+        raw = self.grace_raw()
+        self.assertNotEqual(raw, "", "超时不许删键（删了下一轮又从零进宽限 → M1 死循环）")
+        self.assertEqual(raw.split(":")[2], "1", "第三段 escalated 必须置 1")
         text = "\n".join(alerts) + self.alerts_text()
-        self.assertIn("15 分钟内未拿到成交证据", text)
+        self.assertIn("仍未拿到成交证据", text)
+        self.assertIn("已等待 10", text, "升级文案必须用真实 elapsed")
         self.assertIn("对账异常", text)
         self.assertEqual(self.db.hl_kill_origin(), "reconcile")
 
@@ -425,18 +451,19 @@ class TestKillAutoclear(GraceBase):
 
     def _clean_world(self):
         """本地无仓、交易所无仓无挂单（对账必然 ok）。"""
-        self.db.conn.execute("DELETE FROM positions")
-        self.db.conn.commit()
-        self.info._snap = _snap(equity=987.3, positions=[], orders=[])
+        self.clean_world()
 
     def test_autoclear_after_two_clean_rounds(self):
-        """13. origin=reconcile + 连续 2 轮 clean → 解除并推 1 条。"""
+        """13. origin=reconcile + 连续 2 轮 clean（且间隔 ≥60s）→ 解除并推 1 条。"""
         self._clean_world()
         self.db.hl_set_kill(True, "对账异常", origin="reconcile")
         ex = self.executor()
 
         ex.run()
         self.assertTrue(self.db.hl_kill(), "第 1 轮干净不够（阈值 %d）" % KILL_CLEAN_ROUNDS)
+        # M3：两轮之间必须有时间下限（真实 tick 是 5 分钟一轮）。测试里两次 run() 相隔
+        # 毫秒，把「上一轮计数时刻」拨回 61 秒前，才等价于第二个真 tick。
+        self.bump_clean_gap()
         alerts = ex.run()
 
         self.assertFalse(self.db.hl_kill(), "连续 2 轮干净应自动解除")
@@ -538,6 +565,234 @@ class TestSwitchesOff(GraceBase):
         self.assertEqual(self.row()["status"], "open")
         self.assertEqual(self.row()["hl_status"], "mismatch")
         self.assertTrue(self.db.hl_kill())
+
+
+class TestGraceEscalationSticky(GraceBase):
+    """⑦ 对抗审查 M1：升级是**一次性判定**，不许超时后重进宽限（无限循环）。"""
+
+    def test_escalated_grace_never_reenters_or_repushes(self):
+        self.info._fills = []
+        ex = self.executor()
+        ex.run()                                     # 进宽限（第 1 轮）
+        enters0 = len([m for m in self.notifier.messages if "进入宽限" in m])
+        self.assertEqual(enters0, 1, "第一次进宽限只推 1 条（不许 _run_locked 再推一条）")
+        events0 = len([m for m in self.events() if "进入宽限" in m])
+
+        self.grace_age(1000)
+        ex.run()                                     # 超时 → 升级 + kill
+        self.assertTrue(self.db.hl_kill())
+        self.assertEqual(self.row()["hl_status"], "mismatch")
+        self.assertEqual(len([m for m in self.notifier.messages if "进入宽限" in m]), enters0,
+                         "升级那一轮不许再推「进入宽限」")
+
+        for _ in range(3):                           # 之后每一轮都只报异常
+            ex.run()
+
+        self.assertEqual(len([m for m in self.notifier.messages if "进入宽限" in m]), enters0,
+                         "已升级的仓不许再推「进入宽限」")
+        self.assertEqual(len([m for m in self.events() if "进入宽限" in m]), events0,
+                         "已升级的仓不许再记「进入宽限」")
+        row = self.row()
+        self.assertEqual(row["hl_status"], "mismatch", "状态不许在 mismatch/closing 之间来回翻")
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(self.grace_raw().split(":")[2], "1", "escalated 标记必须留着")
+        self.assertTrue(self.db.hl_kill())
+
+    def test_clock_rollback_resets_instead_of_sticking_forever(self):
+        """L3：first_seen 在 90 秒后的未来 → 视为无效状态、重置为 now（不能永久 closing）。"""
+        self.info._fills = []
+        pid = self.pid
+        self.db.set_config(f"{GRACE_KEY_PREFIX}{pid}",
+                           f"{time.time() + 90:.3f}:2")
+        ex = self.executor()
+        rec = ex.reconcile(_snap(equity=987.3, positions=[], orders=[]))
+
+        self.assertEqual(len(rec["closing_pending"]), 1, "回拨后仍应在正常宽限里（elapsed≈0）")
+        self.assertAlmostEqual(rec["closing_pending"][0]["elapsed_s"], 0.0, delta=5.0)
+        self.assertEqual(self.row()["hl_status"], "closing")
+        self.assertTrue(any("时钟回拨" in m for m in self.events()), "重置必须留事件")
+        # 新起点 ≈ now（不是未来那个值）
+        first = float(self.grace_raw().split(":")[0])
+        self.assertLess(abs(first - time.time()), 30.0)
+        self.assertFalse(self.db.hl_kill())
+
+
+class TestGraceSnapshotFlap(GraceBase):
+    """⑧ 对抗审查 M2：仓位在交易所「又出现」= 快照抖动 → 宽限时钟必须清零。"""
+
+    def test_position_reappears_resets_clock_and_status(self):
+        self.info._fills = []
+        ex = self.executor()
+        ex.run()                                     # 进宽限
+        self.grace_age(800)                          # 已经等了 800s（离 900 只差 100s）
+        self.assertEqual(self.row()["hl_status"], "closing")
+
+        # 仓位又出现在交易所（快照抖动）：这一轮必须清键 + 回到 open + 记事件
+        self.info._snap = _snap(equity=987.3,
+                                positions=[_pos(coin="BTC", size=QTY, entry=ENTRY)],
+                                orders=[_stop_order(coin="BTC", trigger=STOP)])
+        rec = ex.reconcile(_snap(equity=987.3, positions=[_pos(coin="BTC", size=QTY, entry=ENTRY)],
+                                 orders=[_stop_order(coin="BTC", trigger=STOP)]))
+        self.assertTrue(rec["ok"], f"仓位回来了不该报异常：{rec['problems']}")
+        self.assertEqual(self.row()["hl_status"], "open")
+        self.assertEqual(self.grace_raw(), "", "抖动时必须清键（否则时钟继续走）")
+        self.assertTrue(any("重新出现" in m for m in self.events()), "抖动必须留事件")
+
+        # 下一次真的消失：从零开始计时（第 1 轮、new=True），而不是立刻升级
+        self.info._snap = _snap(equity=987.3, positions=[], orders=[])
+        rec2 = ex.reconcile(_snap(equity=987.3, positions=[], orders=[]))
+        self.assertEqual(len(rec2["closing_pending"]), 1)
+        cp = rec2["closing_pending"][0]
+        self.assertEqual(cp["rounds"], 1, "重新计时 → 轮次从 1 开始")
+        self.assertTrue(cp["new"])
+        self.assertFalse(self.db.hl_kill(), "抖动前的 800s 不许被算进这一次的宽限")
+
+
+class TestKillOriginHygiene(GraceBase):
+    """⑨ 对抗审查 H1/H2/L6/M3：kill 的归因与解除必须是「只升不降、只对自家有效」。"""
+
+    def test_manual_kill_not_overwritten_by_reconcile_problem(self):
+        """H1：人工 kill 期间遇到对账异常 → origin 保持 manual，世界变干净也不解。"""
+        self.db.hl_set_kill(True, "人工", origin="manual")
+        self.info._fills = []
+        ex = self.executor(close_grace=False)        # 差证据 → 直接 problem
+        ex.run()
+        self.assertEqual(self.db.hl_kill_origin(), "manual",
+                         "对账异常不许把人工 kill 改写成 reconcile")
+        self.assertTrue(self.db.hl_kill())
+
+        # 世界变干净（本地仓被人工关掉）：连续多轮干净也不许自解
+        self.clean_world()
+        ex2 = self.executor()
+        ex2.run()
+        self.bump_clean_gap()
+        ex2.run()
+        ex2.run()
+        self.assertTrue(self.db.hl_kill(), "人工 kill 永不自动解")
+        self.assertEqual(self.db.hl_kill_origin(), "manual")
+
+    def test_expiry_promotes_reconcile_kill_to_expiry(self):
+        """H2：到期保护遇到 origin=reconcile 的 kill → 升级为 expiry，之后不再被自动解。"""
+        from app.hl import agent as hl_agent
+
+        self.clean_world()
+        self.db.hl_set_kill(True, "对账异常", origin="reconcile")
+        hl_agent._kill(self.db, "agent 到期保护：清仓前先暂停开新仓",
+                       lambda *a, **k: None)
+
+        self.assertTrue(self.db.hl_kill())
+        self.assertEqual(self.db.hl_kill_origin(), "expiry",
+                         "到期保护必须把 reconcile 升级为 expiry")
+        self.assertEqual(self.db.get_config_str("hl_exec_kill_reason"),
+                         "agent 到期保护：清仓前先暂停开新仓")
+
+        ex = self.executor()
+        ex.run()
+        self.bump_clean_gap()
+        ex.run()
+        self.assertTrue(self.db.hl_kill(), "到期 kill 永不自解（清仓后世界干净也不行）")
+        self.assertEqual(self.db.hl_kill_origin(), "expiry")
+
+    def test_expiry_does_not_rewrite_manual_kill(self):
+        """H2 的另一半：人工 kill 的归因不许被到期保护改写。"""
+        from app.hl import agent as hl_agent
+
+        self.db.hl_set_kill(True, "人工", origin="manual")
+        hl_agent._kill(self.db, "agent 到期保护", None)
+        self.assertTrue(self.db.hl_kill())
+        self.assertEqual(self.db.hl_kill_origin(), "manual")
+        self.assertEqual(self.db.get_config_str("hl_exec_kill_reason"), "人工")
+
+    def test_autoclear_clears_kill_reason(self):
+        """L6：自动解 kill 时原因必须一起清空（否则面板/看守解释一个不存在的停手）。"""
+        self.clean_world()
+        self.db.hl_set_kill(True, "对账异常", origin="reconcile")
+        ex = self.executor()
+        ex.run()
+        self.bump_clean_gap()
+        alerts = ex.run()
+
+        self.assertFalse(self.db.hl_kill())
+        self.assertEqual(str(self.db.get_config_str("hl_exec_kill_reason") or ""), "",
+                         "解除后 reason 必须被清空")
+        self.assertEqual(len([m for m in alerts if "已自动恢复自动交易" in m]), 1)
+
+    def test_second_clean_round_too_soon_is_not_counted(self):
+        """M3：两次干净轮间隔 <60s → 不计数、也不归零（不能靠连点凑两轮）。"""
+        self.clean_world()
+        self.db.hl_set_kill(True, "对账异常", origin="reconcile")
+        ex = self.executor()
+
+        ex.run()                                     # 计数 1，记时间戳
+        self.assertEqual(str(self.db.get_config_str("hl_kill_clean_rounds", "0")), "1")
+        ex.run()                                     # 毫秒级间隔 → 不计数
+        self.assertEqual(str(self.db.get_config_str("hl_kill_clean_rounds", "0")), "1",
+                         "间隔不足：不计数，也不归零")
+        self.assertTrue(self.db.hl_kill(), "同一世界判两次不算「连续两轮干净」")
+
+        self.bump_clean_gap()                        # 真正的下一个 tick
+        ex.run()
+        self.assertFalse(self.db.hl_kill(), "间隔够了才解除")
+
+
+class TestGraceHousekeeping(GraceBase):
+    """⑩ 对抗审查 L1/L2/L5：垃圾键、限频、以及「宽限中别说已恢复」。"""
+
+    def test_close_local_clears_grace_key(self):
+        """L1：关账后宽限键必须消失（否则 configuration 表永久残留）。"""
+        self.info._fills = []
+        ex = self.executor()
+        ex.run()
+        self.assertNotEqual(self.grace_raw(), "")
+
+        ex._close_local(self.pid, FILL_PX, "stop", QTY)
+
+        self.assertEqual(self.grace_raw(), "", "关账必须清宽限键")
+        self.assertEqual(self.row()["status"], "closed")
+        self.assertEqual(self.row()["hl_status"], "closed")
+
+    def test_late_grace_stops_refetching(self):
+        """L2：宽限第 4 轮之后只读 cache（不再每轮打 userFillsByTime）。"""
+        self.info._fills = []
+        self.info.by_time = [[]]                     # 回捞永远拿不到证据（仓必须还挂着）
+        ex = self.executor()
+        ex.run()                                     # 第 1 轮
+        self.assertTrue(self.info.by_time_calls, "前几轮应当回捞（时滞通常一两轮）")
+
+        pid = self.pid
+        self.info.by_time_calls.clear()
+        self.db.set_config(f"{GRACE_KEY_PREFIX}{pid}", f"{time.time() - 100:.3f}:4")
+        rec = ex.reconcile(_snap(equity=987.3, positions=[], orders=[]))
+
+        self.assertEqual(self.info.by_time_calls, [], "宽限后半程不许再打接口")
+        self.assertEqual(len(rec["closing_pending"]), 1, "仍应在宽限中（不升级、不关账）")
+        self.assertEqual(self.row()["status"], "open")
+
+    def test_no_recovery_alert_while_grace_running(self):
+        """L5：closing_pending 非空时不许推「对账已恢复正常」。"""
+        self.info._fills = []
+        ex = self.executor()
+        ex.run()                                     # 进宽限
+        self.db.set_config("hl_recon_alert_at", f"{time.time():.0f}")   # 上一次告警节流在
+
+        alerts = ex.run()
+
+        self.assertNotIn("对账已恢复正常", "\n".join(alerts),
+                         "宽限期还在进行时不许说「已恢复正常」")
+        self.assertEqual([a for a in alerts if "对账已恢复正常" in a], [])
+
+    def test_recovery_alert_returns_after_grace_resolved(self):
+        """对照：宽限结束（证据到齐、关账）后恢复文案照常推。"""
+        self.info._fills = []
+        ex = self.executor()
+        ex.run()
+        self.db.set_config("hl_recon_alert_at", f"{time.time():.0f}")
+
+        self.info._fills = _fills()                  # 成交到了
+        alerts = ex.run()
+
+        self.assertEqual(self.row()["status"], "closed")
+        self.assertIn("对账已恢复正常", "\n".join(alerts))
 
 
 class TestPanelWording(unittest.TestCase):

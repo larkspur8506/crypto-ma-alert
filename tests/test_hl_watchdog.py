@@ -124,6 +124,25 @@ class TestProblems(Base):
         self._set_hl_status(pid, "mismatch")
         self.assertIn("mismatch", " ".join(self.bad(self.checks())))
 
+    def test_closing_row_listed_but_not_shouted(self):
+        """L4（对抗审查）：closing（平仓成交待核对）必须出现在报告里，但**不当异常喊**。
+
+        以前它两头都不报：mismatch 分行不收它、「本地有仓但交易所查不到」只认
+        hl_status='open' —— 宽限期里的仓在看守报告里彻底消失。
+        """
+        self._heartbeat()
+        pid = self.db.create_position(symbol="BTC_USDT", signal_bar_ms=1, side=1, entry_price=1.0,
+                                      stop_price=0.9, stop_dist=0.1, contracts=1, coin_qty=1.0,
+                                      notional=1.0, risk_u=1.0, equity_at_entry=100.0)
+        self.db.confirm_position(pid, 1.0, 1, 0.9, True)
+        self._set_hl_status(pid, "closing")
+
+        notes = self.checks(force=True)
+        joined = " ".join(notes)
+        self.assertIn("平仓待核对", joined)
+        self.assertEqual(self.bad(notes), [], "closing 是已知状态，不许当异常喊")
+        self.assertIn("· ", [n[:2] for n in notes if "平仓待核对" in n][0])
+
     def test_recent_failures(self):
         self.db.hl_record_intent("BTC_USDT", "BTC", 1791900000000, "entry", 1, sz=0.01)
         self.db.hl_record_intent("ETH_USDT", "ETH", 1791900000000, "entry", 1, sz=0.1)
