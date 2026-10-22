@@ -31,6 +31,7 @@
 | `HL_DEADMAN_MINUTES` | 死手开关窗口（每分钟自动续期） | 30 |
 | `HL_MIN_NOTIONAL` | 交易所最小名义 | 10.0 |
 | `HL_CHURN_MAX` | 同一 coin-side 10 分钟内撤单/改价重挂达这次数就停手（0 = 关闭熔断）。DB `hl_churn_max` 优先 | 5 |
+| `HL_FILL_CLOSE` | 交易所侧已平仓时按成交价自动关账（见 §6 B 前的「止损已成交」小节）。DB `hl_fill_close` 优先 | `1`（开） |
 
 改 env 必须 `docker compose up -d` 重建（容器不热读 env）；改 `hl_exec_mode` / kill 走面板或 DB，立即生效。
 
@@ -144,6 +145,12 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 ### B. 对账 mismatch（`hl_events` 有「对账异常」）
 执行器会**自动 kill**（停止新开仓）。处理：① 用 §4 的 `clearinghouseState` 看真实仓位；② 与本地 `positions` 表核对；③ 人工把仓位与本地记录对齐（平掉多余的仓 / 在确认页补录）；④ 面板解除 kill 前，先确认 `hl_orders` 里没有卡在 `intent/sent` 的单。
 
+#### 止损/人工已在交易所平仓（`hl_fill_close`，默认开）
+对账发现「本地有仓、交易所无仓」时，**先**用本轮已同步的 `hl_fills` 自证仓位已平：成交必须是开仓后（`opened_at−120s` 起）、`reduce_only`/`Close` 腿、合计数量落在「持仓量（`hl_sz`，回落 `actual_contracts`）± 1 tick」区间内（**低于** = 只平了一部分；**高于** = 窗口里混进了不属于这仓的成交，账不可归因）。全部满足才按**加权成交均价**关账（`exit_reason` = 全部成交出自 `hl_stop_oid` → `stop`，否则 `exchange`）、把对应挂单落 `filled`、推一条提醒，且**不** kill；任一条件不满足（无成交/数量不足或超额/精度不可知/oid 不明）完全退回旧行为（mismatch + kill）。
+`exit_reason=exchange`（人工/外部平掉，止损单没成交）时，执行器会顺手撤掉该 symbol 仍 `resting/sent` 的止损类挂单（`stop` / `stop:fix` / `exit:rehang`，只撤有明确 oid 的行）并落 `cancelled` —— 否则那张孤儿 reduce-only 单会把下一次开仓平掉。撤单失败：行保持 `resting` + `hl_events` 记 error + 推一条告警，需人工到 HL 撤单。
+面板「策略与保护」可关掉该开关（DB `hl_fill_close=0`）：**两条路径一起**回到旧行为 —— 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效（mismatch 行直接让出接管权，引擎走人工提醒流）。关掉后止损成交只能人工补录，别指望 4h 收盘的 `on_exit` 代关。
+两条容易踩的边界（对抗审查后收紧）：① **挂单落 `filled` 只认 oid 相等** —— 成交里没有 oid（升级前已同步的老成交恒为 NULL）时一行都不改，只记一条 `hl_events`（候选来自 `hl_recent_orders` 的跨 bar 扫描，「恰好一行」也可能是别的仓那张没成交的止损）；② `on_exit` 的止损关账**必须有 `Close` 腿**，只有开仓腿时 `_last_fill_px` 返回 `None`（不再拿开仓价冒充成交价）→ mismatch 行让出接管权、不关账；同一轮对账里一批成交只归一个仓（tid 已消耗即 fail-closed）。
+
 ### B2. 数量对账不一致（`hl_events` 有「数量对账」/「持仓数量对账不一致」）
 reconcile 除了比「有没有仓 / 有没有止损」，还比**数量**：本地 `hl_fills` 的净量
 （ΣOpen − ΣClose，窗口 `opened_at−300s` 至今）对交易所 `szi`，容差 1 tick
@@ -159,6 +166,10 @@ strike 计数只在进程内存里（重启清零），且按 (仓位, 标的) �
 本地 `hl_sz` 错要人工核对（执行器的止损量是按下单时 `hl_sz` 挂的，量错了保护也是错的）；
 ④ 若确认是「本地流水缺数据」而非真错仓，回捞会把成交补进 `hl_fills` → 下一轮自动清零
 strike，再解除 kill 即可。
+
+容差用的 `szDecimals` 来自 `meta`（一次真实 POST），按 (info 对象, coin) 在进程内缓存
+**1 小时**、失败不缓存（对抗审查 M6：执行器不健康时这一步原本每 5 分钟打一次 + 3 次重试）。
+交易所若真的调整了某标的精度，最多 1 小时内仍按旧 tick 判容差；怀疑精度变了就重启进程。
 
 ### B3. 关账净额差异（`hl_events` 有「关账口径差异」）
 每笔关账都会用 `hl_fills` 聚合出流水口径净额（`positions.net_pnl`），并与本地价差口径

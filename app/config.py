@@ -65,6 +65,11 @@ class Config:
     # app/hl/executor.py:ExecParams.pnl_from_fills（先观测差异、再切换读数）。
     # net_pnl 列两态都写，开关只影响「读哪个数」，不丢数据、可回滚。
     hl_pnl_from_fills: bool = _env("HL_PNL_FROM_FILLS", "0").lower() in ("1", "true", "yes", "on")
+    # 交易所侧已平仓 → 对账时按成交价关账（2026-10-22 事故修复）。**默认开**：
+    # 交易所挂单止损触发后本地不关账，旧逻辑会让下一轮对账误判 mismatch 并 kill。
+    # 开 = 对账先拿已同步的平仓成交自证，证据严格成立才关账；不成立完全退回旧行为
+    # （fail-closed）。设 0 即回到旧行为（应急回滚，与 hl_pnl_from_fills 同处可热改）。
+    hl_fill_close: bool = _env("HL_FILL_CLOSE", "1").lower() in ("1", "true", "yes", "on")
     # churn 熔断阈值（PR-4）：同一 coin-side 在 10 分钟内撤单/改价重挂达到这次数就停手。
     # 0 = 关闭熔断（只留 15s 静置闸门）。默认 5 —— 正常修复不会到 5 次，到了就是
     # 「止损挂不上 → 撤 → 重挂」的循环，继续试只会制造更多无保护瞬间。
@@ -101,7 +106,8 @@ class Config:
     OVERRIDABLE = ("equity", "risk_pct", "leverage", "stop_min", "stop_max",
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
-                   "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max")
+                   "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max",
+                   "hl_fill_close")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让

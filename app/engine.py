@@ -311,7 +311,8 @@ def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms:
     r = (exit_price - entry) / risk if pos.side == 1 else (entry - exit_price) / risk
     r = r if risk > 0 else 0.0
     ma_note = "4h 收盘跌破 SMA20" if pos.side == 1 else "4h 收盘站上 SMA20"
-    why = {"stop": "触发止损单", "ma20": ma_note, "manual": "手动平仓"}.get(reason, reason)
+    why = {"stop": "触发止损单", "ma20": ma_note, "manual": "手动平仓",
+           "exchange": "交易所侧已平仓（人工/外部）"}.get(reason, reason)
     # 止损是**交易所已成交**的事件，不能再说「4 小时内市价平仓」——照做等于反手开新仓。
     if reason == "stop":
         head = "止损补报" if stale else "止损提醒"
@@ -764,6 +765,10 @@ def _exit_reason_plain(reason, side) -> str:
         return "价格收上均线，正常离场" if _side_word(side) == "做空" else "价格收下均线，正常离场"
     if r == "stop":
         return "触发止损"
+    if r == "exchange":
+        # 交易所侧已被平掉（人工/外部端下单），不是策略离场也不是止损 —— 说清楚，
+        # 免得周报/面板把它读成「正常离场」。
+        return "交易所侧已平仓（人工/外部）"
     if r in ("agent_expiry_cleanup", "expiry_cleanup"):
         return "API 到期保护清仓"
     return r or "原因未记录"

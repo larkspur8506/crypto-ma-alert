@@ -131,6 +131,10 @@ def hl_params():
         # 净 PnL 口径（PR-3）：默认关。DB > env（Config.apply_db 已解析好），
         # 与 fill_push 同一种「从面板配置读布尔」的模式。
         pnl_from_fills=bool(getattr(cfg, "hl_pnl_from_fills", False)),
+        # 交易所侧已平仓 → 对账按成交价关账（2026-10-22 事故修复）：DB > env > 默认开。
+        # 缺键/脏值一律按「开」（这正是修复本身；关掉它等于回到误 kill 的旧行为），
+        # 与 pnl_from_fills 同一种「从面板配置读布尔」的装配模式。
+        fill_close=bool(getattr(cfg, "hl_fill_close", True)),
         # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
         # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
         churn_max=_churn_max(cfg),
@@ -778,6 +782,15 @@ def _status_label(row) -> str:
             "ignored": "已忽略"}.get(row["status"], row["status"])
 
 
+def _exit_label(row) -> str:
+    """离场原因 → 中文（与 engine 面板/周报同一映射，单一来源在 engine）。
+
+    M8：这里以前直接印 `row['exit_reason']`，`exchange` 这种新枚举值就以英文原样
+    出现在摘要页/确认页上；与 `stop`/`ma20` 同风格翻译，未知值由 engine 兜底原文。
+    """
+    return engine._exit_reason_plain(row["exit_reason"], row["side"])
+
+
 def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     """只读摘要页：只显示当前记录 + 显式入口（修改 / 手动平仓）。"""
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
@@ -792,7 +805,7 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
         f"入场 <b>{entry:,.2f}</b>｜止损 <b>{stop:,.2f}</b>｜{qty:g} {qty_unit}",
     ]
     if row["status"] == "closed":
-        lines.append(f"离场 <b>{row['exit_price'] or 0:,.2f}</b>（{row['exit_reason']}）"
+        lines.append(f"离场 <b>{row['exit_price'] or 0:,.2f}</b>（{_exit_label(row)}）"
                      f"｜本次 <b>{row['r_multiple'] or 0:+.2f}R</b>")
         if row["auto_closed"] and not is_hl:
             lines.append("<span class='muted'>离场价是系统按参考价记录的；"
@@ -827,7 +840,7 @@ def _close_form(row, request: Request = None) -> HTMLResponse:
     hint = ""
     if row["status"] == "closed":
         hint = (f"<p class='muted'>当前记录：离场价 <b>{row['exit_price'] or 0:,.2f}</b>"
-                f"（{row['exit_reason']}，约 {row['r_multiple'] or 0:+.2f}R）。"
+                f"（{_exit_label(row)}，约 {row['r_multiple'] or 0:+.2f}R）。"
                 "保存后按新价重算 R。</p>")
     body = f"""
     <h1>录入平仓 #{row['id']}</h1>
@@ -845,6 +858,7 @@ def _close_form(row, request: Request = None) -> HTMLResponse:
           <option value='ma20' {'selected' if row['exit_reason'] == 'ma20' else ''}>收到提醒后平仓</option>
           <option value='stop' {'selected' if row['exit_reason'] == 'stop' else ''}>止损单被触发</option>
           <option value='manual' {'selected' if row['exit_reason'] == 'manual' else ''}>手动提前平</option>
+          <option value='exchange' {'selected' if row['exit_reason'] == 'exchange' else ''}>交易所侧已平仓（人工/外部）</option>
         </select></p>
       <button type='submit'>保存平仓价</button>
     </form>
