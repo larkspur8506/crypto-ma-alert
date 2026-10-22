@@ -280,9 +280,9 @@ class TestSyncBeforeReconcile(FillCloseBase):
         seen = {}
         orig = ex._fill_close_proof
 
-        def spy(row, snap=None):
+        def spy(row, snap=None, consumed=None):
             seen["fills_in_db"] = len(self.db.hl_recent_fills(50))
-            return orig(row, snap)
+            return orig(row, snap, consumed)
 
         ex._fill_close_proof = spy            # 实例属性覆盖绑定方法，不碰类
         ex.run()
@@ -457,6 +457,245 @@ class TestMismatchStopExit(FillCloseBase):
         self.assertEqual(row["status"], "open")
         self.assertEqual(row["hl_status"], "mismatch")
         self.assertEqual(self.ex.calls, [])
+
+
+class TestM1NoOidDoesNotMarkAnyOrder(FillCloseBase):
+    """M1（高危）：成交没有 oid 时，任何挂单行都不得被写成 filled。
+
+    候选来自 ``hl_recent_orders(100)`` 的**全标的、跨 bar** 扫描 —— 「恰好一行候选」
+    完全可能是别的仓/别的 bar 上那张**没成交**的止损。升级前已同步的成交 oid 恒为
+    NULL（`hl_fills.tid` UNIQUE + INSERT OR IGNORE，迁移只补列不回填），所以老的
+    「恰好一行就落」兜底会真命中 → 删掉，只记事件。
+    """
+
+    OTHER_BAR = BAR - 4 * 3600 * 1000          # 上一根 4h bar（另一个仓的止损）
+
+    def _foreign_stop_row(self, bar_ms=None, purpose="stop"):
+        bar_ms = self.OTHER_BAR if bar_ms is None else bar_ms
+        self.db.hl_record_intent("BTC_USDT", "BTC", bar_ms, purpose, 1, QTY, px=STOP,
+                                 reduce_only=True, status="resting")
+        self.db.hl_update_order("BTC_USDT", bar_ms, purpose, oid=STOP_OID + 7)
+        return bar_ms
+
+    def _proof(self):
+        return {"px": FILL_PX, "sz": QTY, "reason": "exchange",
+                "tids": ["419136180065962", "419136180065963"], "oids": []}
+
+    def _order_events(self):
+        return [r["message"] for r in self.db.hl_recent_events(50, kind="order")]
+
+    def test_two_candidates_without_oid_are_untouched(self):
+        other_bar = self._foreign_stop_row()
+        ex = self.executor()
+        hit = ex._mark_closing_order_filled(dict(self.row()), self._proof())
+
+        self.assertIsNone(hit, "无 oid 证据时不许挑一行落终态")
+        self.assertEqual(self.stop_row()["status"], "resting")
+        self.assertEqual(self.db.hl_order("BTC_USDT", other_bar, "stop")["status"], "resting")
+        self.assertTrue(any("没定位到对应挂单行" in m for m in self._order_events()))
+
+    def test_single_foreign_candidate_is_untouched(self):
+        """本 bar 没有可落的 stop 行 → 唯一候选是**别的 bar** 那张（旧代码会落它）。"""
+        self.db.hl_update_order("BTC_USDT", BAR, "stop", status="cancelled")
+        other_bar = self._foreign_stop_row(purpose="stop:fix")
+        ex = self.executor()
+
+        self.assertIsNone(ex._mark_closing_order_filled(dict(self.row()), self._proof()))
+        self.assertEqual(self.db.hl_order("BTC_USDT", other_bar, "stop:fix")["status"], "resting",
+                         "别的 bar 上没成交的止损不能被写成 filled")
+
+
+class TestM2StopExitNeedsCloseLeg(FillCloseBase):
+    """M2（假关账）：`_last_fill_px` 没有 Close 腿时不许拿开仓价冒充平仓价。"""
+
+    def test_only_open_leg_hands_off_without_kill(self):
+        self.db.set_pos_hl(self.pid, hl_status="mismatch")     # 事故第二入口的现场
+        self.info._fills = _fills(oids=(OTHER_OID, OTHER_OID), dir_word="Open Long")
+        ex = self.executor()
+
+        px, fills = ex._last_fill_px("BTC")
+        self.assertIsNone(px, "只有开仓腿时必须返回 None")
+        self.assertEqual(len(fills), 2, "成交原文仍要返回，供诊断")
+
+        self.assertFalse(ex.on_exit(self.pid, "stop", STOP))
+        row = self.row()
+        self.assertEqual(row["status"], "open", "不许按开仓价关账")
+        self.assertEqual(row["hl_status"], "mismatch")
+        self.assertIsNone(row["exit_price"])
+        self.assertIsNone(row["exit_reason"])
+        self.assertFalse(self.db.hl_kill(), "让出接管权不等于 kill")
+        self.assertEqual(self.ex.calls, [], "更不许下单/撤单")
+        errs = [r["message"] for r in self.db.hl_recent_events(50, kind="error")]
+        self.assertTrue(any("读不到成交价" in m for m in errs), errs)
+
+
+class TestM3SwitchOffCoversExitPath(FillCloseBase):
+    """M3：开关关掉 = 两条路径一起回到旧行为（含 on_exit 的 mismatch+stop 放行）。"""
+
+    def test_disabled_switch_does_not_take_over_mismatch_stop(self):
+        self.db.set_pos_hl(self.pid, hl_status="mismatch")
+        self.info._fills = _fills()                 # 证据齐全，但开关关着
+        ex = self.executor(fill_close=False)
+
+        self.assertFalse(ex.on_exit(self.pid, "stop", STOP), "关掉开关后不该接管")
+        row = self.row()
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["hl_status"], "mismatch")
+        self.assertIsNone(row["exit_price"])
+        self.assertEqual(self.ex.calls, [])
+
+
+class TestM4SnapshotRequired(FillCloseBase):
+    """M4：没有快照 → 证明不成立（否则 ex_coins 为空，等于 fail-open）。"""
+
+    def test_missing_snapshot_returns_none(self):
+        self.info._fills = _fills()
+        ex = self.executor()
+        ex._sync_fills()
+        row = dict(self.row())
+
+        self.assertIsNone(ex._fill_close_proof(row), "缺省快照不许当成「交易所无仓」")
+        self.assertIsNone(ex._fill_close_proof(row, None))
+        # 对照：给了快照（且确实无仓）时证据是成立的 —— 证明上面真的是被 snap 挡住的
+        proof = ex._fill_close_proof(row, _snap(equity=987.3, positions=[], orders=[]))
+        self.assertIsNotNone(proof)
+        self.assertEqual(proof["reason"], "stop")
+
+
+class TestM5FillsConsumedOncePerRound(FillCloseBase):
+    """M5（重复关账）：同轮同 coin 两个本地 open 行不得用**同一批**成交各关一次。"""
+
+    def _second_position(self) -> int:
+        bar2 = BAR - 4 * 3600 * 1000
+        pid2 = self.db.create_position(symbol="BTC_USDT", signal_bar_ms=bar2, status="open",
+                                       side=1, entry_price=ENTRY, stop_price=STOP,
+                                       stop_dist=0.0244943, contracts=64, coin_qty=QTY,
+                                       notional=540.5, risk_u=13.2395, equity_at_entry=1000.0)
+        self.db.confirm_position(pid2, actual_entry=ENTRY, actual_contracts=QTY,
+                                 actual_stop=STOP, stop_placed=True)
+        self.db.set_pos_hl(pid2, hl_status="open", hl_entry_oid=OTHER_OID + 1,
+                           hl_stop_oid=STOP_OID + 1, hl_sz=QTY)
+        self.db.hl_record_intent("BTC_USDT", "BTC", bar2, "entry", 1, QTY, px=ENTRY,
+                                 status="filled")
+        self.db.hl_update_order("BTC_USDT", bar2, "entry", oid=OTHER_OID + 1,
+                                filled_sz=QTY, avg_px=ENTRY)
+        self.db.hl_record_intent("BTC_USDT", "BTC", bar2, "stop", 1, QTY, px=STOP,
+                                 reduce_only=True, status="resting")
+        self.db.hl_update_order("BTC_USDT", bar2, "stop", oid=STOP_OID + 1)
+        return pid2
+
+    def test_second_row_fails_closed(self):
+        pid2 = self._second_position()
+        self.info._fills = _fills()            # 一批成交，合计刚好 QTY
+        ex = self.executor()
+        ex.run()
+
+        rows = {self.pid: self.row(), pid2: self.db.position_by_id(pid2)}
+        statuses = sorted(r["status"] for r in rows.values())
+        self.assertEqual(statuses, ["closed", "open"], "只能关一个仓，另一个必须留给人看")
+        loser = [r for r in rows.values() if r["status"] == "open"][0]
+        self.assertEqual(loser["hl_status"], "mismatch")
+        self.assertIsNone(loser["exit_price"])
+        self.assertTrue(self.db.hl_kill(), "第二行证据不足 → fail-closed（mismatch + kill）")
+
+
+class CountingSpecsInfo(FakeInfo):
+    """记录 specs() 调用次数：M6 要证明「第二轮不再打接口」。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.spec_calls = []
+
+    def specs(self, coins=None):
+        self.spec_calls.append(tuple(coins or ()))
+        return super().specs(coins)
+
+
+class RaisingSpecsInfo(FakeInfo):
+    """specs() 永远失败：失败**不许**进缓存（否则一小时都按「无精度」静默跳过）。"""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.spec_calls = 0
+
+    def specs(self, coins=None):
+        self.spec_calls += 1
+        raise HlInfoError("meta 不可用")
+
+
+class TestM6SpecsTickCached(FillCloseBase):
+    """M6：`_size_tick` 的 specs() 是真实 POST，必须按 (info, coin) 缓 1 小时。"""
+
+    def test_second_round_does_not_hit_specs(self):
+        # 交易所有仓 → 走数量对账 → 每轮都会问一次 tick
+        self.info = CountingSpecsInfo(
+            snap=_snap(equity=987.3, positions=[_pos(coin="BTC", size=QTY, entry=ENTRY)],
+                       orders=[_stop_order(coin="BTC", trigger=STOP)]))
+        ex = self.executor()
+        ex.run()
+        first = len(self.info.spec_calls)
+        self.assertGreaterEqual(first, 1)
+        ex.run()
+        self.assertEqual(len(self.info.spec_calls), first,
+                         f"第二轮不该再调 specs（实际 {self.info.spec_calls}）")
+
+    def test_failure_is_not_cached(self):
+        self.info = RaisingSpecsInfo(snap=_snap(equity=987.3, positions=[], orders=[]))
+        ex = self.executor()
+        self.assertIsNone(ex._size_tick("BTC"))
+        self.assertIsNone(ex._size_tick("BTC"))
+        self.assertEqual(self.info.spec_calls, 2, "失败必须每轮重试，不能被缓存")
+
+    def test_tick_value_unchanged(self):
+        self.info = CountingSpecsInfo(snap=_snap(equity=987.3, positions=[], orders=[]))
+        ex = self.executor()
+        self.assertAlmostEqual(ex._size_tick("BTC"), 1e-5, places=12)
+
+
+class TestM7AlertWordingFollowsKillState(FillCloseBase):
+    """M7：别的标的 fail-closed 已 kill 时，关账提醒不得声称「未暂停自动交易」。"""
+
+    def _adding_eth_mismatch(self) -> int:
+        """ETH 本地有仓、交易所无仓、无成交 → 同轮 mismatch + kill。"""
+        pid = self.db.create_position(symbol="ETH_USDT", signal_bar_ms=BAR, status="open", side=1,
+                                      entry_price=2500.0, stop_price=2400.0, stop_dist=0.04,
+                                      contracts=10, coin_qty=0.5, notional=1250.0,
+                                      risk_u=50.0, equity_at_entry=1000.0)
+        self.db.confirm_position(pid, actual_entry=2500.0, actual_contracts=0.5,
+                                 actual_stop=2400.0, stop_placed=True)
+        self.db.set_pos_hl(pid, hl_status="open", hl_entry_oid=777, hl_stop_oid=778, hl_sz=0.5)
+        return pid
+
+    def test_no_false_reassurance(self):
+        self._adding_eth_mismatch()
+        self.info._fills = _fills()            # BTC 足额成交 → 正常关账、不 kill
+        ex = self.executor()
+        alerts = ex.run()
+
+        self.assertTrue(self.db.hl_kill())
+        stop_alerts = [m for m in alerts if "🛑 止损已在交易所成交" in m]
+        self.assertEqual(len(stop_alerts), 1, alerts)
+        self.assertNotIn("未暂停自动交易", stop_alerts[0],
+                         "系统已暂停时不能写「未暂停」")
+        self.assertIn("暂停状态", stop_alerts[0])
+        self.assertIn("对账异常", stop_alerts[0], "要带上 kill 原因")
+
+
+class TestM8ExitReasonRendered(unittest.TestCase):
+    """M8：`exchange` 在摘要/确认页要显示中文（不能把英文枚举印给用户）。"""
+
+    def test_exchange_label_and_wiring(self):
+        from app import engine
+        self.assertEqual(engine._exit_reason_plain("exchange", 1), "交易所侧已平仓（人工/外部）")
+        self.assertEqual(engine._exit_reason_plain("stop", 1), "触发止损")
+        # 未知值兜底原文（不许崩、也不许编一个看着像结论的词）
+        self.assertEqual(engine._exit_reason_plain("weird_reason", 1), "weird_reason")
+
+        src = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text("utf-8")
+        self.assertNotIn("（{row['exit_reason']}）", src, "摘要页仍在直接印英文枚举")
+        self.assertNotIn("（{row['exit_reason']}，", src, "确认页仍在直接印英文枚举")
+        self.assertGreaterEqual(src.count("_exit_label(row)"), 2,
+                                "摘要页与确认页都要走 _exit_label")
 
 
 if __name__ == "__main__":
