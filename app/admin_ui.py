@@ -915,8 +915,14 @@ def _dd_threshold_fields(cfg: Any, raw: Dict[str, Any]) -> str:
     hint = (f"当前生效：告警 {th['warn'] * 100:g}% / 熔断 {th['kill'] * 100:g}%"
             f"（按单笔风险 {risk * 100:g}% 档位自动）。留空 = 保持原值；"
             f"填 0 = 回到档位自动；改「单笔风险」时两条线会自动跟着走")
+    # 【低5】常驻小字（不是只在出错时才出现）：用户填完提交后如果被拒收，输入框里
+    # 还回显着他填的值，而 DB 里跑的是旧值 —— 不说清「你的值没生效」就等于静默失效。
+    # 放在这里而不是只靠 flash 提示：flash 只出现一次，事后回看页面看不出差别。
+    hint += (f"。你填的值若自相矛盾会被拒收、不生效（须满足 告警线 < 熔断线 ≤ "
+             f"{hl_dd.MAX_KILL * 100:g}%）")
     if th["rejected"]:
-        hint += "。⚠️ 当前配置自相矛盾（告警线须小于熔断线、熔断线 ≤95%），已按档位默认值执行"
+        hint += ("。⚠️ 当前 DB 里的覆盖值自相矛盾，你填的值没生效 —— "
+                 "已按单笔风险档位的默认线执行")
     return ("<div class='field'><div class='lbl'>回撤阈值覆盖（可选，小数，如 0.25 = 25%）"
             f"<span class='src'>&nbsp;来源 {_source(raw, 'hl_dd_warn_pct', 'HL_DD_WARN_PCT')}"
             f" / {_source(raw, 'hl_dd_kill_pct', 'HL_DD_KILL_PCT')}</span></div>"
@@ -964,8 +970,11 @@ def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
     risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
     if hl_dd.thresholds(risk, out.get("hl_dd_warn_pct", cur["hl_dd_warn_pct"]),
                         out.get("hl_dd_kill_pct", cur["hl_dd_kill_pct"]))["rejected"]:
-        return {}, (f"回撤阈值被拒收（告警线必须小于熔断线、熔断线 ≤{hl_dd.MAX_KILL * 100:g}%），"
-                    f"两条都保留原值")
+        # 【低5】文案必须让用户知道「你填的值没生效」，不只是「被拒收」：DB 里保留的
+        # 是旧值（apply_db 的拒收语义不改），面板输入框却还回显着刚填的数字 ——
+        # 不说清「没生效」用户会以为自己已经改了线。
+        return {}, (f"回撤阈值没生效（自相矛盾：告警线必须小于熔断线、熔断线 ≤"
+                    f"{hl_dd.MAX_KILL * 100:g}%），两条都保留原值（当前生效值见输入框下方）")
     return out, ""
 
 

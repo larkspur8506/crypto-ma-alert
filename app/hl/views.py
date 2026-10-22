@@ -361,7 +361,13 @@ def _kill_state(deps: DashboardDeps) -> tuple:
 _DD_ST_TXT = {
     "normal": "正常",
     "warn": "已达告警线",
-    "killed": "已熔断",
+    # 【低3】「已熔断」必须带上「停手中」：这个词只允许在 kill **实态为真** 时出现。
+    # 旧文案就四个字，用户无法判断「是还在停手，还是指标越线但已经恢复交易」。
+    "killed": "已熔断（停手中）",
+    # 【低3】DD 越了熔断线、但 kill 实态是假的（例如人工解熔断后峰值还没重置，
+    # 或 monitor 还没跑到下一轮）：既不能说「已熔断」（已恢复交易，会误导人以为
+    # 还在停手），也不能说「正常」（下一轮就会重新熔断，会误导人现在可以开仓）。
+    "over_kill": "已越熔断线（当前未停手）",
     "unavailable": "暂不可用",
     "off": "暂不可用",
 }
@@ -410,8 +416,15 @@ def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
     # 「已熔断」既看当前回撤，也看 kill 的来源：指数回升后 DD 可能掉回线下，
     # 但停手还在（dd 永不自解）—— 那种时候显示「正常」会让人以为可以开仓了。
     origin = str(_config_get(deps, "hl_exec_kill_origin", "") or "")
-    if pct >= th["kill"] or (killed and origin == "dd"):
+    over = pct >= th["kill"]
+    # 【低3】「已熔断」只允许在 kill **实态为真** 时出现。旧判据
+    # `pct >= kill or (killed and origin == "dd")` 把「DD 越线但已恢复交易」
+    # 也显示成「已熔断」—— 用户以为还在停手，实际下一轮就要重新熔断前仓位已开得出去。
+    # 四态：killed（真停手）/ over_kill（越线未停手）/ warn / normal。
+    if killed and (origin == "dd" or over):
         status = "killed"
+    elif over:
+        status = "over_kill"
     elif pct >= th["warn"]:
         status = "warn"
     else:
@@ -1594,7 +1607,11 @@ def _dd_line_html(meta: Dict[str, Any]) -> str:
         txt = f"{txt}（{note}）"
     pct = _opt_num(meta.get("dd_pct"))
     pct_txt = "—" if pct is None else f"{pct * 100:.2f}%"
-    cls = "neg" if st == "killed" else ("muted" if st != "warn" else "")
+    # 【低3】over_kill 用 warn 色（不是 neg/红）：它是「需要注意」而不是「已停手」——
+    # 红色会和 killed 抢视觉优先级，用户分不清哪个才真的要停手。
+    cls = ("neg" if st == "killed"
+           else "warn" if st == "over_kill"
+           else ("muted" if st != "warn" else ""))
     span = f"<span class='{cls}'>{_esc(txt)}</span>" if cls else _esc(txt)
     # 「等待流水同步」只在真的没判过时出现（执行器写的 hl_dd_wait_note）；正常节奏下
     # 用固定的口径说明「按流水同步节奏更新」——用户必须知道这条线的分辨率是 30 分钟，

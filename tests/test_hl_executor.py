@@ -528,10 +528,16 @@ class TestReconcileAndRun(Base):
         self.executor(use_schedule_cancel=True).run(force_snapshot=True)
         self.assertIn(("schedule_cancel", 30), self.ex.calls)
 
-    def test_run_skips_deadman_when_killed(self):
+    def test_run_still_schedules_deadman_when_killed(self):
+        """【高3 附加路径】kill 态也续期死手开关。
+
+        旧行为是 kill 态**不**调 scheduleCancel；但它的语义是「到点撤掉该地址全部挂单」
+        （含 reduce-only 止损）→ kill（dd/manual 永不自解）期间不续期，等于定时把止损
+        撤掉、让仓位裸奔。续期只是把撤单时刻往后推，不动任何挂单，所以 kill 态也要续。
+        """
         self.db.hl_set_kill(True, "test")
-        self.executor().run(force_snapshot=True)
-        self.assertNotIn(("schedule_cancel", 30), self.ex.calls)
+        self.executor(use_schedule_cancel=True).run(force_snapshot=True)
+        self.assertIn(("schedule_cancel", 30), self.ex.calls)
 
 
 if __name__ == "__main__":
