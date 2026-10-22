@@ -104,6 +104,33 @@ PNL_SRC_FILLS = "fills"          # 有成交，net_pnl 来自 hl_fills 聚合
 PNL_SRC_NO_FILLS = "no_fills"    # 窗内查不到成交（net_pnl 为 NULL，不猜 0）
 PNL_SRC_NO_EXIT_FILLS = "no_exit_fills"   # 只有入场腿（平仓成交还没同步），不写半截净额
 
+# ---------------------------------------------------------------- 宽限期（对账失败自动消化）
+# hl_status 的一个新取值：与 open/pending/mismatch/closed 并列。
+#   closing = 「交易所侧已无仓，但还没拿到足够成交证据」—— 既不是 open（不能在别的
+#   路径上被当成正常持仓去补挂止损），也不是 mismatch（还不是真矛盾，只是时滞）。
+HL_ST_CLOSING = "closing"
+
+# 宽限状态的存储键：`hl_close_grace:<pid>` → "<first_seen>:<rounds>"（configuration 表）。
+# 为什么落在 DB 而不是进程内存：build_executor() 每轮新建实例、容器还会重启，
+# 宽限期必须跨轮/跨重启计时（内存版等于每轮都重新开始等 = 永远不 kill）。
+GRACE_KEY_PREFIX = "hl_close_grace:"
+GRACE_DEFAULT_S = 900.0          # 15 分钟（用户拍板）：≈ 3 个 tick 的时滞余量
+GRACE_MIN_S, GRACE_MAX_S = 300.0, 3600.0
+
+# 窄口径自解 kill 的连续干净轮次计数（configuration 表整数）与阈值。
+# 为什么是 2 而不是 1：一轮干净可能只是「这一轮恰好没读到问题」（快照抖动、
+# 挂单接口一时返回空），连干净两轮才说明账真的自己收敛了。
+KILL_CLEAN_KEY = "hl_kill_clean_rounds"
+KILL_CLEAN_ROUNDS = 2
+
+# 定点回捞成交（证据不足那一轮才发，最多 2 次、间隔 1s）：
+#   窗口起点 = opened_at − 120s（与本地 _fill_close_proof 的下界同一口径），
+#   只用开始时间而不是「开始+结束」—— 平仓成交一定在 opened_at 之后，
+#   给它一个更晚的结束时间反而会漏掉「刚成交」的那一笔。
+REFETCH_ATTEMPTS = 2
+REFETCH_GAP_S = 1.0
+REFETCH_MARGIN_MS = 120_000
+
 
 # ---------------------------------------------------------------- 推送文案（人类可读）
 
@@ -238,6 +265,17 @@ class ExecParams:
     # 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效
     # （见 _on_exit_locked 的守卫），否则「关掉」只剩半截，止损成交仍会被自动关账。
     fill_close: bool = True
+    # 对账失败自动消化（2026-10-22 事故后第二轮，规格见 docs/HL_RUNBOOK.md §「宽限期」）：
+    #   close_grace    —— 开 = 对账发现「交易所无仓、但本轮拿不到成交证据」时先挂起
+    #                     （hl_status='closing'、不 kill、每轮重试 + 定点回捞），
+    #                     超过 close_grace_s 才升级成 mismatch + kill。
+    #                     关 = 完全回到「第一轮没证据就 mismatch + kill」的旧行为。
+    #   close_grace_s  —— 宽限秒数（Config 默认 900 = 15 分钟，允许 300–3600）。
+    #   kill_autoclear —— 开 = **只对 origin='reconcile' 的 kill**，连续 2 轮干净后
+    #                     自动解除并推一条；其它来源（人工/熔断/数量/到期）永不自动解除。
+    close_grace: bool = True
+    close_grace_s: float = GRACE_DEFAULT_S
+    kill_autoclear: bool = True
     # churn 熔断阈值（PR-4）：同一 coin-side 在 CHURN_WINDOW_S 内 cancel/replace
     # 达到这次数 → 停手 + 告警（走既有 _alert 通道）。可配（面板/DB 键 hl_churn_max），
     # 0 或负数 = 关闭熔断（只保留静置闸门）。默认 5：实测正常一轮修不出 5 次撤挂，
@@ -416,7 +454,7 @@ class Executor:
         snap = snap if snap is not None else self._snapshot()
         if snap is None:
             return {"ok": False, "problems": ["读不到账户状态（info 失败）"], "unknown": True,
-                    "fill_closed": []}
+                    "fill_closed": [], "closing_pending": []}
         ex_pos = {p["coin"]: p for p in snap.get("positions") or []}
         # 挂单列表可信才允许判断「止损有无」：回落老接口时读不到 isTrigger，会把有止损读成没止损，
         # 据此自动补挂/平仓 = 误平仓。缺字段按**不可信**处理 —— 与面板（views）和看护
@@ -427,6 +465,7 @@ class Executor:
         missing_stop: List[dict] = []
         unconfirmed: List[str] = []
         fill_closed: List[dict] = []
+        closing_pending: List[dict] = []
         # 本轮已被某个仓消耗掉的成交 tid（M5）：一笔成交只能关一个仓，见 _fill_close_proof。
         consumed_tids: set = set()
         local_open = [r for r in self.db.recent_positions(50)
@@ -442,7 +481,10 @@ class Executor:
                       # skipped）时交易所什么都没有，无条件纳入会让下一轮对账报
                       # 「本地有仓但交易所无仓位」→ 误置 kill + 误标 mismatch。
                       and (r["status"] == "open" or self._entry_issued(r))
-                      and (r["hl_status"] or "") in ("open", "mismatch", "")]
+                      # 宽限期（closing）：**必须**每轮重试 —— 它正是「交易所无仓、
+                      # 成交证据还没到」那个状态，不纳入就永远等不到证据（也永远
+                      # 不会超时升级），宽限期就成了「永久挂起」。
+                      and (r["hl_status"] or "") in ("open", "mismatch", "", HL_ST_CLOSING)]
         seen = set()
         size_problems: List[str] = []
         size_warn: List[str] = []
@@ -464,6 +506,9 @@ class Executor:
                 # 证据不成立（无成交/数量不足/精度不可知/开关关）→ 严格退回原行为。
                 proof = self._fill_close_proof(r, snap, consumed_tids)
                 if proof is not None:
+                    # 「宽限期内终于拿到证据」与「第一轮就有证据」走同一条关账路径，
+                    # 唯一的区别是要把宽限键删掉（否则下一轮还会按「仍在宽限」拦开仓）。
+                    was_closing = (r["hl_status"] or "") == HL_ST_CLOSING
                     self._close_local(int(r["id"]), proof["px"], proof["reason"], proof["sz"])
                     # 这批成交已归属本仓：同轮后面的行不得再拿它关账（M5）。
                     consumed_tids.update(proof.get("tids") or [])
@@ -473,15 +518,20 @@ class Executor:
                     # reason=='stop' 不走这里：那张单就是成交的那张，撤它没有意义。
                     if proof["reason"] == "exchange":
                         self._cancel_residual_stops(r, coin)
+                    self._grace_clear(int(r["id"]))
                     self._event(EV_ORDER,
                                 f"{r['symbol']} 交易所侧已平仓（{proof['reason']}），"
-                                f"本地按成交价 {proof['px']:.2f} 关账",
+                                f"本地按成交价 {proof['px']:.2f} 关账"
+                                + (f"（证据来源 {proof.get('source')}）" if proof.get("source") else ""),
                                 symbol=r["symbol"], data=proof)
                     fill_closed.append({"position_id": int(r["id"]), "symbol": r["symbol"],
-                                        "coin": coin, **proof})
+                                        "coin": coin, "grace_ended": was_closing, **proof})
                     continue                       # 不进 problems、不 kill
-                problems.append(f"{r['symbol']} 本地有仓（#{r['id']}）但交易所无仓位")
-                self.db.set_pos_hl(r["id"], hl_status="mismatch")
+                # 证据不足。宽限期开着 → 先挂起（closing，不 kill），超时才升级；
+                # 关掉 → 完全回到「立刻 mismatch + kill」的旧行为（一格都不改）。
+                pend = self._grace_step(r, problems)
+                if pend is not None:
+                    closing_pending.append(pend)
                 continue
             # 数量对账（PR-3）：以前只比「有没有仓」，数量错了（部分成交、IOC 只成一半、
             # 手工加减仓）会一路带进 PnL。两击规则见 _size_check。
@@ -507,7 +557,9 @@ class Executor:
             if kill_before is None:
                 kill_before = bool(self.db.hl_kill())
             if not kill_before:
-                self.db.hl_set_kill(True, "持仓数量对账连续不一致")
+                # origin='size'：数量对账造成的 kill **不**自动解除 —— 它代表
+                # 「本地记的量与交易所不一致」，自动解等于把一个还在的矛盾静音。
+                self.db.hl_set_kill(True, "持仓数量对账连续不一致", origin="size")
                 self._event(EV_KILL, "持仓数量对账连续不一致 → 自动 kill switch",
                             data={"problems": size_problems})
         # 清掉已经不在 open 列表里的 strike 键：仓位关掉后没人会再走「数量一致」分支，
@@ -516,27 +568,32 @@ class Executor:
         return {"ok": not problems, "problems": problems, "unknown": False,
                 "missing_stop": missing_stop, "unconfirmed": unconfirmed,
                 "size_warn": size_warn, "size_kill": bool(size_problems),
-                "fill_closed": fill_closed}
+                "fill_closed": fill_closed, "closing_pending": closing_pending}
 
     # ------------------------------------------------------------ 交易所侧已平仓（成交证据）
     def _fill_close_proof(self, row, snap: Optional[dict] = None,
                           consumed: Optional[set] = None) -> Optional[dict]:
-        """证明该本地仓已在交易所侧被平掉：返回 {"px","sz","reason","tids","oids"} 或 None。
+        """证明该本地仓已在交易所侧被平掉：返回 {"px","sz","reason","tids","oids","source"} 或 None。
 
-        只认**已同步的交易所成交**（本轮 _sync_fills 刚写的 hl_fills），不额外打接口 ——
-        每轮多打一次 userFills 既没必要（同一份数据刚拉过），也会在被限频时把对账拖瘸。
-        任一条件不满足都返回 None（fail-closed，调用方退回原来的 mismatch + kill）：
-        没有证据就不许动账，宁可停手让人看，也不能凭「交易所没仓」把本地仓凭空关掉
-        —— 那会把「账户读错/接口漏仓」变成一笔假平仓，真实仓位还在，账却没了。
+        **v2（对账失败自动消化）**：先用本轮已同步的 `hl_fills` 判；不够（无平仓腿 /
+        数量不符）才做**一次定点回捞**（`user_fills_by_time` 从 opened_at−120s 起，
+        最多 2 次、间隔 1s，落库后重判）。回捞只在「证据不足」的那一轮发生 —— 证据
+        齐全时一次多余的接口都不打（这条约束比「多捞几次更保险」重要：每轮都打就是
+        在限频窗口里给自己找 429，最后连对账本身都读不到数）。
 
-        snap：**必须**是调用方刚读到的账户快照。缺省返回 None 而不是「当作没有仓」——
-        没有快照时 ``ex_coins`` 恒为空，「交易所无仓」这条前提会自动成立，等于把
-        fail-closed 变成 fail-open（对抗审查 M4）。保留默认值只为兼容旧调用签名，
-        语义上是必传。
+        判定口径（每一格都是「不成立就不许动账」）：
+        - **平仓腿**：`reduce_only==1` **或** dir 含 "Close" **或** `closedPnl != 0`。
+          最后一条兜 ADL/清算：那种成交的 dir 可能不是 Close，但 closedPnl 一定非 0。
+        - **oid 锚定优先**：`hl_stop_oid` 非空、且窗口里真有该 oid 的平仓腿 → **只用
+          这些成交**做合计与均价，reason="stop"；否则用全部平仓腿，reason="exchange"。
+          （旧版要求「所有腿都出自止损单」才算 stop，窗口里混进别的仓的人工平仓腿时
+          会把整笔判成 exchange 并撤掉止损 —— 归因错了，数字还可能被混合。）
+        - **双侧容差**：`abs(total − qty) <= tol`，tol = 1 数量 tick；tick 读不到时
+          用 `qty × 1e-6`（浮点往返量级，**不猜精度**）。不再只有下界 —— 超额平仓
+          同样不是这一仓的证据（详见 _judge_close_fills）。
+        - `consumed`（同轮 tid 复用）保留：一笔成交只能关一个仓。
 
-        consumed：**同一轮对账**里已被别的仓位消耗掉的成交 tid 集合（对抗审查 M5）。
-        一笔成交只能归一个仓：两个本地 open 行同 coin 时，不传这个集合就会用同一批
-        成交把两个仓都关掉（凭空少一个仓）。命中已消耗 → 返回 None（fail-closed）。
+        任一条件不满足 → None（fail-closed：调用方进宽限期，超时才 mismatch + kill）。
         """
         if not bool(getattr(self.p, "fill_close", True)):
             return None
@@ -562,58 +619,274 @@ class Executor:
         if opened is None:
             return None
         lo = float(opened) - 120.0             # 120s 容差：成交 ts 与本地 opened_at 有秒级漂移
-        tick = self._size_tick(coin)           # 精度不可知 → 不判（不猜容差）
-        if tick is None:
-            return None
+        # ① 本轮已同步的成交（零额外接口）
+        proof = self._judge_close_fills(row, symbol, coin, qty, lo, consumed)
+        if proof is not None:
+            return {**proof, "source": "cache"}
+        # ② 不足 → 定点回捞。最多 2 次、每次之后重判（拿到就停，不为「保险」多打一次）。
+        self._event(EV_RECONCILE,
+                    f"{symbol} 平仓证据不足 → 定点回捞成交（最多 {REFETCH_ATTEMPTS} 次）",
+                    symbol=symbol, data={"pid": int(row["id"]), "coin": coin, "qty": qty})
+        for attempt in range(REFETCH_ATTEMPTS):
+            if attempt:
+                time.sleep(REFETCH_GAP_S)
+            if not self._refetch_close_fills(opened):
+                continue                       # 空/异常 = 无证据，继续下一次（不抛）
+            proof = self._judge_close_fills(row, symbol, coin, qty, lo, consumed)
+            if proof is not None:
+                return {**proof, "source": "refetch"}
+        return None
+
+    def _judge_close_fills(self, row, symbol: str, coin: str, qty: float, lo: float,
+                           consumed: Optional[set] = None) -> Optional[dict]:
+        """按**本地已落库**的成交判一次证据（纯读，不打接口）。不成立返回 None。
+
+        单独抽出来的原因：v2 要在「回捞前/回捞后」用**同一套**判据各判一次 ——
+        两处各写一遍必然漂移，而这里漂移一格就是「凭一批对不上的成交把仓关掉」。
+        """
         try:
             fills = self.db.hl_fills_window(coin, lo=lo)
         except Exception as e:                                        # noqa: BLE001
             logger.warning("[hl-exec] 读取成交失败，本轮不做已平仓证明：%s", e)
             return None
-        # 只认平仓腿：reduce_only 由 _sync_fills 按 dir 含 "Close" 标记；dir 再判一次
-        # 兜住「标记没写到」的老行。开仓腿混进来会把数量凑够，等于自证成功。
-        closing = []
+        # 容差：1 个数量 tick；精度读不到（specs 失败/桩）→ 用浮点往返量级，
+        # **不猜**一个 szDecimals（猜错差 100 倍，两种结论都不可信）。
+        tol = self._size_tick(coin)
+        if tol is None:
+            tol = qty * 1e-6
+        legs: List[dict] = []
         for f in fills:
             sym = f["symbol"]
-            if sym and sym != symbol:           # coin 相同但 symbol 不同（映射变更）→ 不算
+            if sym and sym != symbol:          # coin 相同但 symbol 不同（映射变更）→ 不算
                 continue
-            if not (int(f["reduce_only"] or 0) == 1 or "Close" in str(f["dir"] or "")):
+            if not self._is_closing_leg(f):
                 continue
             sz, px = self._num(f["sz"]), self._num(f["px"])
             if sz <= 0 or px <= 0:
                 continue
-            closing.append({"sz": sz, "px": px, "oid": f["oid"], "tid": f["tid"]})
-        if not closing:
+            legs.append({"sz": sz, "px": px, "oid": f["oid"], "tid": f["tid"]})
+        if not legs:
             return None
-        # 同一轮里这笔成交已被别的仓用掉了 → 不重复归因（M5）。否则两个同 coin 的
+        # oid 锚定：本仓止损单打出的那些腿**优先**，命中就只用它们（归因 + 均价都干净）；
+        # 没命中才把全部平仓腿当证据，归因为「人工/外部平仓」。
+        reason = "exchange"
+        stop_oid = row["hl_stop_oid"]
+        if stop_oid not in (None, ""):
+            anchored = [c for c in legs
+                        if c["oid"] is not None and str(c["oid"]) == str(stop_oid)]
+            if anchored:
+                legs = anchored
+                reason = "stop"
+        # 同一轮里这批成交已被别的仓用掉了 → 不重复归因（M5）。否则两个同 coin 的
         # 本地 open 行会各自拿**同一批**成交关账，一个真实仓位被抹掉两次。
         if consumed:
-            used = {str(c["tid"]) for c in closing}
+            used = {str(c["tid"]) for c in legs}
             if used & set(consumed):
                 return None
-        total = sum(c["sz"] for c in closing)
-        # 必须**足额**：只平掉一部分时仓位还在（交易所还会带残余量），按平仓价把本地
-        # 整仓关掉会把剩余敞口从账本里抹掉。容差只给 1 tick（浮点往返的末位误差）。
-        if total < qty - tick:
+        total = sum(c["sz"] for c in legs)
+        # **双侧**容差：少于持仓量 = 只平了一部分（交易所还有残余量，按均价关整仓会把
+        # 剩余敞口从账本里抹掉）；多于持仓量 = 窗口里混进了不属于这一仓的成交
+        # （照 2×持仓算下去会把仓关在一个既不是止损价也不是任何成交价的混合均价上，
+        # 凭空造一笔巨亏）。两种都不是证据 → None，fail-closed。
+        if abs(total - qty) > tol:
             return None
-        # 上限同样要卡（对抗自查 A）：平仓腿合计**超过**本仓持仓量，说明这个时间窗里
-        # 混进了不属于这一仓的成交（同一 coin 上一仓的平仓残腿、或人工另外平了一笔）。
-        # 这种账已经不可归因：照 2×持仓算下去会把仓位关在一个既不是止损价、也不是
-        # 任何成交价的「混合均价」上，凭空造出一笔巨亏、并抹掉真实仓位归属。
-        # 比「不关账」更糟 —— 所以同样 fail-closed，退回 mismatch + kill 让人看。
-        # 上限也给 1 tick（同一套浮点末位容差），不多给。
-        if total > qty + tick:
+        px = sum(c["px"] * c["sz"] for c in legs) / total
+        return {"px": px, "sz": total, "reason": reason,
+                "tids": [str(c["tid"]) for c in legs],
+                "oids": sorted({str(c["oid"]) for c in legs if c["oid"] is not None})}
+
+    def _is_closing_leg(self, f) -> bool:
+        """这笔成交是不是**平仓腿**（v2 三判据取或）。
+
+        ADL / 强制清算的 dir 写法不一定是 "Close"（HL 里可能是 "Auto-Deleveraging"
+        之类），但 `closedPnl` 一定非 0 —— 只看 dir 会把「交易所确实平了仓」的证据
+        漏掉，然后白白进宽限、超时 kill。
+        反过来，dir 里写着 "Open" 就是**开仓腿**，一律不算（把开仓腿算成平仓腿 =
+        用开仓价把仓关掉，凭空造一笔 R=0 的平仓，比不关账更糟）。最后一条判据依赖
+        closedPnl 非 0，而个别交易所/桩数据会给开仓腿也带上非 0 的 closedPnl，
+        所以先用 "Open" 把这条路封死。
+        """
+        d = str(f["dir"] or "")
+        if "Open" in d:
+            return False
+        try:
+            if int(f["reduce_only"] or 0) == 1:
+                return True
+        except (TypeError, ValueError, KeyError, IndexError):
+            pass
+        if "Close" in d:
+            return True
+        return abs(self._num(f["closed_pnl"])) > 0.0
+
+    def _refetch_close_fills(self, opened) -> int:
+        """定点回捞该账户从 opened_at−120s 起的成交并落库；返回新增条数（失败/空 = 0，不抛）。
+
+        与 `_refetch_fills`（数量对账那条）的区别只在窗口起点与用途：那条从
+        opened_at−300s 起、为了重算流水净量；这条从 −120s 起，只服务「这仓是不是
+        被交易所平掉了」。两者都不新增**每轮**调用 —— 只在各自的证据不足分支里打。
+        """
+        if not self.p.account_address:
+            return 0
+        try:
+            start_ms = int(float(opened) * 1000) - REFETCH_MARGIN_MS
+        except (TypeError, ValueError):
+            return 0
+        fn = getattr(self.info, "user_fills_by_time", None)
+        if callable(fn):
+            try:
+                got = fn(self.p.account_address, start_ms) or []
+            except Exception as e:                                     # noqa: BLE001
+                # 回捞是**修复手段**：它失败只能说明这次没拿到证据，绝不能把整轮对账带崩
+                # （那才是更危险的连锁反应）。按「无证据」处理，交给宽限期。
+                logger.warning("[hl-exec] 定点回捞成交失败（按无证据处理）：%s", e)
+                return 0
+        else:
+            # 桩/老客户端没有 userFillsByTime：退回滑动窗口（userFills）再按 opened_at 过滤。
+            # 生产 info 一定有 by_time 版本；这条只为「直接调 reconcile（未经 run 的同步）」
+            # 和测试桩留一条可用的回捞路径，避免它们被误判成「无证据」而进宽限。
+            logger.info("[hl-exec] 无 userFillsByTime，回捞退回 userFills 滑动窗口")
+            try:
+                got = self.info.user_fills(self.p.account_address) or []
+            except Exception as e:                                     # noqa: BLE001
+                logger.warning("[hl-exec] 退回 userFills 回捞失败（按无证据处理）：%s", e)
+                return 0
+        if not isinstance(got, list):
+            return 0
+        rows = [x for x in got if isinstance(x, dict)]
+        if not rows:
+            return 0
+        try:
+            return int(self._sync_fills(limit=len(rows), fills=rows) or 0)
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 回捞成交落库失败（按无证据处理）：%s", e)
+            return 0
+
+    # ------------------------------------------------------------ 宽限期（closing）
+    def _grace_key(self, pid: int) -> str:
+        return f"{GRACE_KEY_PREFIX}{int(pid)}"
+
+    def _grace_s(self) -> float:
+        """生效宽限秒数；脏值/越界退回默认 900（不静默关功能、也不放大成一整天）。"""
+        try:
+            v = float(getattr(self.p, "close_grace_s", GRACE_DEFAULT_S))
+        except (TypeError, ValueError):
+            return GRACE_DEFAULT_S
+        if not (GRACE_MIN_S <= v <= GRACE_MAX_S):
+            logger.warning("[hl-exec] close_grace_s=%.0f 越界（允许 %g–%g），按 %.0f 处理",
+                           v, GRACE_MIN_S, GRACE_MAX_S, GRACE_DEFAULT_S)
+            return GRACE_DEFAULT_S
+        return v
+
+    def _grace_read(self, pid: int) -> Optional[dict]:
+        """读该仓的宽限状态 {"first_seen","rounds"}；没有/读不懂 → None（不抛）。"""
+        try:
+            raw = str(self.db.get_config_str(self._grace_key(pid), "") or "").strip()
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 读宽限状态失败（按未进入宽限处理）：%s", e)
             return None
-        px = sum(c["px"] * c["sz"] for c in closing) / total
-        stop_oid = row["hl_stop_oid"]
-        # 全部成交都出自本仓的止损单才是「止损离场」；只要有一笔来源不明（oid 缺失或
-        # 不是止损单）就是人工/外部平仓 —— 宁可按「人工」报，也不冒领止损。
-        oids = {c["oid"] for c in closing}
-        is_stop = bool(stop_oid) and None not in oids and len(oids) == 1 \
-            and str(stop_oid) in {str(o) for o in oids}
-        return {"px": px, "sz": total, "reason": "stop" if is_stop else "exchange",
-                "tids": [str(c["tid"]) for c in closing],
-                "oids": sorted({str(c["oid"]) for c in closing if c["oid"] is not None})}
+        if not raw or ":" not in raw:
+            return None
+        head, _, tail = raw.partition(":")
+        try:
+            first, rounds = float(head), int(float(tail or 0))
+        except (TypeError, ValueError):
+            return None
+        if first <= 0:
+            return None
+        return {"first_seen": first, "rounds": max(0, rounds)}
+
+    def _grace_write(self, pid: int, first_seen: float, rounds: int) -> None:
+        try:
+            self.db.set_config(self._grace_key(pid), f"{float(first_seen):.3f}:{int(rounds)}")
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 写宽限状态失败（本轮按未进入宽限处理）：%s", e)
+
+    def _grace_clear(self, pid: int) -> None:
+        """删掉宽限键（证明成功 / 超时升级都必须删）。
+
+        写法上做了一次兼容：`del_config` 是本轮新加的 db 方法，注入的替身 DB
+        （测试/脚本）可能没有 —— 退化成写空串。空串在 `_grace_read` 里同样等于
+        「没有宽限状态」，语义一致，不会因为少一个方法就把宽限期卡死。
+        """
+        try:
+            fn = getattr(self.db, "del_config", None)
+            if callable(fn):
+                fn(self._grace_key(pid))
+            else:
+                self.db.set_config(self._grace_key(pid), "")
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 清宽限状态失败（下一轮会按已超时处理）：%s", e)
+
+    def _grace_step(self, row, problems: List[str]) -> Optional[dict]:
+        """证据不足时的宽限期一步：进入 / 继续 / 超时升级。返回 closing_pending 条目或 None。
+
+        三种情形（规格 §2）：
+        - 宽限开关关 → **完全**回到旧行为（problem + mismatch + kill），一格都不改；
+        - 键不存在 → 写 first_seen、置 hl_status='closing'、记「进入宽限」事件、不 kill；
+        - 键存在未超时 → 只累计轮次，不 kill（**不重复推**「进入宽限」）；
+        - 键存在已超时 → 升级：problem（→ kill）+ mismatch + 删键。
+        """
+        pid = int(row["id"])
+        symbol = str(row["symbol"])
+        # `fill_close` 是**最外层**开关：关掉它 = 上一轮上线的全部自动关账能力都回旧行为，
+        # 宽限自然也不该独自生效（否则「回滚」只回滚了一半，账本仍会被自动改写）。
+        if not (bool(getattr(self.p, "fill_close", True))
+                and bool(getattr(self.p, "close_grace", True))):
+            problems.append(f"{symbol} 本地有仓（#{pid}）但交易所无仓位")
+            self.db.set_pos_hl(pid, hl_status="mismatch")
+            return None
+        grace_s = self._grace_s()
+        now = time.time()
+        st = self._grace_read(pid)
+        if st is None:
+            self._grace_write(pid, now, 1)
+            self.db.set_pos_hl(pid, hl_status=HL_ST_CLOSING)
+            self._event(EV_RECONCILE,
+                        f"{symbol} 平仓成交待核对，进入宽限（最多 {grace_s:g} 秒）",
+                        symbol=symbol, data={"pid": pid, "grace_s": grace_s})
+            # 只在这一支推送（同一仓第二次进来 rounds>0，不会再走到这里）：
+            # 用户需要知道「交易已经平了、账在核对中」，而不是从面板自己去猜状态词。
+            self._alert(f"【HL执行】⏳ {symbol} 已探测到交易所无仓，平仓成交待核对 —— "
+                        f"已进入宽限（最多 {int(grace_s // 60)} 分钟，自动重试；"
+                        f"期间该标的暂不开新仓）")
+            return {"position_id": pid, "symbol": symbol, "first_seen": now,
+                    "elapsed_s": 0.0, "rounds": 1, "new": True, "grace_s": grace_s}
+        first = float(st["first_seen"])
+        rounds = int(st["rounds"]) + 1
+        elapsed = max(0.0, now - first)
+        if elapsed < grace_s:
+            self._grace_write(pid, first, rounds)
+            if (row["hl_status"] or "") != HL_ST_CLOSING:
+                # 行可能是上一版逻辑留下的 open/mismatch：宽限期内统一钉成 closing，
+                # 否则面板/看护/开仓闸门读到的状态与事实（正在等证据）不一致。
+                self.db.set_pos_hl(pid, hl_status=HL_ST_CLOSING)
+            return {"position_id": pid, "symbol": symbol, "first_seen": first,
+                    "elapsed_s": elapsed, "rounds": rounds, "new": False, "grace_s": grace_s}
+        # 超时：升级成真矛盾 → 交人（problem → _run_locked 里 kill）
+        self._grace_clear(pid)
+        self.db.set_pos_hl(pid, hl_status="mismatch")
+        msg = (f"{symbol} 已探测到交易所无仓，但 {int(grace_s // 60)} 分钟内未拿到成交证据"
+               f"（{rounds} 轮重试）")
+        problems.append(msg)
+        self._event(EV_RECONCILE, msg + " → 升级为对账异常（停手等人工核对）", symbol=symbol,
+                    data={"pid": pid, "grace_s": grace_s, "rounds": rounds, "elapsed_s": elapsed})
+        return None
+
+    def closing_symbols(self) -> set:
+        """当前处于宽限期（hl_status='closing'）的标的集合。
+
+        开仓闸门与面板共用这一份读法：宽限期间**禁止该标的开新仓** —— 上一笔平仓
+        的成交还没核对完就再开一笔，一旦那笔的成交后来被归到新仓上，两个仓的归属
+        就再也分不开了（成交只能按 coin + 时间窗归因）。
+        """
+        out = set()
+        try:
+            for r in self.db.recent_positions(50):
+                if (r["hl_status"] or "") == HL_ST_CLOSING and r["status"] in ("open", "pending"):
+                    out.add(str(r["symbol"]))
+        except Exception as e:                                         # noqa: BLE001
+            logger.warning("[hl-exec] 读 closing 行失败（本轮不拦开仓）：%s", e)
+        return out
 
     def _mark_closing_order_filled(self, row, proof: dict) -> Optional[dict]:
         """把产生这笔平仓的挂单行落终态（否则面板/看护会一直报「卡单」）。
@@ -1363,6 +1636,12 @@ class Executor:
         coin = self._coin_or_none(symbol)
         if coin is None:
             bad.append(f"未配置 HL coin 映射：{symbol}（拒绝开仓）")
+        # 宽限期（closing）：同标的有「平仓成交待核对」的行 → 直接拦，不依赖仓位槽。
+        # 理由：那一笔的成交还没归属确定，此时再开一笔同标的的仓，两边成交在
+        # (coin, 时间窗) 上就混在一起了 —— 关账会归错仓、数量对账也会来回抖。
+        # 它只持续到证据到齐（或超时升级），不是长期停手。
+        if symbol in self.closing_symbols():
+            bad.append(f"{symbol} 平仓成交待核对，暂不开仓")
         if self.db.hl_kill():
             bad.append("kill switch 已触发")
         # 闸门（PR-4）：新开仓属于「重复动作」——同一 coin-side 刚有成交回报（15s 静置）
@@ -1738,8 +2017,10 @@ class Executor:
         # 「关 = 回到旧行为」的说法与实现不符。现在关 = 两条路径一起回到旧行为：
         # mismatch 行直接让出接管权（引擎走人工提醒流）。
         fill_close_on = bool(getattr(self.p, "fill_close", True))
+        # 宽限期（closing）与 mismatch 同一口径：都是「交易所侧已经没有这个仓了」的行，
+        # 只有 reason=='stop' 才放行 —— 也只有它下面那一支「交易所无仓」的关账分支能用。
         if hl_status != "open" and not (fill_close_on and reason == "stop"
-                                        and hl_status == "mismatch"):
+                                        and hl_status in ("mismatch", HL_ST_CLOSING)):
             return False
         symbol, side = row["symbol"], int(row["side"] or 1)
         # 离场也不能猜 coin：解析不出就**让出接管权**（return False）→ 引擎照常走人工提醒流，
@@ -1770,6 +2051,16 @@ class Executor:
                 self._event(EV_ERROR, f"{symbol} mismatch 止损离场但读不到成交价，未关账",
                             symbol=symbol)
                 return False
+            if px is None and hl_status == HL_ST_CLOSING:
+                # 宽限期内读不到成交价：**接管但不关账**，也不许回落人工流。
+                # 这条行本来就归「对账自动消化」管（下一轮会继续重试/回捞），此时把
+                # 用户喊去「到 MEXC 核对持仓已平」既错（HL 仓）又多余（系统会自己处理）。
+                self._event(EV_DECISION,
+                            f"{symbol} 止损离场：交易所已无该仓，成交价核对中（宽限内自动重试）",
+                            symbol=symbol)
+                self._alert(f"【HL执行】ℹ️ {coin} 交易所已无该仓，成交价核对中"
+                            f"（宽限内自动重试），无需人工操作")
+                return True
             self._close_local(position_id, px or ref_price, "stop", sz)
             r = self._r_multiple(row, px or ref_price)
             self._alert(f"【HL执行】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
@@ -1788,12 +2079,12 @@ class Executor:
                         f"本地暂未关账 —— 请人工核对交易所。")
             return True
 
-        if hl_status == "mismatch":
+        if hl_status in ("mismatch", HL_ST_CLOSING):
             # 走到这里 = 交易所**仍有**该 coin 的仓（上面「无仓」那支已返回）。
-            # mismatch 行只允许走「已确认被交易所平掉」那一条路径；账本已经不一致时
+            # 这两类行只允许走「已确认被交易所平掉」那一条路径；账本已经不一致/待核对时
             # 再由执行器撤止损/下平仓单，就是拿一本错账去真实下单 —— 让出接管权，交人工。
             self._event(EV_DECISION,
-                        f"{symbol} mismatch 行止损离场但交易所仍有仓，让出接管权",
+                        f"{symbol} {hl_status} 行止损离场但交易所仍有仓，让出接管权",
                         symbol=symbol)
             return False
 
@@ -2350,6 +2641,84 @@ class Executor:
                             f"{res.get('error') or f'{len(res.get('closed') or [])} 个标的已平'}")
                 return res
 
+    # ------------------------------------------------------------ 窄口径自动解 kill
+    def _kill_clean_read(self) -> int:
+        """连续干净轮次计数（configuration 表；读不懂按 0 —— 宁可多数两轮）。"""
+        try:
+            return max(0, int(float(str(self.db.get_config_str(KILL_CLEAN_KEY, "0") or "0"))))
+        except Exception:                                             # noqa: BLE001
+            return 0
+
+    def _kill_clean_write(self, n: int) -> None:
+        try:
+            self.db.set_config(KILL_CLEAN_KEY, str(int(max(0, n))))
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[hl-exec] 写干净轮次计数失败（本轮不解除 kill）：%s", e)
+
+    def _round_is_clean(self, rec: dict, snap: Optional[dict]) -> bool:
+        """本轮算不算「干净」—— 四条全真才算，任一不满足就归零重数。
+
+        1. 对账 ok（problems 为空）且**不是** unknown：快照读不到 = 什么都不知道，
+           不是「干净」（把「读不到账户」当成恢复条件，等于接口一抖就自解 kill）；
+        2. 本地没有 open/pending 行：有仓还在，账就还没对上（closing 行的 status 也是
+           open，所以这一条同时覆盖「宽限期待核对」）；
+        3. 挂单列表可信（`orders_trusted`）且确实为空：读不到挂单就不知道有没有残留
+           触发单，凭这个解除 kill 可能放着一堆幽灵单去开新仓；
+        4. kill 仍然是 origin='reconcile'（由调用方判，见 _maintain_kill_autoclear）。
+        """
+        if rec.get("unknown") or not rec.get("ok"):
+            return False
+        try:
+            for r in self.db.recent_positions(50):
+                if r["status"] in ("open", "pending"):
+                    return False
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[hl-exec] 读本地仓位失败（本轮不解除 kill）：%s", e)
+            return False
+        if not isinstance(snap, dict) or not bool(snap.get("orders_trusted", False)):
+            return False
+        return not (snap.get("open_orders") or [])
+
+    def _maintain_kill_autoclear(self, rec: dict, snap: Optional[dict] = None) -> List[str]:
+        """对账之后维护「连续干净轮次」，够 2 轮就把**对账自己造成的** kill 解除。
+
+        为什么只认 origin='reconcile'（窄口径）：自动解除的本质是「这个停手是时滞
+        造成的假警报，现在证据齐了」。人工按的 kill（可能是人看到了机器看不见的东西）、
+        当日亏损熔断（钱真的亏了）、数量对账（本地记的量错了）、到期保护（钱包要过期）
+        都不是时滞 —— 对这四类自解 = 把真问题静音。所以只解除自己造成的那一种。
+
+        为什么放在对账**之后**：判据全部来自本轮对账结果，先判等于用上一轮的世界
+        决定要不要放开交易。
+        """
+        alerts: List[str] = []
+        try:
+            killed = bool(self.db.hl_kill())
+            origin = str(self.db.hl_kill_origin() or "")
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[hl-exec] 读 kill 状态/来源失败（本轮不解除）：%s", e)
+            return alerts
+        if not killed or origin != "reconcile":
+            # 非「对账造成的」kill（或本来就没 kill）：计数归零，避免旧计数留到下一次
+            # 对账异常时被直接凑成「已经干净两轮」。
+            self._kill_clean_write(0)
+            return alerts
+        if not self._round_is_clean(rec, snap):
+            self._kill_clean_write(0)
+            return alerts
+        n = self._kill_clean_read() + 1
+        self._kill_clean_write(n)
+        if not bool(getattr(self.p, "kill_autoclear", True)):
+            return alerts                    # 开关关 = 永不自解（计数照记，便于观测）
+        if n < KILL_CLEAN_ROUNDS:
+            return alerts
+        self.db.hl_set_kill(False, "", origin="auto")
+        self._kill_clean_write(0)
+        self._event(EV_KILL, "对账异常已自动恢复（止损/平仓已按成交价入账）",
+                    data={"rounds": n, "origin": "reconcile"})
+        alerts.append(f"【HL执行】✅ 已自动恢复自动交易（对账连续 {n} 轮正常，"
+                      f"此前的对账异常已自动消化）")
+        return alerts
+
     # ------------------------------------------------------------ 每轮
     def run(self, force_snapshot: bool = False) -> List[str]:
         """每轮 tick 调用：快照 → 同步成交 → 对账 → 熔断 → 死手开关 → 心跳。返回告警文案。"""
@@ -2393,7 +2762,9 @@ class Executor:
             problems = rec["problems"]
             self._event(EV_RECONCILE, "对账异常：" + "；".join(problems), data=rec)
             if not rec.get("unknown"):
-                self.db.hl_set_kill(True, "对账异常")
+                # origin='reconcile'：只有这类 kill 允许被「连续 N 轮干净」自动解除
+                # （见 _maintain_kill_autoclear）。人工/熔断/数量/到期永不自解。
+                self.db.hl_set_kill(True, "对账异常", origin="reconcile")
                 self._event(EV_KILL, "对账异常 → 自动 kill switch", data=rec)
             # 告警去重：kill 态下每轮 run() 都会走到这里（5 分钟一轮），
             # 同一状态只推送一次 + 每 6 小时提醒一次仍在等人工；恢复由下方 else 分支报告。
@@ -2431,12 +2802,33 @@ class Executor:
                     alerts.append("【HL执行】✅ 对账已恢复正常")
             # 数量对账处于「观察期」（首次超差、已回捞、未到两击）→ 不写「对账一致」：
             # 明明有未解释的数量差，日志说一致会误导事后复盘。
+            # 宽限期（closing）同理：问题列表为空 ≠ 账已对上，它是「还在等证据」——
+            # 写「对账一致」会让事后复盘以为当时就已经对上了。
             if rec.get("size_warn"):
                 self.db.hl_log_event(EV_RECONCILE,
                                      "数量对账观察中：" + "；".join(rec["size_warn"]),
                                      code_rev=self.p.code_rev)
+            elif rec.get("closing_pending"):
+                self.db.hl_log_event(
+                    EV_RECONCILE,
+                    "平仓成交待核对（宽限中）：" + "；".join(
+                        f"{c['symbol']} 剩 {max(0.0, c['grace_s'] - c['elapsed_s']):.0f}s"
+                        f"（第 {c['rounds']} 轮）" for c in rec["closing_pending"]),
+                    code_rev=self.p.code_rev)
             else:
                 self.db.hl_log_event(EV_RECONCILE, "对账一致", code_rev=self.p.code_rev)
+
+        # 宽限期提醒频控（规格 §2.5）：进入宽限推 1 条；同一仓**不重复推**进入宽限
+        # （`new` 只在第一次写宽限键时为真）；恢复由下面 fill_closed 那条推。
+        for cp in rec.get("closing_pending") or []:
+            if not cp.get("new"):
+                continue
+            alerts.append(f"【HL执行】⏳ {cp['symbol']} 交易所侧已无该仓，平仓成交待核对 —— "
+                          f"已进入宽限（最多 {int(cp['grace_s'] // 60)} 分钟，每轮自动重试），"
+                          f"暂不暂停自动交易；该标的宽限期内不开新仓。")
+
+        # 窄口径自动解 kill（规格 §4）：只对**对账自己造成的** kill 生效。
+        alerts.extend(self._maintain_kill_autoclear(rec, snap))
 
         # 交易所侧已按成交证据关账的仓：推一条提醒让人知道「止损/人工平仓已经生效、
         # 账已对上」。**不设节流键**：一笔仓只会关一次，天然只推一次；重复推送只可能
@@ -2453,13 +2845,14 @@ class Executor:
         for fc in rec.get("fill_closed") or []:
             pos_row = self.db.position_by_id(fc["position_id"])
             side = int((pos_row["side"] if pos_row is not None else 1) or 1)
+            grace_note = ("（宽限期内已核对到成交，账已对上）" if fc.get("grace_ended") else "")
             if fc["reason"] == "stop":
                 r = self._r_multiple(pos_row, fc["px"]) if pos_row is not None else 0.0
                 alerts.append(f"【HL执行】🛑 止损已在交易所成交 · {fc['coin']} {_side_word(side)} "
-                              f"@ {fc['px']:,.2f}，本地已按成交价关账（R {r:+.2f}），{tail}")
+                              f"@ {fc['px']:,.2f}，本地已按成交价关账（R {r:+.2f}），{tail}{grace_note}")
             else:
                 alerts.append(f"【HL执行】ℹ️ {fc['coin']} 已在交易所被平仓（人工/外部）"
-                              f"@ {fc['px']:,.2f}，本地已按成交价关账，{tail}")
+                              f"@ {fc['px']:,.2f}，本地已按成交价关账，{tail}{grace_note}")
 
         # 3) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
         day0 = _today_start_ts()
@@ -2473,7 +2866,7 @@ class Executor:
             if not spot_ok:
                 logger.warning("[hl-exec] 现货余额读取失败，本轮跳过亏损熔断判断（数据不可信）")
             elif start_eq > 0 and (now_eq - start_eq) / start_eq <= -self.p.max_daily_loss_pct:
-                self.db.hl_set_kill(True, "当日亏损熔断")
+                self.db.hl_set_kill(True, "当日亏损熔断", origin="daily_loss")
                 self._event(EV_KILL, f"当日亏损 {((now_eq - start_eq) / start_eq) * 100:.1f}% → kill",
                             data={"start_equity": start_eq, "equity": now_eq})
                 alerts.append(f"【HL执行】⚠️ 当日亏损 {(now_eq - start_eq) / start_eq * 100:.1f}%"

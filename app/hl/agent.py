@@ -867,11 +867,15 @@ def _do_cleanup(db: Any, cfg: Any, notifier: Any, cleanup: Optional[Callable[...
 
 
 def _kill(db: Any, reason: str, log_event: Optional[Callable[..., None]] = None) -> None:
-    """置 kill（已置则不重复写，保留最早的触发原因）。"""
+    """置 kill（已置则不重复写，保留最早的触发原因）。
+
+    origin='expiry'：到期保护清仓造成的 kill 是**人工确认类**的停手
+    （钱包快到期，本来就该由人接手），永不自动解除。
+    """
     try:
         if db.hl_kill():
             return
-        db.hl_set_kill(True, reason)
+        db.hl_set_kill(True, reason, origin="expiry")
         if log_event is not None:
             log_event("kill", f"agent 到期保护：{reason}")
     except Exception as e:                                        # noqa: BLE001

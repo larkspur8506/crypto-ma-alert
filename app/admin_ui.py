@@ -134,6 +134,20 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
      "对账不再按成交证据关账，且 mismatch 行的止损离场也照旧让出接管权"
      "（只能人工补录，别指望 4h 收盘的 on_exit 代关）",
      True, "HL_FILL_CLOSE"),
+    # 2026-10-22 第二轮（对账失败自动消化）：
+    # ① 宽限期 —— 「交易所刚平、本地流水还没同步」是最常见的时滞，用 kill 打断自动交易
+    #    并不能让它更快对上账，只会把人叫起来看一个会自动消失的问题。
+    ("hl_close_grace", "对账证据不足时先进宽限期",
+     "开 = 对账发现「交易所已无该仓、但本轮拿不到成交证据」时先挂起"
+     "（状态「平仓待核对」、每轮自动重试并定点回捞成交、不暂停交易），"
+     "超过宽限时间（参数页可改，默认 15 分钟）才升级成对账异常并停手；"
+     "宽限期内该标的禁止开新仓。关 = 第一轮没证据就按旧行为报异常并停手",
+     True, "HL_CLOSE_GRACE"),
+    ("hl_kill_autoclear", "对账异常可自动恢复",
+     "开 = 仅当停手是「对账异常」造成的（人工触发 / 当日亏损熔断 / 数量对账 / "
+     "到期保护除外），且连续 2 轮对账干净（无本地持仓、无挂单、挂单接口可信）时，"
+     "自动解除停手并推一条提醒；关 = 永远等人工解除",
+     True, "HL_KILL_AUTOCLEAR"),
 )
 
 
@@ -434,6 +448,10 @@ PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
     # 和 risk_pct 一样属于「策略参数」，改完下一轮 tick 生效。
     ("hl_churn_max", "执行与推送", "撤单/重挂熔断阈值（10 分钟内次数，0=关闭）",
      "HL_CHURN_MAX", 5, "int"),
+    # 宽限期（对账失败自动消化）：存**秒**（配置/装配都是秒），渲染时在旁边提示分钟，
+    # 免得「15」被当成 15 秒填进去（那样等于关掉宽限）。范围 300–3600。
+    ("hl_close_grace_s", "执行与推送", "平仓证据宽限时长（秒，300–3600，默认 900 = 15 分钟）",
+     "HL_CLOSE_GRACE_S", 900.0, "float"),
     ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "mode"),
     ("equity", "资金", "账户权益基数 U（固定模式用）", "ACCOUNT_EQUITY", 1000.0, "float"),
     ("equity_min", "资金", "资金下限 U（跟随模式用）", "", 20.0, "float"),
@@ -504,6 +522,14 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
     if key == "hl_agent_valid_until_ms":
         return ("仅当 HL 授权接口查不到同名 Hermes 时用：填毫秒时间戳"
                 "（如 1830000000000）。留空 = 不改动当前值（要清空点下面的「清除兜底」）")
+    if key == "hl_close_grace_s":
+        try:
+            sec = float(getattr(cfg, "hl_close_grace_s", 900.0) or 900.0)
+        except (TypeError, ValueError):
+            sec = 900.0
+        return (f"{sec:.0f} 秒 ≈ {sec / 60:.0f} 分钟：交易所已平仓但拿不到成交证据时，"
+                f"最多等这么久才判对账异常并停手（期间该标的禁止开新仓）。"
+                f"调小 = 更快交人，调大 = 更多自动消化")
     return ""
 
 
@@ -517,6 +543,25 @@ def _flag(val: Any) -> int:
     （fail-dangerous：脚本/表单发 0 反而打开推送）。
     """
     return 1 if str(val if val is not None else "").strip().lower() in _TRUTHY else 0
+
+
+def _manual_kill(deps: Any, on: bool, reason: str = "") -> None:
+    """面板按下的 kill 一律标注 origin='manual' —— 人工 kill **永不**被自动解除。
+
+    为什么要显式传：`db.hl_set_kill` 的 origin 默认值虽然是 manual，但那是给「新增
+    调用点忘了传」兜底的保守默认；面板这条路径是**明确的**人工动作，把意图写进参数里
+    比依赖默认值可靠（将来默认值变了也不会把人工 kill 变成可自解的）。
+
+    兼容注入的替身：`deps.hl_set_kill` 是老签名的两参数可调用对象时不带 origin
+    （测试/脚本里的 lambda），退化成旧调用 —— 但绝不因为参数不匹配就把动作丢掉。
+    """
+    fn = deps.hl_set_kill
+    if fn is None:
+        return
+    try:
+        fn(on, reason, origin="manual")
+    except TypeError:
+        fn(on, reason)
 
 
 def _num_field(key: str, label: str, value: str, hint: str, src: str, step: str = "",
@@ -723,6 +768,25 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
                 else:
                     out["hl_churn_max"] = ch_v
 
+    # 平仓证据宽限时长（秒）：与 hl_churn_max 同一套语义 —— **缺字段/空 = 保持原值**
+    # （老书签/curl 不带这个键时不能把它刷成 0 = 第一轮没证据就 kill，那正是要修的行为）。
+    gs_raw = form.get("hl_close_grace_s")
+    if gs_raw is not None:
+        gs_txt = str(gs_raw or "").strip()
+        if gs_txt:
+            try:
+                gs_v = float(gs_txt.replace(",", ""))
+            except ValueError:
+                errs.append("平仓证据宽限时长不是数字")
+                gs_v = None
+            if gs_v is not None:
+                lo, hi = _R["hl_close_grace_s"]
+                if not (lo <= gs_v <= hi):
+                    errs.append(f"平仓证据宽限时长必须在 {lo:.0f}~{hi:.0f} 秒之间"
+                                f"（{lo / 60:.0f}~{hi / 60:.0f} 分钟）")
+                else:
+                    out["hl_close_grace_s"] = gs_v
+
     # 做空均线：必须是整数
     sraw = str(form.get("short_regime_ma") or "").strip()
     if not sraw:
@@ -831,7 +895,8 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
     #   勾选   → 提交 0 再提交 1 → 后端取最后一个 = 开
     #   字段完全缺失（脚本/旧书签）→ 后端保持原值，不写库
     o.append("<div class='card'><div class='sec'>策略与保护</div>"
-             "<div class='hint'>决定发不发哪个方向、以及 API 快到期时要不要自动清仓。"
+             "<div class='hint'>决定发不发哪个方向、API 快到期时要不要自动清仓，"
+             "以及对账拿不到成交证据时先宽限还是立刻停手。"
              "改完立刻生效（下一轮 tick），不用重启。</div>"
              "<form method='post' action='/admin/switch/strategy'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>")
@@ -1343,6 +1408,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                      equity_mode: Optional[str] = Form(None),
                      equity_min: Optional[str] = Form(None),
                      hl_churn_max: Optional[str] = Form(None),
+                     hl_close_grace_s: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
                      k: str = Form("")):
         token = _auth(deps, request, k or None)
@@ -1353,6 +1419,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             "equity_min": equity_min,
             # PR-4：缺字段（None）= 保持原值，与 equity_mode 同口径
             "hl_churn_max": hl_churn_max,
+            # 宽限期（对账失败自动消化）：同样缺字段 = 保持原值
+            "hl_close_grace_s": hl_close_grace_s,
             "hl_agent_valid_until_ms": hl_agent_valid_until_ms,
         })
         if errs:
@@ -1388,11 +1456,10 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             raise HTTPException(400, f"模式切换保存失败：{err}（面板显示的仍是旧模式）")
         deps.log_event("decision", f"面板切换执行器模式 → {m}")
         if m != "live":
-            if deps.hl_set_kill is not None:
-                try:
-                    deps.hl_set_kill(False, "")
-                except Exception as e:                                   # noqa: BLE001
-                    logger.warning("[admin] 清 kill 失败：%s", e)
+            try:
+                _manual_kill(deps, False, "")
+            except Exception as e:                                   # noqa: BLE001
+                logger.warning("[admin] 清 kill 失败：%s", e)
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 策略与保护（方向开关 + 到期自动清仓） ----------------
@@ -1403,6 +1470,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                               agent_expiry_cleanup: Optional[str] = Form(None),
                               hl_pnl_from_fills: Optional[str] = Form(None),
                               hl_fill_close: Optional[str] = Form(None),
+                              hl_close_grace: Optional[str] = Form(None),
+                              hl_kill_autoclear: Optional[str] = Form(None),
                               k: str = Form("")):
         """保存「策略与保护」的开关。
 
@@ -1416,7 +1485,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
                     "agent_expiry_cleanup": agent_expiry_cleanup,
                     "hl_pnl_from_fills": hl_pnl_from_fills,
-                    "hl_fill_close": hl_fill_close}
+                    "hl_fill_close": hl_fill_close,
+                    "hl_close_grace": hl_close_grace,
+                    "hl_kill_autoclear": hl_kill_autoclear}
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1438,7 +1509,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         word = {1: "开", 0: "关"}
         deps.log_event("decision",
                        "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s"
-                       " · 交易所已平仓自动关账=%s）"
+                       " · 交易所已平仓自动关账=%s · 证据不足先进宽限=%s · 对账异常可自动恢复=%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
@@ -1446,7 +1517,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                           word[vals["hl_pnl_from_fills"]]
                           if "hl_pnl_from_fills" in vals else "不变",
                           word[vals["hl_fill_close"]]
-                          if "hl_fill_close" in vals else "不变"))
+                          if "hl_fill_close" in vals else "不变",
+                          word[vals["hl_close_grace"]]
+                          if "hl_close_grace" in vals else "不变",
+                          word[vals["hl_kill_autoclear"]]
+                          if "hl_kill_autoclear" in vals else "不变"))
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 推送开关 ----------------
@@ -1477,7 +1552,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         want = str(on or "") in ("1", "true", "on")
         if deps.hl_set_kill is not None:
-            deps.hl_set_kill(want, "人工" if want else "")
+            _manual_kill(deps, want, "人工" if want else "")
             deps.log_event("kill", f"面板{'触发' if want else '解除'} kill switch")
         else:
             # 没有真实动作就不记「已触发」事件 —— 事件与事实必须一致

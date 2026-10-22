@@ -41,13 +41,19 @@ FILL_PX = 82375.0              # 止损实际成交价（两笔均价）
 
 def _fills(oids=(STOP_OID, STOP_OID), szs=(0.0025, 0.00388), px=FILL_PX,
            age_s=60, coin="BTC", dir_word="Close Long"):
-    """造交易所成交：默认 = 事故原样（两笔 Close Long，合计 0.00638，oid 都是止损单）。"""
+    """造交易所成交：默认 = 事故原样（两笔 Close Long，合计 0.00638，oid 都是止损单）。
+
+    closedPnl 按腿的方向给：平仓腿才有已实现盈亏（非 0），开仓腿是 0 —— 与交易所
+    真实数据一致（对账的平仓腿判据里有一条「closedPnl != 0」，桩数据给错方向会把
+    开仓腿喂成平仓证据）。
+    """
     now_ms = int(time.time() * 1000)
+    pnl = -5.26 if "Close" in str(dir_word) else 0.0
     out = []
     for i, (oid, sz) in enumerate(zip(oids, szs)):
         out.append({"coin": coin, "oid": oid, "dir": dir_word, "sz": sz, "px": px,
                     "time": now_ms - age_s * 1000, "tid": 419136180065962 + i,
-                    "closedPnl": -5.26, "fee": 0.092671, "feeToken": "USDC", "hash": "0xaaa"})
+                    "closedPnl": pnl, "fee": 0.092671, "feeToken": "USDC", "hash": "0xaaa"})
     return out
 
 
@@ -88,6 +94,11 @@ class FillCloseBase(unittest.TestCase):
         return pid
 
     def executor(self, **kw) -> Executor:
+        # 本文件钉的是**「宽限期关掉」的旧口径**（证据不足 → 立刻 mismatch + kill）：
+        # 这些用例原本就在断言那一条分支，宽限期默认开之后它只在 close_grace=False
+        # 时走到。宽限期本身（默认开）由 tests/test_audit6_grace.py 覆盖 ——
+        # 「差证据不动账」这个铁律两个文件都断言，谁也跑不掉。
+        self.p.close_grace = False
         for k, v in kw.items():
             setattr(self.p, k, v)
         return Executor(self.db, self.p, self.info, self.ex, notifier=self.notifier)

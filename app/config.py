@@ -70,6 +70,19 @@ class Config:
     # 开 = 对账先拿已同步的平仓成交自证，证据严格成立才关账；不成立完全退回旧行为
     # （fail-closed）。设 0 即回到旧行为（应急回滚，与 hl_pnl_from_fills 同处可热改）。
     hl_fill_close: bool = _env("HL_FILL_CLOSE", "1").lower() in ("1", "true", "yes", "on")
+    # 对账失败自动消化（2026-10-22 事故后第二轮）：宽限期 + 窄口径自解 kill。
+    # `hl_close_grace`：对账发现「交易所无仓、但本轮拿不到成交证据」时**先挂起**，
+    #   `hl_status='closing'`、不 kill，每轮重试（兼定点回捞），最多 `hl_close_grace_s` 秒；
+    #   超时才升级成 mismatch + kill。默认 **开**（15 分钟）——「交易所刚成交、本地流水
+    #   还没同步」是最常见的时滞，用 kill 打断自动交易并不能让它更快对上账。
+    hl_close_grace: bool = _env("HL_CLOSE_GRACE", "1").lower() in ("1", "true", "yes", "on")
+    # 宽限秒数：默认 900（15 分钟 ≈ 3 个 tick）。允许范围 300–3600，越界保留原值
+    # （apply_db 语义；不静默关掉宽限功能）。
+    hl_close_grace_s: float = _env_f("HL_CLOSE_GRACE_S", 900.0)
+    # `hl_kill_autoclear`：**只对 origin=reconcile 的 kill** 生效 —— 连续 2 轮干净
+    # （对账一致、无未知、本地无 open/pending/closing、无挂单）才自动解除。
+    # 人工/熔断/数量/到期拉起的 kill 永不自动解除。
+    hl_kill_autoclear: bool = _env("HL_KILL_AUTOCLEAR", "1").lower() in ("1", "true", "yes", "on")
     # churn 熔断阈值（PR-4）：同一 coin-side 在 10 分钟内撤单/改价重挂达到这次数就停手。
     # 0 = 关闭熔断（只留 15s 静置闸门）。默认 5 —— 正常修复不会到 5 次，到了就是
     # 「止损挂不上 → 撤 → 重挂」的循环，继续试只会制造更多无保护瞬间。
@@ -107,7 +120,8 @@ class Config:
                    "enable_long", "enable_shorts", "short_regime_ma", "heartbeat_push",
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
                    "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max",
-                   "hl_fill_close")
+                   "hl_fill_close", "hl_close_grace", "hl_close_grace_s",
+                   "hl_kill_autoclear")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
@@ -126,6 +140,10 @@ class Config:
         # churn 熔断阈值（PR-4）：0 = 关闭（只留静置闸门），上限 100 防止「配成 10000
         # 等于关掉保护还自以为开着」。
         "hl_churn_max": (0, 100),
+        # 平仓宽限秒数：默认 900（15 分钟）。下界 300 = 一个 tick 周期，再小就等于
+        # 没有宽限（第一轮没证据立刻 kill）；上界 3600 = 一小时，再长就是「忘了这回事」，
+        # 期间该标的还禁止开新仓。越界保留原值（不静默关功能）。
+        "hl_close_grace_s": (300.0, 3600.0),
     }
 
     # 字符串配置允许「显式清空」的键。

@@ -249,6 +249,16 @@ class DB:
             (key, json.dumps(value), now()))
         self.conn.commit()
 
+    @_locked
+    def del_config(self, key: str) -> None:
+        """删掉一个配置键（宽限期 `hl_close_grace:<pid>` 这类「有生命周期的状态」用）。
+
+        `set_config` 只能写不能删：宽限到期/证明成功必须真的**消失**，
+        否则「键存在」这条判据永远成立（下一轮又被当成还在宽限期）。
+        """
+        self.conn.execute("DELETE FROM configuration WHERE key=?", (str(key),))
+        self.conn.commit()
+
     # ---------------- bar state
     @_locked
     def get_last_bar(self, symbol: str) -> Optional[int]:
@@ -696,7 +706,26 @@ class DB:
         return raw in ("1", "true", "yes", "on")
 
     @_locked
-    def hl_set_kill(self, on: bool, reason: str = "") -> None:
+    def hl_kill_origin(self) -> str:
+        """这次 kill 是**谁**拉起来的：manual / reconcile / daily_loss / size / expiry / auto。
+
+        自动解除只认 `reconcile`（对账自己造成的），其它来源（人工、熔断、数量、
+        到期）一律不动 —— 这是「窄口径」的唯一判据，读侧不许自己再推断。
+        老库里没有这个键（升级前触发的 kill）→ 返回空串，等价于「来源不明 = 人工」。
+        """
+        return str(self.get_config_str("hl_exec_kill_origin", "") or "").strip()
+
+    @_locked
+    def hl_set_kill(self, on: bool, reason: str = "", origin: str = "manual") -> None:
+        """置/清 kill。``origin`` 必须由调用点显式给出（见各调用点注释）。
+
+        origin 只做**归因**，不改变 kill 的语义：它唯一的用途是让
+        「对账异常已自动消化」那条窄口径能确认「这个 kill 是我自己造成的」，
+        从而允许连续 N 轮干净后自动解除（见 Executor._run_locked）。
+        默认 "manual"：新增调用点忘了传时段成人工 kill —— 偏保守（永不自解），
+        不会出现「谁都能自解」的宽松默认。
+        """
         self.set_config("hl_exec_kill", 1 if on else 0)
+        self.set_config("hl_exec_kill_origin", str(origin or "manual"))
         if reason:
             self.set_config("hl_exec_kill_reason", reason)

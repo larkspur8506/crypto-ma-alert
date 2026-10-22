@@ -135,6 +135,11 @@ def hl_params():
         # 缺键/脏值一律按「开」（这正是修复本身；关掉它等于回到误 kill 的旧行为），
         # 与 pnl_from_fills 同一种「从面板配置读布尔」的装配模式。
         fill_close=bool(getattr(cfg, "hl_fill_close", True)),
+        # 对账失败自动消化（宽限期 + 窄口径自解 kill）：与 fill_close 同一种装配模式。
+        # 脏值/缺键 → 按开（这是修复本身；关掉等于回到「没证据就 kill」的旧行为）。
+        close_grace=bool(getattr(cfg, "hl_close_grace", True)),
+        close_grace_s=_grace_seconds(cfg),
+        kill_autoclear=bool(getattr(cfg, "hl_kill_autoclear", True)),
         # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
         # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
         churn_max=_churn_max(cfg),
@@ -167,6 +172,24 @@ def _churn_max(cfg) -> int:
     except (TypeError, ValueError):
         return 5
     return n if n >= 0 else 5
+
+
+GRACE_DEFAULT_S = 900.0
+
+
+def _grace_seconds(cfg) -> float:
+    """平仓宽限秒数。脏值/缺键/越界一律退回 900（15 分钟）。
+
+    与 `_churn_max` 同一个理由：读坏的字符串不该把宽限关成 0 秒（= 第一轮没证据
+    就 kill，回到要修的那个行为），也不该放大成一天（期间该标的禁止开新仓）。
+    """
+    raw = getattr(cfg, "hl_close_grace_s", None)
+    try:
+        v = float(str(raw).strip().strip('"').strip("'"))
+    except (TypeError, ValueError):
+        return GRACE_DEFAULT_S
+    lo, hi = 300.0, 3600.0
+    return v if lo <= v <= hi else GRACE_DEFAULT_S
 
 
 def hl_info_base() -> str:
@@ -997,15 +1020,20 @@ def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
     db.set_config("hl_exec_mode", mode)
     db.hl_log_event("decision", f"人工切换执行器模式 → {mode}")
     if mode != "live":
-        db.hl_set_kill(False, "")
+        # 人工路径（含「切出 live」这种收尾动作）→ origin='manual'：永不被自动解除。
+        db.hl_set_kill(False, "", origin="manual")
     return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)
 
 
 @app.post("/admin/hl/kill")
 def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
-    """kill switch：off=恢复正常，on=暂停自动交易（仍允许人工平仓/撤单）。"""
+    """kill switch：off=恢复正常，on=暂停自动交易（仍允许人工平仓/撤单）。
+
+    origin 显式写 'manual'：这是**人**按的按钮，绝不能被「连续 N 轮对账干净」自动解除
+    —— 人按下去通常正因为它看到了机器看不出的东西（见 Executor._maintain_kill_autoclear）。
+    """
     _require_admin(request, k or None)
     want = on in ("1", "true", "on")
-    db.hl_set_kill(want, "人工" if want else "")
+    db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
     return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)
