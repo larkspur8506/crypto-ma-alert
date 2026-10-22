@@ -125,6 +125,13 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
      "开 = 记录页「净额（流水）」列显示按真实成交聚合的净额；"
      "关 = 不显示该列（面板仍用交易所已实现口径）。两种状态下净额都会照常计算入库",
      False, "HL_PNL_FROM_FILLS"),
+    # 2026-10-22 事故修复：交易所挂单止损成交后本地不关账，旧逻辑下一轮对账会误判
+    # mismatch 并 kill。默认开；关掉 = 回到旧行为（只适合排查对账逻辑时临时用）。
+    ("hl_fill_close", "交易所已平仓时自动关账",
+     "开 = 对账发现「本地有仓、交易所无仓」时，先用已同步的平仓成交（reduce-only、"
+     "开仓后、数量足额）证明仓位真的已平 → 按成交价关账并把止损单落终态，不暂停交易；"
+     "证据不成立才按旧行为报对账异常并停手。关 = 完全回到旧行为",
+     True, "HL_FILL_CLOSE"),
 )
 
 
@@ -1393,6 +1400,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                               enable_shorts: Optional[str] = Form(None),
                               agent_expiry_cleanup: Optional[str] = Form(None),
                               hl_pnl_from_fills: Optional[str] = Form(None),
+                              hl_fill_close: Optional[str] = Form(None),
                               k: str = Form("")):
         """保存「策略与保护」的开关。
 
@@ -1405,7 +1413,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         token = _auth(deps, request, k or None)
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
                     "agent_expiry_cleanup": agent_expiry_cleanup,
-                    "hl_pnl_from_fills": hl_pnl_from_fills}
+                    "hl_pnl_from_fills": hl_pnl_from_fills,
+                    "hl_fill_close": hl_fill_close}
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1426,13 +1435,16 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                                     status_code=303)
         word = {1: "开", 0: "关"}
         deps.log_event("decision",
-                       "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s）"
+                       "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s"
+                       " · 交易所已平仓自动关账=%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
                           if "agent_expiry_cleanup" in vals else "不变",
                           word[vals["hl_pnl_from_fills"]]
-                          if "hl_pnl_from_fills" in vals else "不变"))
+                          if "hl_pnl_from_fills" in vals else "不变",
+                          word[vals["hl_fill_close"]]
+                          if "hl_fill_close" in vals else "不变"))
         return RedirectResponse(_back(token, "switch"), status_code=303)
 
     # ---------------- 推送开关 ----------------

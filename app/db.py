@@ -46,7 +46,7 @@ CREATE TABLE IF NOT EXISTS positions (
     actual_stop REAL,
     stop_placed INTEGER DEFAULT 0,
     exit_price REAL,
-    exit_reason TEXT,                  -- stop | ma20 | manual
+    exit_reason TEXT,                  -- stop | ma20 | manual | exchange（交易所侧已平仓）
     auto_closed INTEGER DEFAULT 0,     -- 1 = 系统按参考价自动关（用户可覆盖真实成交价）；0 = 用户已确认
     r_multiple REAL,
     -- PR-3：流水口径的净 PnL（Σclosed_pnl − 手续费），关账那一刻由执行器用
@@ -130,6 +130,10 @@ CREATE TABLE IF NOT EXISTS hl_fills (
     side INTEGER, sz REAL, px REAL,
     fee REAL, fee_token TEXT, fee_quote REAL, dir TEXT, closed_pnl REAL, hash TEXT,
     reduce_only INTEGER DEFAULT 0,
+    -- oid：产生这笔成交的交易所订单号。对账要判「这笔平仓成交是不是本仓的止损单
+    -- 打出来的」（见 Executor._fill_close_proof），只靠 tid/价格无从判断；老库由
+    -- _migrate 补列，老行留 NULL（NULL 一律按「不知道是哪张单」处理，fail-closed）。
+    oid INTEGER,
     ts INTEGER, created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS hl_events (
@@ -214,6 +218,11 @@ class DB:
         if fcols and "fee_quote" not in fcols:
             self.conn.execute("ALTER TABLE hl_fills ADD COLUMN fee_quote REAL")
             logger.info("[db] 迁移：hl_fills 新增 fee_quote 列")
+        # 成交所属订单号（2026-10-22 事故修复）：老库补列，历史行保持 NULL ——
+        # 「当时没记」是事实，回填一个猜出来的 oid 会让对账把平仓归错单。
+        if fcols and "oid" not in fcols:
+            self.conn.execute("ALTER TABLE hl_fills ADD COLUMN oid INTEGER")
+            logger.info("[db] 迁移：hl_fills 新增 oid 列")
 
     # ---------------- configuration
     @_locked
@@ -540,15 +549,17 @@ class DB:
         ``fee`` 是交易所原值，币种由 ``fee_token`` 指明；``fee_quote`` 是折算成计价币
         （U）后的金额 —— 只有 fee_token 属于计价币时才等于 fee，其余留 None 由调用方
         决定怎么标注（见 Executor._sync_fills）。列顺序与 CREATE TABLE 一致。
+        ``oid`` 是产生这笔成交的订单号（对账判「哪张单平的仓」用），老数据可能为 None。
         """
         self.conn.execute(
             "INSERT OR IGNORE INTO hl_fills(tid, symbol, coin, side, sz, px, fee, fee_token,"
-            " fee_quote, dir, closed_pnl, hash, reduce_only, ts, created_at)"
-            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " fee_quote, dir, closed_pnl, hash, reduce_only, oid, ts, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (str(kw.get("tid")), kw.get("symbol"), kw.get("coin"), kw.get("side"), kw.get("sz"),
              kw.get("px"), kw.get("fee"), kw.get("fee_token"), kw.get("fee_quote"),
              kw.get("dir"), kw.get("closed_pnl"), kw.get("hash"),
-             1 if kw.get("reduce_only") else 0, kw.get("ts"), now()))
+             1 if kw.get("reduce_only") else 0, kw.get("oid"),
+             kw.get("ts"), now()))
         self.conn.commit()
 
     @_locked

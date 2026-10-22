@@ -131,6 +131,10 @@ def hl_params():
         # 净 PnL 口径（PR-3）：默认关。DB > env（Config.apply_db 已解析好），
         # 与 fill_push 同一种「从面板配置读布尔」的模式。
         pnl_from_fills=bool(getattr(cfg, "hl_pnl_from_fills", False)),
+        # 交易所侧已平仓 → 对账按成交价关账（2026-10-22 事故修复）：DB > env > 默认开。
+        # 缺键/脏值一律按「开」（这正是修复本身；关掉它等于回到误 kill 的旧行为），
+        # 与 pnl_from_fills 同一种「从面板配置读布尔」的装配模式。
+        fill_close=bool(getattr(cfg, "hl_fill_close", True)),
         # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
         # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
         churn_max=_churn_max(cfg),
@@ -845,6 +849,7 @@ def _close_form(row, request: Request = None) -> HTMLResponse:
           <option value='ma20' {'selected' if row['exit_reason'] == 'ma20' else ''}>收到提醒后平仓</option>
           <option value='stop' {'selected' if row['exit_reason'] == 'stop' else ''}>止损单被触发</option>
           <option value='manual' {'selected' if row['exit_reason'] == 'manual' else ''}>手动提前平</option>
+          <option value='exchange' {'selected' if row['exit_reason'] == 'exchange' else ''}>交易所侧已平仓（人工/外部）</option>
         </select></p>
       <button type='submit'>保存平仓价</button>
     </form>

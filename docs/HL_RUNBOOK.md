@@ -31,6 +31,7 @@
 | `HL_DEADMAN_MINUTES` | 死手开关窗口（每分钟自动续期） | 30 |
 | `HL_MIN_NOTIONAL` | 交易所最小名义 | 10.0 |
 | `HL_CHURN_MAX` | 同一 coin-side 10 分钟内撤单/改价重挂达这次数就停手（0 = 关闭熔断）。DB `hl_churn_max` 优先 | 5 |
+| `HL_FILL_CLOSE` | 交易所侧已平仓时按成交价自动关账（见 §6 B 前的「止损已成交」小节）。DB `hl_fill_close` 优先 | `1`（开） |
 
 改 env 必须 `docker compose up -d` 重建（容器不热读 env）；改 `hl_exec_mode` / kill 走面板或 DB，立即生效。
 
@@ -143,6 +144,10 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 
 ### B. 对账 mismatch（`hl_events` 有「对账异常」）
 执行器会**自动 kill**（停止新开仓）。处理：① 用 §4 的 `clearinghouseState` 看真实仓位；② 与本地 `positions` 表核对；③ 人工把仓位与本地记录对齐（平掉多余的仓 / 在确认页补录）；④ 面板解除 kill 前，先确认 `hl_orders` 里没有卡在 `intent/sent` 的单。
+
+#### 止损/人工已在交易所平仓（`hl_fill_close`，默认开）
+对账发现「本地有仓、交易所无仓」时，**先**用本轮已同步的 `hl_fills` 自证仓位已平：成交必须是开仓后（`opened_at−120s` 起）、`reduce_only`/`Close` 腿、合计数量 ≥ 持仓量（`hl_sz`，回落 `actual_contracts`）−1 tick。三条全满足才按**加权成交均价**关账（`exit_reason` = 全部成交出自 `hl_stop_oid` → `stop`，否则 `exchange`）、把对应挂单落 `filled`、推一条提醒，且**不** kill；任一条件不满足（无成交/数量不足/精度不可知/oid 不明）完全退回旧行为（mismatch + kill）。
+面板「策略与保护」可关掉该开关（DB `hl_fill_close=0`）即回到旧行为；关掉后止损成交仍要靠人工或 4h 收盘的 `on_exit` 补关账。
 
 ### B2. 数量对账不一致（`hl_events` 有「数量对账」/「持仓数量对账不一致」）
 reconcile 除了比「有没有仓 / 有没有止损」，还比**数量**：本地 `hl_fills` 的净量
