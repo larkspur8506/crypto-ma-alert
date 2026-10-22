@@ -441,8 +441,13 @@ class TestReconcileAndRun(Base):
         self.executor().on_entry(pid)
         self.info._snap = _snap(positions=[])                     # 交易所没了
         rec = self.executor().reconcile()
-        self.assertFalse(rec["ok"])
-        self.assertIn("本地有仓", rec["problems"][0])
+        # 2026-10-22 起首轮先进宽限（closing）；超时才判 mismatch（下面把两段都钉住）
+        self.assertTrue(rec["ok"], "首轮只应进宽限")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "closing")
+        self.db.set_config(f"hl_close_grace:{pid}", f"{time.time() - 1000:.3f}:3")
+        rec2 = self.executor().reconcile()
+        self.assertFalse(rec2["ok"])
+        self.assertIn("未拿到成交证据", rec2["problems"][0])
         self.assertEqual(self.db.position_by_id(pid)["hl_status"], "mismatch")
 
     def test_reconcile_detects_missing_stop(self):
@@ -475,9 +480,16 @@ class TestReconcileAndRun(Base):
         pid = self.add_signal()
         self.executor().on_entry(pid)
         self.info._snap = _snap(positions=[])
+        # 首轮：进宽限，不 kill（先给「成交还在路上」一个重试窗口）
         alerts = self.executor().run(force_snapshot=True)
+        self.assertFalse(self.db.hl_kill(), "宽限期内不应 kill")
+        self.assertEqual(self.db.position_by_id(pid)["hl_status"], "closing")
+        self.assertTrue(any("进入宽限" in m for m in self.notifier.messages))
+        # 宽限超时：必须 kill 并推「对账异常」（原意保留）
+        self.db.set_config(f"hl_close_grace:{pid}", f"{time.time() - 1000:.3f}:3")
+        alerts2 = self.executor().run(force_snapshot=True)
         self.assertTrue(self.db.hl_kill())
-        self.assertTrue(any("对账异常" in a for a in alerts))
+        self.assertTrue(any("对账异常" in a for a in alerts2))
         self.assertEqual(len(self.events("kill")), 1)
 
     def test_run_unknown_state_does_not_kill(self):
