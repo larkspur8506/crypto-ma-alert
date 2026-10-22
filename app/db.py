@@ -146,7 +146,23 @@ CREATE TABLE IF NOT EXISTS hl_snapshots (
     ts REAL NOT NULL, equity REAL, withdrawable REAL, margin_used REAL,
     notional REAL, unrealized_pnl REAL, positions_json TEXT, created_at REAL NOT NULL
 );
+-- 出入金流水（feat/pnl-curve）：面板的盈亏曲线 = equity − Σflows。
+-- 与 hl_snapshots 一样是**观测表**：只用来算「剔除了出入金的盈亏」，不参与交易决策。
+-- kind: deposit|withdraw|send_in|send_out|vault_in|vault_out|other；
+-- amount 带符号（正 = 流入账户）。UNIQUE(hash, ts) 让重复拉取天然幂等。
+CREATE TABLE IF NOT EXISTS hl_flows (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    kind TEXT NOT NULL,
+    amount REAL NOT NULL,
+    hash TEXT,
+    counterparty TEXT,
+    dex TEXT,
+    created_at REAL NOT NULL,
+    UNIQUE(hash, ts)
+);
 CREATE INDEX IF NOT EXISTS idx_hl_snap_ts ON hl_snapshots(ts);
+CREATE INDEX IF NOT EXISTS idx_hl_flows_ts ON hl_flows(ts);
 CREATE INDEX IF NOT EXISTS idx_hl_events_created ON hl_events(created_at);
 """
 
@@ -649,6 +665,42 @@ class DB:
     @_locked
     def hl_latest_snapshot(self) -> Optional[sqlite3.Row]:
         return self.conn.execute("SELECT * FROM hl_snapshots ORDER BY ts DESC LIMIT 1").fetchone()
+
+    # ---------------- 出入金流水（feat/pnl-curve）
+    @_locked
+    def hl_add_flow(self, flow: Dict[str, Any]) -> bool:
+        """写一条流水。`INSERT OR IGNORE` + `UNIQUE(hash, ts)` = 幂等（重复拉取不写两行）。
+
+        返回 True = 真的插了一行（新流水），False = 已存在被忽略。返回值给执行器做
+        「本轮新拉到几笔」的日志，也给测试断言去重；**不参与任何交易判断**。
+        """
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO hl_flows(ts, kind, amount, hash, counterparty, dex, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (float(flow.get("ts") or 0.0), str(flow.get("kind") or "other"),
+             float(flow.get("amount") or 0.0), flow.get("hash"),
+             flow.get("counterparty") or None, flow.get("dex") or None, now()))
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    @_locked
+    def hl_flows_since(self, since_ts: float = 0.0) -> List[sqlite3.Row]:
+        """按时间升序返回流水（读侧算前缀和用；总量是「一生几百条」级别）。"""
+        return list(self.conn.execute(
+            "SELECT * FROM hl_flows WHERE ts >= ? ORDER BY ts ASC, id ASC", (float(since_ts),)))
+
+    @_locked
+    def hl_flow_sum(self, since_ts: float = 0.0) -> float:
+        """净入金合计（正 = 净流入）。"""
+        r = self.conn.execute(
+            "SELECT sum(amount) AS s FROM hl_flows WHERE ts >= ?", (float(since_ts),)).fetchone()
+        return float(r["s"]) if r and r["s"] is not None else 0.0
+
+    @_locked
+    def hl_flow_last_ts(self) -> Optional[float]:
+        """最后一条流水的交易所时间（秒）。None = 本地一条都没有（→ 首次全量回填）。"""
+        r = self.conn.execute("SELECT max(ts) AS t FROM hl_flows").fetchone()
+        return float(r["t"]) if r and r["t"] else None
 
     @_locked
     def prune_hl_telemetry(self, keep_days: float = 30.0, keep_events: int = 20000,

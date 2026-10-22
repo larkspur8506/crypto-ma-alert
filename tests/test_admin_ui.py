@@ -214,7 +214,7 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "权益曲线", "仓位", "交易所挂单"):
+        for s in ("账户总值", "盈亏曲线（已剔除出入金）", "仓位", "交易所挂单"):
             self.assertIn(s, html)
         # 2026-10-19：状态卡在总览末尾（PR#29 搬多了，用户拍板只把「更新 API」表单留参数页）
         self.assertIn("<h2>API 有效期</h2>", html)
@@ -229,7 +229,7 @@ class TestOverviewTab(BaseCase):
         """迁走三张表 + API 有效期卡片后，总览的当下块必须还在（仓位/挂单/系统）。"""
         html = self.body(tab="overview")
         for keep in ("<h2>仓位</h2>", "<h2>交易所挂单</h2>", "<h2>系统</h2>",
-                     "<h2>权益曲线</h2>"):
+                     "<h2>盈亏曲线（已剔除出入金）</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
         # API 有效期状态卡在总览末尾（只把写私钥的「更新 API」表单留在参数页）
         self.assertIn("<h2>API 有效期</h2>", html)
@@ -241,7 +241,7 @@ class TestOverviewTab(BaseCase):
         self.assertEqual(html.count("<h1>"), 1, "整页只能有一个 <h1>（hl 自带标题已剥掉）")
         # <h2> 区块是 hl/views._render_body 的产物，admin_ui 自己一个 <h2> 都不渲染
         # （记录页的五块用 <div class='sec'> 标题，不用 <h2>）
-        for h2 in ("<h2>仓位</h2>", "<h2>权益曲线</h2>", "<h2>交易所挂单</h2>"):
+        for h2 in ("<h2>仓位</h2>", "<h2>盈亏曲线（已剔除出入金）</h2>", "<h2>交易所挂单</h2>"):
             self.assertIn(h2, html, f"总览应内嵌 _render_body 的 {h2}")
         # 下单记录已迁走 → 总览的 <h2> 计数也随之减少（防"删了又长回来"）
         self.assertNotIn("<h2>下单记录", html)
@@ -711,7 +711,7 @@ class TestLegacyRedirects(BaseCase):
         self.assertEqual(j["schema_version"], 1)
         for k in ("ts", "mode", "kill", "network", "account", "positions",
                   "orders_open", "orders_recent", "fills", "signals", "system",
-                  "equity_curve", "events"):
+                  "curve", "events"):
             self.assertIn(k, j, f"JSON schema 少了 {k}")
         self.assertIn("equity", j["account"])
 

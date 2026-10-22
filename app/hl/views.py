@@ -38,6 +38,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
 
 from app import posfields
+from app.hl import flows as hl_flows
 from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
                           theme_switch_html)
 
@@ -52,7 +53,7 @@ __all__ = [
 ]
 
 # 长表每页行数（手机优先）：默认 20，面板上可切 10/20/50，选择存 cookie `cma_rows`。
-# 只作用于「记录/历史」类长表（记录页的下单/成交/信号/提醒/事件五块）；权益曲线不受影响。
+# 只作用于「记录/历史」类长表（记录页的下单/成交/信号/提醒/事件五块）；盈亏曲线不受影响。
 ROW_CHOICES = (10, 20, 50)
 DEFAULT_ROWS = 20
 ROWS_COOKIE = "cma_rows"
@@ -643,15 +644,22 @@ def status_payload(deps: DashboardDeps) -> dict:
             sig["pnl_source"] = d.get("pnl_source")
         signals.append(sig)
 
-    # ---------------- 权益曲线 ----------------
+    # ---------------- 盈亏曲线（已剔除出入金）+ TWR 指数 ----------------
+    # 旧版这里直接画 hl_snapshots.equity —— 出入金会把曲线顶出一个台阶（本账户
+    # 2026-10-14 +100.79、10-21 +901.80 两笔转入），看着像暴赚。现在主曲线是
+    # 「剔除出入金的累计盈亏」，另叠一条时间加权收益指数（TWR，起点 100）：
+    # 前者回答「交易赚了多少 U」，后者回答「收益率多少」（入金的时点不影响它）。
+    # 计算全在 app/hl/flows.py（纯本地，不打接口）；equity 仍用于熔断基线与顶部数字。
     snaps = _db_call(deps.db, "hl_snapshots", now - 30 * _DAY, 20000) or []
-    curve_30: List[List[float]] = []
-    for s in snaps:
-        d = _rowd(s)
-        t = _opt_num(d.get("ts"))
-        if t is not None:
-            curve_30.append([t, _num(d.get("equity"))])
-    curve_7 = [[t, e] for t, e in curve_30 if t >= now - 7 * _DAY]
+    flows = _db_call(deps.db, "hl_flows_since", 0.0) or []
+    # 「流水可信吗」：有过一次**成功**同步（hl_flows_synced_at）或本地已有流水。
+    # 两者都没有 = 从没拉成功过 → 不画曲线（不退回权益曲线：那正是要删掉的东西，
+    # 而且会给出误导性走势），只显示一句提示。
+    synced_at = _opt_num(_config_get(deps, "hl_flows_synced_at", "0")) or 0.0
+    flows_ok = bool(flows) or synced_at > 0
+    curve = hl_flows.curve(
+        snaps, flows, now=now, window_s=30 * _DAY, flows_ok=flows_ok,
+        flows_note="" if flows_ok else "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
 
     # ---------------- 事件 / 系统 ----------------
     events: List[dict] = []
@@ -741,61 +749,163 @@ def status_payload(deps: DashboardDeps) -> dict:
                                    orders_trusted=bool(snap.get("orders_trusted", False))
                                    if snap else False),
         },
-        "equity_curve": {"7d": curve_7, "30d": curve_30},
+        # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
+        # 用户要求**整个删掉**，不是开关 —— 全仓只有这一个图表源。
+        "curve": curve,
         "events": events,
     }
 
 
-# ---------------------------------------------------------------- SVG 权益曲线
-def _equity_svg(points: List[List[float]], width: int = 760, height: int = 160) -> str:
-    """手写内联 SVG 折线（不引任何图表库）。"""
-    # 审计三轮 L：按像素列降采样 —— 30 天 5 分钟一张快照 ≈ 8600 点，
-    # 保留窗口内可能上万点，全量内联 polyline 会让页面体积和渲染开销线性膨胀。
-    if len(points) > (width * 2):
-        step = len(points) / (width * 2)
-        points = [points[min(len(points) - 1, int(i * step))] for i in range(width * 2)]
-    pad_l, pad_r, pad_t, pad_b = 6, 6, 12, 16
-    if len(points) < 2:
-        return (f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' "
-                f"aria-label='权益曲线'>"
-                f"<text x='{width / 2}' y='{height / 2}' text-anchor='middle' "
-                f"class='gtext' font-size='12'>暂无权益快照（等执行器落一次 hl_snapshots）</text></svg>")
+# ---------------------------------------------------------------- SVG 盈亏曲线
+_CURVE_EMPTY = "暂无数据（等执行器落快照一次 hl_snapshots）"
 
-    xs = [_num(p[0]) for p in points]
-    ys = [_num(p[1]) for p in points]
+
+def _curve_points(v: Any) -> List[List[float]]:
+    """payload 的 [[ts, val], ...] → 干净的 float 点列（脏数据直接丢）。"""
+    out: List[List[float]] = []
+    for x in _as_list(v):
+        if isinstance(x, (list, tuple)) and len(x) >= 2:
+            t, y = _opt_num(x[0]), _opt_num(x[1])
+            if t is not None and y is not None:
+                out.append([t, y])
+    return out
+
+
+def _curve_window(pnl: List[List[float]], twr: List[List[float]]) -> tuple:
+    """展示窗口：优先近 7 天（≥2 点），否则整个 30 天；(pnl, twr, 标签)。"""
+    if len(pnl) < 2:
+        return [], [], "近 7 天"
+    cut = pnl[-1][0] - 7 * _DAY
+    sel_p = [p for p in pnl if p[0] >= cut]
+    if len(sel_p) >= 2:
+        sel_t = [p for p in twr if p[0] >= cut]
+        return sel_p, sel_t, "近 7 天"
+    return pnl, twr, "近 30 天"
+
+
+def _downsample(n: int, cap: int) -> List[int]:
+    """按像素列降采样（抽样下标，审计三轮 L）：30 天 5 分钟一张快照 ≈ 8600 点，全量内联
+    polyline 会让页面体积和渲染开销线性膨胀。返回要保留的下标列表。"""
+    if n <= cap:
+        return list(range(n))
+    step = n / float(cap)
+    idx = [min(n - 1, int(i * step)) for i in range(cap)]
+    if idx[-1] != n - 1:
+        idx[-1] = n - 1
+    return idx
+
+
+def _pnl_svg(pnl: List[List[float]], twr: List[List[float]],
+             width: int = 760, height: int = 160) -> str:
+    """手写内联 SVG（零外部资源）：
+
+    - 主曲线 = 累计盈亏（USDC，左轴）：0 基准线灰色虚线；正区间绿、负区间红
+      —— 用**分段折线**实现（穿过 0 时插值出交点，两段各自着色），不是渐变、不靠 JS。
+    - 叠加曲线 = 收益指数 TWR（独立缩放，右轴）：虚线；右侧标出该轴的 min/max。
+    """
+    if len(pnl) < 2:
+        return (f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' "
+                f"aria-label='盈亏曲线'>"
+                f"<text x='{width / 2}' y='{height / 2}' text-anchor='middle' "
+                f"class='gtext' font-size='12'>{_CURVE_EMPTY}</text></svg>")
+
+    pad_l, pad_r, pad_t, pad_b = 6, 46, 12, 16
+    idx = _downsample(len(pnl), width * 2)
+    pts_p = [pnl[i] for i in idx]
+    # TWR 与 pnl 同一时间轴（同一份快照序列）。长度不一致时按时间对齐，不强凑。
+    if len(twr) == len(pnl):
+        pts_t = [twr[i] for i in idx]
+    else:
+        by_ts = {round(p[0], 3): p[1] for p in twr}
+        pts_t = [[p[0], by_ts[round(p[0], 3)]] for p in pts_p if round(p[0], 3) in by_ts]
+
+    xs = [p[0] for p in pts_p]
+    ys = [p[1] for p in pts_p]
     x0, x1 = min(xs), max(xs)
-    y0, y1 = min(ys), max(ys)
+    y0, y1 = min(min(ys), 0.0), max(max(ys), 0.0)      # 0 一定在可视范围内
     span_x = (x1 - x0) or 1.0
-    span_y = (y1 - y0) or (abs(y0) * 0.02 or 1.0)
+    span_y = (y1 - y0) or 1.0
+
+    plot_w = width - pad_l - pad_r
+    plot_h = height - pad_t - pad_b
 
     def sx(x: float) -> float:
-        return round(pad_l + (x - x0) / span_x * (width - pad_l - pad_r), 1)
+        return round(pad_l + (x - x0) / span_x * plot_w, 1)
 
     def sy(y: float) -> float:
-        return round(height - pad_b - (y - y0) / span_y * (height - pad_t - pad_b), 1)
+        return round(height - pad_b - (y - y0) / span_y * plot_h, 1)
 
-    pts = " ".join(f"{sx(x)},{sy(y)}" for x, y in zip(xs, ys))
-    base_y = round(height - pad_b, 1)
-    area = f"{sx(xs[0])},{base_y} {pts} {sx(xs[-1])},{base_y}"
+    # ---- 主曲线：按 0 轴切段（正绿负红），穿过 0 时插值出交点
+    segs: List[tuple] = []
+    cur_cls: Optional[str] = None
+    cur: List[tuple] = []
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        cls = "gpos" if y >= 0 else "gneg"
+        px, py = sx(x), sy(y)
+        if cur_cls is None:
+            cur_cls, cur = cls, [(px, py)]
+            continue
+        if cls == cur_cls:
+            cur.append((px, py))
+            continue
+        prev_x, prev_y = xs[i - 1], ys[i - 1]
+        denom = (y - prev_y) or (1e-12 if y >= 0 else -1e-12)
+        x_cross = prev_x + (-prev_y) / denom * (x - prev_x)
+        cross = (sx(x_cross), sy(0.0))
+        cur.append(cross)
+        segs.append((cur_cls, cur))
+        cur_cls, cur = cls, [cross, (px, py)]
+    if cur:
+        segs.append((cur_cls, cur))
+
+    paths = []
+    for cls, pts in segs:
+        if len(pts) < 2:
+            pts = [pts[0], (pts[0][0] + 0.1, pts[0][1])]   # 单点段也要可见
+        coords = " ".join(f"{px},{py}" for px, py in pts)
+        paths.append(f"<polyline points='{coords}' fill='none' class='{cls}' "
+                     f"stroke-width='2' stroke-linejoin='round' stroke-linecap='round'/>")
+
+    # ---- 叠加曲线：TWR 独立缩放（右轴）
+    right = ""
+    if len(pts_t) >= 2:
+        ts_ = [p[0] for p in pts_t]
+        vs = [p[1] for p in pts_t]
+        t0, t1 = min(vs), max(vs)
+        pad = (t1 - t0) * 0.08 or max(abs(t1) * 0.01, 1.0)
+        t0, t1 = t0 - pad, t1 + pad
+        span_t = (t1 - t0) or 1.0
+
+        def ty(v: float) -> float:
+            return round(height - pad_b - (v - t0) / span_t * plot_h, 1)
+
+        coords = " ".join(f"{sx(x)},{ty(v)}" for x, v in zip(ts_, vs))
+        right = (f"<polyline points='{coords}' fill='none' class='gtwr' stroke-width='1.6' "
+                 f"stroke-linejoin='round' stroke-linecap='round'/>"
+                 # 右轴 min/max 两个刻度（可见文字，不靠悬停）
+                 + f"<text x='{width - pad_r + 3}' y='{ty(max(vs)) + 4}' class='gtext' "
+                   f"font-size='10'>{max(vs):,.1f}</text>"
+                 + f"<text x='{width - pad_r + 3}' y='{ty(min(vs)) + 4}' class='gtext' "
+                   f"font-size='10'>{min(vs):,.1f}</text>")
+
     grid = "".join(
-        f"<line x1='{pad_l}' y1='{round(pad_t + f * (height - pad_t - pad_b), 1)}' "
-        f"x2='{width - pad_r}' y2='{round(pad_t + f * (height - pad_t - pad_b), 1)}' "
+        f"<line x1='{pad_l}' y1='{round(pad_t + f * plot_h, 1)}' "
+        f"x2='{width - pad_r}' y2='{round(pad_t + f * plot_h, 1)}' "
         f"class='gline' stroke-width='1'/>"
         for f in (0.25, 0.5, 0.75))
-    first_y = round(sy(ys[0]), 1)
+    zero_y = sy(0.0)
     last_x, last_y = sx(xs[-1]), sy(ys[-1])
+
     return (
-        f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' aria-label='权益曲线'>"
+        f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' aria-label='盈亏曲线'>"
         + grid
-        + f"<line x1='{pad_l}' y1='{first_y}' x2='{width - pad_r}' y2='{first_y}' "
-        f"class='gbase' stroke-width='1' stroke-dasharray='4 4' opacity='0.45'/>"
-        + f"<polygon points='{area}' class='garea' opacity='0.13'/>"
-        + f"<polyline points='{pts}' fill='none' class='gline2' stroke-width='2' "
-        f"stroke-linejoin='round' stroke-linecap='round'/>"
-        + f"<circle cx='{last_x}' cy='{last_y}' r='3.5' class='gdot'/>"
+        # 0 基准线：盈亏曲线读的是「赚还是亏」，这条线必须在
+        + f"<line x1='{pad_l}' y1='{zero_y}' x2='{width - pad_r}' y2='{zero_y}' "
+        f"class='gbase' stroke-width='1' stroke-dasharray='4 4' opacity='0.55'/>"
+        + right
+        + "".join(paths)
+        + f"<circle cx='{last_x}' cy='{last_y}' r='3' class='gdot'/>"
         + "</svg>")
-
-
 # ---------------------------------------------------------------- HTML 渲染
 DASH_CSS = """<style>
 *{box-sizing:border-box}
@@ -842,6 +952,9 @@ svg.chart .gline{stroke:var(--line)}
 svg.chart .gbase{stroke:var(--muted)}
 svg.chart .garea{fill:var(--link)}
 svg.chart .gline2{stroke:var(--link)}
+svg.chart .gpos{stroke:var(--pos)}
+svg.chart .gneg{stroke:var(--neg)}
+svg.chart .gtwr{stroke:var(--link);stroke-dasharray:5 4;opacity:.9}
 svg.chart .gdot{fill:var(--link)}
 .btn{display:inline-block;background:var(--btn);color:#fff;border-radius:6px;padding:5px 11px;
      font-size:12px;text-decoration:none;white-space:nowrap}
@@ -1387,7 +1500,8 @@ def _render_body(p: dict) -> str:
     system = _as_dict(p.get("system"))
     positions = _as_list(p.get("positions"))
     orders_open = _as_list(p.get("orders_open"))
-    curve = _as_dict(p.get("equity_curve"))
+    curve = _as_dict(p.get("curve"))
+    curve_meta = _as_dict(curve.get("meta"))
     kill = bool(p.get("kill"))
     kill_reason = p.get("kill_reason") or ""
     reachable = bool(net.get("reachable"))
@@ -1395,10 +1509,9 @@ def _render_body(p: dict) -> str:
     error = str(net.get("error") or "")
     mismatch = bool(system.get("mismatch"))
     stuck = _opt_num(system.get("stuck_orders"))
-    curve7 = _as_list(curve.get("7d"))
-    curve30 = _as_list(curve.get("30d"))
-    shown = [x for x in (curve7 if len(curve7) >= 2 else curve30)
-             if isinstance(x, (list, tuple)) and len(x) >= 2]
+    pnl_all = _curve_points(curve.get("pnl"))
+    twr_all = _curve_points(curve.get("twr"))
+    shown_pnl, shown_twr, curve_span = _curve_window(pnl_all, twr_all)
 
     o: List[str] = []
     o.append("<h1>Hyperliquid 执行器监控</h1>")
@@ -1487,21 +1600,35 @@ def _render_body(p: dict) -> str:
              '可提 = 现货 − 仓位/挂单占用</div>')
     o.append("</div>")
 
-    # ---------------- 权益曲线 ----------------
-    o.append("<h2>权益曲线</h2>")
+    # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
+    # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
+    # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
+    # 流水读不到时**不画任何曲线**，也不退回权益 —— 那条线正是要删掉的误导源。
+    o.append("<h2>盈亏曲线（已剔除出入金）</h2>")
     o.append("<div class='chart-wrap'>")
-    if len(shown) >= 2:
-        first_e = _opt_num(shown[0][1])
-        last_e = _opt_num(shown[-1][1])
-        chg = ""
-        if first_e:
-            chg = f"　{((last_e - first_e) / abs(first_e) * 100.0):+.2f}%"
-        o.append(f"<div class='chart-head'><span>{'近 7 天' if len(curve7) >= 2 else '近 30 天'}"
-                 f"（{len(shown)} 个快照）</span>"
-                 f"<span>起点 {_fmt(first_e)} U &rarr; 最新 <b>{_fmt(last_e)} U</b>{chg}</span></div>")
-    else:
+    if curve_meta.get("flows_ok") is False:
         o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
-    o.append(_equity_svg(shown))
+        o.append(_pnl_svg([], []))
+        note = str(curve_meta.get("flows_note")
+                   or "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
+        o.append(f"<div class=\"legend\">{_esc(note)}</div>")
+    elif len(shown_pnl) >= 2:
+        pnl_total = _opt_num(curve_meta.get("pnl_total")) or 0.0
+        net_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
+        max_dd = _opt_num(curve_meta.get("max_dd_pnl")) or 0.0
+        twr_pct = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
+        # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
+        o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
+                 f"<span>累计盈亏 <b class='{'pos' if pnl_total >= 0 else 'neg'}'>"
+                 f"{pnl_total:+,.2f} U</b></span></div>")
+        o.append(f"<div class=\"legend\">累计盈亏 {pnl_total:+,.2f}U · 净入金 {net_dep:,.2f}U · "
+                 f"最大回撤 {max_dd:,.2f}U · 收益指数 {twr_pct:+.2f}%（起点 100）</div>")
+        o.append(_pnl_svg(shown_pnl, shown_twr))
+        o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
+                 '虚线=收益指数（起点 100，右轴）</div>')
+    else:
+        o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
+        o.append(_pnl_svg([], []))
     o.append("</div>")
 
     # ---------------- 仓位 ----------------
@@ -1726,7 +1853,9 @@ def build_router(deps: DashboardDeps) -> Any:
             "fees_total": a.get("fees_total"),
             "funding_total": a.get("funding_total"),
             "positions": p.get("positions") or [],
-            "curve": p.get("equity_curve") or {},
+            # 盈亏曲线（已剔除出入金）+ TWR 指数：与面板同一份 payload，
+            # 老的原始权益曲线已删除（不是开关），调用方要画图只读这个。
+            "curve": p.get("curve") or {},
         }
 
     @router.get("/api/hl/why")

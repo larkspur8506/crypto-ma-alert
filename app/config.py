@@ -89,6 +89,10 @@ class Config:
     hl_churn_max: int = _env_i("HL_CHURN_MAX", 5)
     # extraAgents 查不到有效期时的手工兜底（毫秒时间戳字符串；空=没有）
     hl_agent_valid_until_ms: str = _env("HL_AGENT_VALID_UNTIL_MS", "")
+    # 出入金流水同步间隔（秒）。面板的盈亏曲线要剔除出入金，数据源是交易所账本；
+    # 流水是**低频**事件（本账户至今 2 笔），没必要每轮都拉，默认 30 分钟。
+    # 只有参数、**没有面板开关**（用户明确要求）：正常情况不需要人管它。
+    hl_flow_sync_s: int = _env_i("HL_FLOW_SYNC_S", 1800)
 
     # 服务
     base_url: str = _env("BASE_URL", "https://ma.222677.xyz")
@@ -121,7 +125,7 @@ class Config:
                    "equity_mode", "equity_min", "agent_expiry_cleanup",
                    "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max",
                    "hl_fill_close", "hl_close_grace", "hl_close_grace_s",
-                   "hl_kill_autoclear")
+                   "hl_kill_autoclear", "hl_flow_sync_s")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让
@@ -137,6 +141,9 @@ class Config:
         "equity": (1.0, 100_000_000.0),
         "equity_min": (1.0, 100_000_000.0),
         "short_regime_ma": (0, 1000),
+        # 出入金流水同步间隔：下限 300s（比 tick 间隔还密没有意义，账本本身就是低频），
+        # 上限 86400s（一天一次）—— 再长面板的盈亏曲线就会长时间停在旧流水上。
+        "hl_flow_sync_s": (300, 86400),
         # churn 熔断阈值（PR-4）：0 = 关闭（只留静置闸门），上限 100 防止「配成 10000
         # 等于关掉保护还自以为开着」。
         "hl_churn_max": (0, 100),
