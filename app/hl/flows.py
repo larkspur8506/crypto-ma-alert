@@ -227,7 +227,10 @@ def curve(snaps: Iterable[Any], flows: Iterable[Any], *, now: float,
     - `snaps`：`hl_snapshots` 行（`ts` 秒 / `equity` 账户总值），只取 `window_s` 窗口内。
     - `flows`：`hl_flows` 行（`ts` / 带符号 `amount`），**不限窗口** —— 60 天前的入金
       同样构成今天的本金，漏掉它 pnl 会凭空多出一大块。
-    - `pnl_k = equity_k − Σflows(≤t_k)`（前缀和 + 两指针，O(n)）。
+    - `pnl_k = equity_k − equity_base − Σflows(base < ts ≤ t_k)`：**期初权益是基线**。
+      交易所入金到账前会有一批 `equity=0` 的快照（执行器先跑起来、钱还没到），它们不是
+      「亏了 100%」而是「还没有本金」；期初之前已存入的钱也不该算盈亏（否则第一笔入金
+      到账那一刻会凭空画出一段与入金等额的「回撤」，实测 100.79）。
     - TWR：`r_k = (equity_k − flow_k)/equity_{k−1} − 1`，`flow_k` 是落在 `(t_{k−1}, t_k]`
       的净流水；`index_k = index_{k−1}·(1+r_k)`，起点 100。`equity_{k−1} <= 0` 时该步
       不猜（r_k = 0，指数不变）并计入 `twr_skipped`。
@@ -240,6 +243,9 @@ def curve(snaps: Iterable[Any], flows: Iterable[Any], *, now: float,
             continue
         pts.append([t, _num(_get(s, "equity"), 0.0)])
     pts.sort(key=lambda x: x[0])
+    # 丢掉「还没本金」的期初零权益快照（见 docstring）。
+    while pts and pts[0][1] <= 0:
+        pts.pop(0)
 
     fs: List[List[float]] = []
     for f in flows or []:
@@ -249,17 +255,27 @@ def curve(snaps: Iterable[Any], flows: Iterable[Any], *, now: float,
     net_deposit = sum(a for _, a in fs)
     pnl: List[List[float]] = []
     twr: List[List[float]] = []
-    cum = cum_prev = 0.0
+    if not pts:
+        return {"pnl": [], "twr": [], "meta": {
+            "net_deposit": round(net_deposit, 6), "pnl_total": 0.0, "pnl_7d": 0.0,
+            "max_dd_pnl": 0.0, "twr_total_pct": 0.0, "flows_ok": bool(flows_ok),
+            "flows_note": str(flows_note or ""), "points": 0, "flows": len(fs),
+            "equity_base": None, "twr_skipped": 0}}
+    t0, base_eq = pts[0][0], pts[0][1]
+    # 基线之前（含同一时刻）的流水已体现在期初权益里，不重复计入 pnl。
     fi = 0
-    prev_eq: Optional[float] = None
+    while fi < len(fs) and fs[fi][0] <= t0:
+        fi += 1
+    cum = cum_prev = 0.0
+    prev_eq: Optional[float] = base_eq
     index = 100.0
     skipped = 0
-    for t, eq in pts:
+    for k, (t, eq) in enumerate(pts):
         while fi < len(fs) and fs[fi][0] <= t:
             cum += fs[fi][1]
             fi += 1
-        pnl.append([t, round(eq - cum, 6)])
-        if prev_eq is None:
+        pnl.append([t, round(eq - base_eq - cum, 6)])
+        if k == 0:
             index = 100.0
         else:
             flow_k = cum - cum_prev            # 落在 (t_prev, t] 的净流水
@@ -286,5 +302,7 @@ def curve(snaps: Iterable[Any], flows: Iterable[Any], *, now: float,
         "points": len(pnl),
         "flows": len(fs),
         "twr_skipped": skipped,
+        # 期初权益（曲线基线）：pnl 是相对它的增量，入金到账前的 0 权益期已被剔除。
+        "equity_base": round(base_eq, 6),
     }
     return {"pnl": pnl, "twr": twr, "meta": meta}

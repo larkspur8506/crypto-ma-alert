@@ -413,10 +413,14 @@ class TestStatusPayload(BaseCase):
             self.assertTrue(all(isinstance(x, list) and len(x) == 2 for x in pts))
             self.assertTrue(all(isinstance(x[0], (int, float))
                                 and isinstance(x[1], (int, float)) for x in pts))
-        self.assertAlmostEqual(pnl[0][1], 8000.0, msg="最老的 20 天点在最前")
-        self.assertAlmostEqual(pnl[1][1], 7000.0, msg="8 天点在其次")
-        self.assertAlmostEqual(pnl[-1][1], 1000.0, msg="最新点在末尾")
+        # 2026-10-22：pnl 改为「相对期初权益的增量」（期初权益 = 窗口内第一条快照，
+        # 这里 = 8000），所以最早一点是 0，后续是相减后的真实盈亏。
+        self.assertAlmostEqual(pnl[0][1], 0.0, msg="期初权益是基线，最早一点为 0")
+        self.assertAlmostEqual(pnl[1][1], -1000.0, msg="8 天点：7000 − 8000")
+        self.assertAlmostEqual(pnl[-1][1], -7000.0, msg="最新点：1000 − 8000")
         self.assertAlmostEqual(twr[0][1], 100.0, msg="指数起点 100")
+        self.assertAlmostEqual(curve["meta"]["equity_base"], 8000.0,
+                               msg="期初权益写进 meta 便于核对")
         self.assertNotIn(1.0, [x[1] for x in pnl], "60 天前的点应被过滤掉")
         meta = curve["meta"]
         for k in ("net_deposit", "pnl_total", "pnl_7d", "max_dd_pnl",
