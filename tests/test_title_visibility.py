@@ -72,7 +72,7 @@ def overview_payload(**over) -> dict:
         "network": {"base_url": "https://api.hyperliquid.xyz", "testnet": False,
                     "latency_ms": 12.0, "reachable": True},
         "positions": [], "orders_open": [], "fills": [], "signals": [],
-        "equity_curve": [],
+        "curve": {},
     }
     p.update(over)
     return p
@@ -88,9 +88,9 @@ class TestOverviewLegends(unittest.TestCase):
     def test_account_legend_visible(self):
         frag = f'<div class="legend">{LEGEND_ACCOUNT}</div>'
         self.assertIn(frag, self.html)
-        # 在「账户」卡内（账户与权益曲线之间）
+        # 在「账户」卡内（账户与盈亏曲线之间）
         self.assertLess(self.html.index("账户"), self.html.index(frag))
-        self.assertLess(self.html.index(frag), self.html.index("<h2>权益曲线</h2>"))
+        self.assertLess(self.html.index(frag), self.html.index("<h2>盈亏曲线（已剔除出入金）</h2>"))
 
     def test_system_legend_visible(self):
         frag = f'<div class="legend">{LEGEND_SYSTEM}</div>'

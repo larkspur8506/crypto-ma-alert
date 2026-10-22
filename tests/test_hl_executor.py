@@ -64,6 +64,11 @@ class FakeInfo:
     def open_orders(self, address):
         return list(self._snap.get("open_orders") or [])
 
+    def ledger_updates(self, address, start_ms=0, deadline_ts=None):
+        # 出入金流水（feat/pnl-curve）：默认「账本没有流水」，避免每轮 tick 都因为
+        # 假 info 缺这个方法而往 hl_events 写一条 error。
+        return []
+
     def user_fills(self, address):
         return list(self._fills)
 

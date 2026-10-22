@@ -5,7 +5,7 @@
 - /api/hl/status JSON schema 与类型
 - info 抛异常 / 未配置时仍 200 且 reachable=False
 - has_stop 判定（reduce_only + is_trigger 挂单）
-- equity_curve 从 hl_snapshots 按 7d/30d 过滤
+- curve（盈亏曲线 + TWR）从 hl_snapshots 30 天窗口算，出入金已剔除
 - 对账 mismatch、kill switch、meta refresh 等
 
 全部用临时 sqlite DB（app.db.DB(tmp_path)）+ 假 info 对象，不触网。
@@ -140,7 +140,7 @@ class TestHtmlPage(BaseCase):
         self.db.mark_feed("BTC_USDT", "binance", True)
         r = self.client.get("/hl")
         self.assertEqual(r.status_code, 200)
-        for text in ("账户", "权益曲线", "仓位", "交易所挂单", "系统"):
+        for text in ("账户", "盈亏曲线（已剔除出入金）", "仓位", "交易所挂单", "系统"):
             self.assertIn(text, r.text, f"缺少区块：{text}")
         # 2026-10-18：下单记录 / 最近成交 / 信号 三张历史表已从总览（含 /hl 这张
         # 独立页，同一份 _render_body）迁到 /admin?tab=records → 这里断言"不再出现"。
@@ -182,20 +182,24 @@ class TestHtmlPage(BaseCase):
         html = self.client.get("/hl").text
         self.assertIn("熔断 <b>未触发</b>", html)
 
-    def test_hl_page_svg_polylines_for_equity_curve(self):
+    def test_hl_page_svg_polylines_for_pnl_curve(self):
+        # 2026-10-22（feat/pnl-curve）：曲线源从 equity 换成「剔除出入金的 pnl」，
+        # 且读侧要求「本地有流水」或「成功同步过水位」才画（否则给提示，不画误导线）。
         now = FIXED_NOW
+        self.db.set_config("hl_flows_synced_at", str(int(now)))
         for i in range(10):
             self.db.hl_add_snapshot({"ts": now - (9 - i) * 3600, "equity": 1000.0 + i * 10,
                                      "positions": []})
         html = self.client.get("/hl").text
         self.assertIn("<svg", html)
         self.assertIn("<polyline", html)
-        self.assertIn("权益曲线", html)
-        self.assertNotIn("暂无权益快照", html)
+        self.assertIn("盈亏曲线（已剔除出入金）", html)
+        self.assertNotIn("暂无数据（等执行器落快照", html)
 
     def test_hl_page_svg_placeholder_when_no_curve(self):
+        self.db.set_config("hl_flows_synced_at", str(int(FIXED_NOW)))   # 同步过，但没快照
         html = self.client.get("/hl").text
-        self.assertIn("暂无权益快照", html)
+        self.assertIn("暂无数据（等执行器落快照", html)
         self.assertNotIn("<polyline", html)
 
     def test_hl_page_info_raises_still_200_with_banner(self):
@@ -233,7 +237,7 @@ class TestHtmlPage(BaseCase):
 class TestStatusPayload(BaseCase):
     TOP_KEYS = ("schema_version", "ts", "mode", "kill", "kill_reason", "network", "account",
                 "positions", "orders_open", "orders_recent", "fills", "signals", "system",
-                "equity_curve", "events")
+                "curve", "events")
 
     def test_schema_version_and_top_level_keys(self):
         p = self.payload()
@@ -245,7 +249,7 @@ class TestStatusPayload(BaseCase):
         self.assertEqual(p["mode"], "live")
         self.assertIsInstance(p["kill"], bool)
         self.assertIsInstance(p["kill_reason"], str)
-        for k in ("network", "account", "system", "equity_curve"):
+        for k in ("network", "account", "system", "curve"):
             self.assertIsInstance(p[k], dict, k)
         for k in ("positions", "orders_open", "orders_recent", "fills", "signals", "events"):
             self.assertIsInstance(p[k], list, k)
@@ -389,29 +393,36 @@ class TestStatusPayload(BaseCase):
         self.assertIsInstance(f["ts"], (int, float))
         self.assertAlmostEqual(f["ts"], FIXED_NOW * 1000)
 
-    def test_equity_curve_filtered_by_7d_and_30d(self):
+    def test_curve_windowed_30d_and_filters_older(self):
+        """2026-10-22：payload 的 curve 只有一条 30 天序列（pnl + twr），不再分 7d/30d。
+
+        展示层（近 7 天优先）在 views._curve_window 里切，JSON 只给原始 30 天。
+        """
         now = FIXED_NOW
-        for i in range(40):                     # 最近 40h：全部落在 7d 与 30d
+        for i in range(40):                     # 最近 40h
             self.db.hl_add_snapshot({"ts": now - i * 3600, "equity": 1000.0 + i, "positions": []})
         self.db.hl_add_snapshot({"ts": now - 8 * 86400, "equity": 7000.0, "positions": []})
         self.db.hl_add_snapshot({"ts": now - 20 * 86400, "equity": 8000.0, "positions": []})
         self.db.hl_add_snapshot({"ts": now - 60 * 86400, "equity": 1.0, "positions": []})
 
-        curve = self.payload()["equity_curve"]
-        self.assertEqual(len(curve["7d"]), 40, "7d 只应含最近 40 个小时点")
-        self.assertEqual(len(curve["30d"]), 42, "30d 应含 40h + 8d + 20d 两点")
-        for pts in (curve["7d"], curve["30d"]):
+        curve = self.payload()["curve"]
+        pnl, twr = curve["pnl"], curve["twr"]
+        self.assertEqual(len(pnl), 42, "30d 应含 40h + 8d + 20d 两点（60 天前的丢掉）")
+        self.assertEqual(len(twr), len(pnl), "pnl 与 twr 同一条时间轴")
+        for pts in (pnl, twr):
             self.assertTrue(all(isinstance(x, list) and len(x) == 2 for x in pts))
             self.assertTrue(all(isinstance(x[0], (int, float))
                                 and isinstance(x[1], (int, float)) for x in pts))
-        self.assertTrue(all(x[0] >= now - 7 * 86400 for x in curve["7d"]))
-        # hl_snapshots 按 ts 升序返回
-        self.assertAlmostEqual(curve["30d"][0][1], 8000.0, msg="最老的 20 天点在最前")
-        self.assertAlmostEqual(curve["30d"][1][1], 7000.0, msg="8 天点在其次")
-        self.assertAlmostEqual(curve["30d"][-1][1], 1000.0, msg="最新点在末尾")
-        self.assertAlmostEqual(curve["7d"][0][1], 1039.0, msg="7d 里最老的是 39h 前")
-        self.assertAlmostEqual(curve["7d"][-1][1], 1000.0)
-        self.assertNotIn(1.0, [x[1] for x in curve["30d"]], "60 天前的点应被过滤掉")
+        self.assertAlmostEqual(pnl[0][1], 8000.0, msg="最老的 20 天点在最前")
+        self.assertAlmostEqual(pnl[1][1], 7000.0, msg="8 天点在其次")
+        self.assertAlmostEqual(pnl[-1][1], 1000.0, msg="最新点在末尾")
+        self.assertAlmostEqual(twr[0][1], 100.0, msg="指数起点 100")
+        self.assertNotIn(1.0, [x[1] for x in pnl], "60 天前的点应被过滤掉")
+        meta = curve["meta"]
+        for k in ("net_deposit", "pnl_total", "pnl_7d", "max_dd_pnl",
+                  "twr_total_pct", "flows_ok", "flows_note"):
+            self.assertIn(k, meta, f"curve.meta 缺少 {k}")
+        self.assertIsInstance(meta["flows_ok"], bool)
 
     def test_signals_from_positions_table(self):
         self.insert_position(status="open")
@@ -591,7 +602,7 @@ class TestFailureModes(BaseCase):
 
     def test_render_dashboard_tolerates_garbage_payload(self):
         from app.hl.views import render_dashboard
-        for bad in ({}, {"positions": None, "account": None}, {"equity_curve": "oops"},
+        for bad in ({}, {"positions": None, "account": None}, {"curve": "oops"},
                     {"system": {"mismatch": "nope"}}, {"positions": [{"coin": None}]}):
             out = render_dashboard(bad)
             self.assertIsInstance(out, str)
@@ -657,7 +668,7 @@ class TestRenderOnly(BaseCase):
     def test_render_dashboard_contains_chinese_titles(self):
         from app.hl.views import render_dashboard
         html = render_dashboard(self.payload())
-        for text in ("Hyperliquid 执行器监控", "账户", "仓位", "权益曲线", "系统"):
+        for text in ("Hyperliquid 执行器监控", "账户", "仓位", "盈亏曲线（已剔除出入金）", "系统"):
             self.assertIn(text, html)
 
     def test_render_dashboard_stop_marks(self):

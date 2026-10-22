@@ -80,9 +80,10 @@ class TestEquitySvgDownsample(unittest.TestCase):
         self.assertIn("降采样", src)
 
     def test_downsample_behavior(self):
-        from app.hl.views import _equity_svg
+        # 2026-10-22（feat/pnl-curve）：_equity_svg → _pnl_svg，降采样逻辑不变
+        from app.hl.views import _pnl_svg
         pts = [[i * 60.0, 100.0 + (i % 7)] for i in range(5000)]
-        svg = _equity_svg(pts, width=760)
+        svg = _pnl_svg(pts, [], width=760)
         self.assertIn("<svg", svg)
         # 抽样后 polyline 点数应远小于 5000（2×760=1520 上限）
         import re

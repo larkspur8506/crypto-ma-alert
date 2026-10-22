@@ -174,6 +174,48 @@ class HlInfo:
         data = self.post(payload)
         return data if isinstance(data, list) else []
 
+    # 账本接口单页上限（交易所硬限 500）
+    LEDGER_PAGE = 500
+    LEDGER_MAX_PAGES = 20
+
+    def ledger_updates(self, address: str, start_ms: int = 0,
+                       max_pages: int = LEDGER_MAX_PAGES,
+                       deadline_ts: Optional[float] = None) -> List[dict]:
+        """非资金流水（`userNonFundingLedgerUpdates`）：出入金 / 账户间转账 / 金库。
+
+        面板的盈亏曲线要剔除出入金，数据源就是它。返回**原始行**列表
+        （`[{"time": ms, "hash": ..., "delta": {...}}, ...]`），分类在 app/hl/flows.py，
+        本层不做业务判断。
+
+        分页：单次最多 500 条，拿满就用最后一条 `time+1` 续拉；`max_pages` 上限防
+        「对端忽略 startTime → 永远返回同一页」的死循环。`deadline_ts`（`time.time()`
+        口径）到了就不再发下一页，已拿到的照常返回 —— 执行器总预算 20s，宁可这一轮
+        少拉几页，也不许把 tick 卡死。
+
+        续拉用 `time+1` 会漏掉与最后一条**同毫秒**的其它条目（HL 官方 SDK 同款做法）；
+        去重键是 `(hash, ts)`，重复拉到只会被 `INSERT OR IGNORE` 掉，不会写两行。
+        """
+        out: List[dict] = []
+        cursor = max(0, int(start_ms))
+        for _ in range(max(1, int(max_pages))):
+            if deadline_ts is not None and time.time() >= float(deadline_ts):
+                logger.warning("[hl-info] 账本流水拉取超过时间预算（已取 %d 条），本轮放弃剩余页", len(out))
+                break
+            data = self.post({"type": "userNonFundingLedgerUpdates", "user": address,
+                              "startTime": int(cursor)})
+            if not isinstance(data, list):
+                # 错误对象 ≠ 空流水：当成失败抛出去，让上层记事件、下轮再来
+                raise HlInfoError(f"userNonFundingLedgerUpdates 返回了非预期结构：{str(data)[:120]}")
+            out.extend([r for r in data if isinstance(r, dict)])
+            if len(data) < self.LEDGER_PAGE:
+                break
+            last_t = self._num((data[-1] or {}).get("time"), 0.0)
+            if last_t <= 0 or int(last_t) + 1 <= cursor:      # 游标没前进 → 防死循环
+                logger.warning("[hl-info] 账本流水游标未前进（time=%s），停止分页", last_t)
+                break
+            cursor = int(last_t) + 1
+        return out
+
     def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> List[dict]:
         data = self.post({"type": "candleSnapshot",
                           "req": {"coin": coin, "interval": interval,

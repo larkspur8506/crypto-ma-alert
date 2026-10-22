@@ -29,6 +29,7 @@ from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, 
                     EV_DECISION, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
 from app.hl import pnl as hl_pnl
+from app.hl import flows as hl_flows
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
@@ -303,6 +304,10 @@ class ExecParams:
     # 到这个量级必然是「止损挂不上 → 撤了重挂 → 又挂不上」的循环，此时停手比继续试安全
     # （继续试只会制造更多无保护的瞬间，且交易所侧限频也会打满）。
     churn_max: int = CHURN_MAX_DEFAULT
+    # 出入金流水同步间隔（秒）：盈亏曲线要剔出入金，流水从交易所账本拉。
+    # 低频事件（本账户至今 2 笔）→ 不必每轮拉，默认 30 分钟。范围 300~86400，
+    # 由 Config.hl_flow_sync_s / DB 键同名控制；**没有面板开关**（用户明确要求）。
+    flow_sync_s: int = 1800
     code_rev: str = ""
 
     @property
@@ -2665,6 +2670,61 @@ class Executor:
             self._event(EV_ORDER, f"同步 {added} 笔交易所成交到本地", data={"added": added})
         return added
 
+    # ------------------------------------------------------------ 出入金流水
+    FLOW_SYNC_DEFAULT = 1800          # 秒；与 Config.hl_flow_sync_s / ExecParams.flow_sync_s 同值
+    FLOW_SYNC_BUDGET_S = 20.0         # 单轮最多花多少秒（分页 + 重试都在内）
+
+    def _sync_flows(self, now: Optional[float] = None) -> int:
+        """拉 `userNonFundingLedgerUpdates` → 分类落 `hl_flows`（幂等）。返回新增条数。
+
+        间隔：距上次**成功**同步 < `flow_sync_s` 就整段跳过（流水是低频事件，每轮拉
+        纯浪费交易所请求）。首次运行 `start_ms=0` 全量回填；之后从
+        `最后一条流水时间 − 60s` 续拉（留一分钟重叠吸收交易所的边界抖动，靠
+        `UNIQUE(hash, ts)` 去重，不会写两行）。
+
+        失败：只 `logger.warning` + 记 `error` 事件，**不写** `hl_flows_synced_at`
+        （下轮会再试；面板读侧看到没有成功标记且无流水 → 不画曲线并显示提示文案）。
+        """
+        now = time.time() if now is None else float(now)
+        try:
+            interval = int(getattr(self.p, "flow_sync_s", self.FLOW_SYNC_DEFAULT)
+                           or self.FLOW_SYNC_DEFAULT)
+        except (TypeError, ValueError):
+            interval = self.FLOW_SYNC_DEFAULT
+        try:
+            synced_at = float(str(self.db.get_config_str("hl_flows_synced_at", "0") or "0"))
+        except (TypeError, ValueError):
+            synced_at = 0.0
+        if synced_at and (now - synced_at) < interval:
+            return 0                        # 未到间隔，本轮不拉
+
+        address = str(getattr(self.p, "account_address", "") or "")
+        if not address:
+            return 0
+        last_ts = self.db.hl_flow_last_ts()
+        start_ms = 0 if last_ts is None else int(max(0.0, last_ts - 60.0) * 1000)
+        try:
+            rows = self.info.ledger_updates(
+                address, start_ms=start_ms,
+                deadline_ts=time.time() + self.FLOW_SYNC_BUDGET_S)
+        except Exception as e:                                       # noqa: BLE001
+            # 账本接口坏了不影响交易：只记一次事件 + warning，下轮再来
+            logger.warning("[hl-exec] 拉取出入金流水失败（下轮重试）：%s", e)
+            self._event(EV_ERROR, f"出入金流水同步失败（盈亏曲线暂用旧数据）：{e}"[:300],
+                        data={"start_ms": start_ms, "error": str(e)[:300]})
+            return 0
+
+        res = hl_flows.record_flows(self.db, rows, address, now=now)
+        # 只有**成功**才写时间水位：失败时写它会让「刚失败」看起来像「刚同步过」，
+        # 面板会以为流水是新的，而实际上一条都没有。
+        try:
+            self.db.set_config("hl_flows_synced_at", str(int(now)))
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 写 hl_flows_synced_at 失败（忽略）：%s", e)
+        if res["added"]:
+            logger.info("[hl-exec] 新增 %d 笔出入金流水（拉到 %d 条）", res["added"], res["seen"])
+        return res["added"]
+
     def _r_multiple(self, row, exit_px: float) -> float:
         entry = float(row["actual_entry"] or row["entry_price"])
         stop = float(row["actual_stop"] or row["stop_price"])
@@ -3045,6 +3105,15 @@ class Executor:
                                 data={"error": str(r["error"])[:300]})
             except Exception as ex:                                   # noqa: BLE001
                 logger.warning("[hl-exec] 死手开关记账失败（忽略）：%s", ex)
+
+        # 4b) 出入金流水（盈亏曲线要剔除它）。**纯观测**：失败只记事件 + warning，
+        #     绝不影响交易。放在这里（交易动作之后、心跳之前）的理由：心跳是「本轮跑完
+        #     了」的信标，流水同步属于本轮工作的一部分，must not 拖住心跳的语义 —— 但它
+        #     自己有 20s 预算 + 300s+ 的间隔闸门，跑不跑得起来都不改变判活时间。
+        try:
+            self._sync_flows()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 同步出入金流水失败（不影响交易）：%s", e)
 
         # 5) 心跳（看守据此判断执行器存活）
         self._event(EV_HEARTBEAT,

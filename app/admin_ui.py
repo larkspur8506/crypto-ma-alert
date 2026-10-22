@@ -3,7 +3,7 @@
 四个 Tab（链接切换，服务端渲染，**无 CDN / 无框架 / 无外部资源**，手机弱网可开；
 唯一的原生 JS 是「参数」页资金口径的单选钮显隐，无 JS 时两个字段都显示）：
 
-- ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/权益曲线区块）；
+- ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/盈亏曲线区块）；
   末尾接「API 有效期」状态卡（地址/到期日/剩余/状态 + 到期前自动清仓开关状态）
 - ``params``   参数 —— 策略 / 执行与推送 / 资金 / API 有效期 四组，显示来源（DB·env·默认）与影响预览；
   末尾另有「更新 API（续期）」折叠表单（粘新私钥，POST /admin/hl/agent/renew）
@@ -83,7 +83,7 @@ def rows_switch_html(tab: str, current: int, k: str = "") -> str:
         cls = "btn" if n == cur else "btn gray"
         links.append(f"<a class='{cls}' href='/admin/rows?n={n}&tab={_esc(tab)}&k={q}'>{n}</a>")
     return ("<div class='foot'><span class='muted'>每页行数：</span>" + " ".join(links)
-            + "<span class='muted'>&nbsp;（历史类长表；权益曲线不受影响）</span></div>")
+            + "<span class='muted'>&nbsp;（历史类长表；盈亏曲线不受影响）</span></div>")
 
 
 TABS: Tuple[Tuple[str, str], ...] = (
@@ -1124,7 +1124,7 @@ def _tabs_html(tab: str, k: str) -> str:
 
 
 def _overview_body(deps: AdminDeps, payload: dict) -> str:
-    """总览：完全复用 hl/views._render_body（仓位表/权益曲线/挂单/事件一块都不重写）。
+    """总览：完全复用 hl/views._render_body（仓位表/盈亏曲线/挂单/事件一块都不重写）。
 
     _render_body 自带 <h1> 和它自己的状态条，而本面板顶部已有标题 + 状态条，
     所以把这两块剥掉，避免同一屏出现两个 <h1>、两条状态条。

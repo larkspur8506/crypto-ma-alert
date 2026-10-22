@@ -143,6 +143,10 @@ def hl_params():
         # churn 熔断阈值（PR-4）：DB > env > 默认（Config 已解析好，不再单独读 env）。
         # 与 fill_push / pnl_from_fills 同一种装配模式；脏值/缺键退回 5（不静默关保护）。
         churn_max=_churn_max(cfg),
+        # 出入金流水同步间隔（秒）：DB > env > 默认 1800。盈亏曲线要剔除出入金，
+        # 数据源是交易所账本；**只有参数、没有面板开关**（用户要求）。
+        # 脏值/缺键退回 1800（不退回 300：调接口不必比账本事件还勤）。
+        flow_sync_s=_flow_sync_s(cfg),
         # 死手开关默认关闭：识别不了的值也按「关」处理（安全侧默认，与推送开关的 fail-open 相反）
         use_schedule_cancel=str(db.get_config_str(
             "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
@@ -190,6 +194,18 @@ def _grace_seconds(cfg) -> float:
         return GRACE_DEFAULT_S
     lo, hi = 300.0, 3600.0
     return v if lo <= v <= hi else GRACE_DEFAULT_S
+
+
+def _flow_sync_s(cfg) -> int:
+    """出入金流水同步间隔（秒）。脏值/缺键退回 1800；出界值收敛到 300~86400
+    （与 Config._RANGES 同一区间：读侧不该绕过配置校验自己放行一个越界值）。"""
+    raw = getattr(cfg, "hl_flow_sync_s", None)
+    try:
+        n = int(float(str(raw).strip().strip('"').strip("'")))
+    except (TypeError, ValueError):
+        return 1800
+    return min(86400, max(300, n))
+
 
 
 def hl_info_base() -> str:
