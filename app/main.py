@@ -147,6 +147,12 @@ def hl_params():
         # 数据源是交易所账本；**只有参数、没有面板开关**（用户要求）。
         # 脏值/缺键退回 1800（不退回 300：调接口不必比账本事件还勤）。
         flow_sync_s=_flow_sync_s(cfg),
+        # 回撤熔断（DD Guard）：DB > env > 默认（Config 已解析好）。缺键按「开」，
+        # 阈值 0 = 按 risk_pct 档位自动（1.5%→25/30、2.5%→30/40、3%→40/50）。
+        # 与 fill_close/kill_autoclear 同一种「从面板配置读布尔」的装配模式。
+        dd_guard=bool(getattr(cfg, "hl_dd_guard", True)),
+        dd_warn_pct=_dd_pct(cfg, "hl_dd_warn_pct"),
+        dd_kill_pct=_dd_pct(cfg, "hl_dd_kill_pct"),
         # 死手开关默认关闭：识别不了的值也按「关」处理（安全侧默认，与推送开关的 fail-open 相反）
         use_schedule_cancel=str(db.get_config_str(
             "hl_use_schedule_cancel", _env("HL_USE_SCHEDULE_CANCEL", "0")) or "0"
@@ -205,6 +211,23 @@ def _flow_sync_s(cfg) -> int:
     except (TypeError, ValueError):
         return 1800
     return min(86400, max(300, n))
+
+
+def _dd_pct(cfg, key: str) -> float:
+    """回撤阈值覆盖（0 = 按 risk_pct 档位自动）。脏值/缺键/越界一律退回 0（自动）。
+
+    为什么不退回一个具体数字：档位是「跟着 risk_pct 走」的，抄一个 0.30 进这里
+    等于把 3% 档的账户钉在 2.5% 档的线上（那档 P(DD>30%)=96%，必然误触发）。
+    越界值退回 0 而不是钳到边界：钳值会造出一个用户没写过的阈值。
+    """
+    raw = getattr(cfg, key, None)
+    try:
+        v = float(str(raw).strip().strip('"').strip("'"))
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v or v <= 0.0:                      # NaN / 0 / 负 → 自动档位
+        return 0.0
+    return v if 0.05 <= v <= 0.95 else 0.0
 
 
 

@@ -39,6 +39,7 @@ from fastapi.responses import HTMLResponse
 
 from app import posfields
 from app.hl import flows as hl_flows
+from app.hl import dd as hl_dd
 from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
                           theme_switch_html)
 
@@ -354,6 +355,74 @@ def _kill_state(deps: DashboardDeps) -> tuple:
     return on, _config_get(deps, "hl_exec_kill_reason")
 
 
+# 回撤熔断（DD Guard）状态词。iOS 没有 title 悬停 → 状态必须是**可见文字**（§7）。
+# 规格只给了四个词（正常/已达告警线/已熔断/暂不可用）；总开关关掉时**复用「暂不可用」**
+# 而不是新造第五个词，把原因写进括号里 —— 判据确实不可用，词汇表保持封闭。
+_DD_ST_TXT = {
+    "normal": "正常",
+    "warn": "已达告警线",
+    "killed": "已熔断",
+    "unavailable": "暂不可用",
+    "off": "暂不可用",
+}
+
+
+def _dd_meta(deps: DashboardDeps, cfg: Any, flows_ok: bool) -> Dict[str, Any]:
+    """总览「策略回撤」那一行的数据源：**只读**持久化状态，不重算 TWR 链。
+
+    为什么不重算：判据是执行器每轮推进的复利链（每轮一格），面板若按快照逐点重算，
+    得到的是另一条曲线（采样密度不同）→ 用户看到的数字与真正触发熔断的数字不一致，
+    那比不显示更糟。这里只做「读状态 + 算 DD + 选状态词」。
+    """
+    risk = _num(getattr(cfg, "risk_pct", 0.02) if cfg is not None else 0.02, 0.02)
+    th = hl_dd.thresholds(
+        risk,
+        _num(getattr(cfg, "hl_dd_warn_pct", 0.0) if cfg is not None else 0.0),
+        _num(getattr(cfg, "hl_dd_kill_pct", 0.0) if cfg is not None else 0.0))
+    out: Dict[str, Any] = {
+        "dd_ok": False, "dd_status": "unavailable",
+        "dd_status_text": _DD_ST_TXT["unavailable"],
+        "dd_pct": None, "dd_index": None, "dd_peak_index": None, "dd_asof": None,
+        "dd_warn_pct": round(th["warn"], 6), "dd_kill_pct": round(th["kill"], 6),
+        "dd_auto": bool(th["auto"]), "dd_note": "",
+    }
+    if not bool(getattr(cfg, "hl_dd_guard", True) if cfg is not None else True):
+        out.update(dd_status="off", dd_status_text=_DD_ST_TXT["off"],
+                   dd_note="回撤熔断已关闭")
+        return out
+    if not flows_ok:
+        # 流水读不到 → 指数的历史段不可信（少一笔入金就会被当成亏损）→ 不显示数字
+        out["dd_note"] = "出入金流水读取失败"
+        return out
+    st = hl_dd.load_state(deps.db)
+    if not st:
+        out["dd_note"] = "尚未计算（等执行器跑一轮）"
+        return out
+    pct = hl_dd.drawdown(st.get("index"), st.get("peak_index"))
+    if pct is None:
+        out["dd_note"] = "状态数据不完整"
+        return out
+    try:
+        killed = bool(deps.db.hl_kill())
+    except Exception as e:                                       # noqa: BLE001
+        logger.warning("[hl-views] hl_kill 失败（按未熔断显示）：%s", e)
+        killed = False
+    # 「已熔断」既看当前回撤，也看 kill 的来源：指数回升后 DD 可能掉回线下，
+    # 但停手还在（dd 永不自解）—— 那种时候显示「正常」会让人以为可以开仓了。
+    origin = str(_config_get(deps, "hl_exec_kill_origin", "") or "")
+    if pct >= th["kill"] or (killed and origin == "dd"):
+        status = "killed"
+    elif pct >= th["warn"]:
+        status = "warn"
+    else:
+        status = "normal"
+    out.update(dd_ok=True, dd_status=status, dd_status_text=_DD_ST_TXT[status],
+               dd_pct=round(pct, 6), dd_index=round(float(st["index"]), 4),
+               dd_peak_index=round(float(st["peak_index"]), 4),
+               dd_asof=float(st.get("updated_at") or 0.0) or None)
+    return out
+
+
 def _reconcile(reachable: bool, snap_positions: List[dict], snap_orders: List[dict],
                open_by_coin: Dict[str, dict], stuck_orders: List[Any],
                orders_trusted: bool = True) -> bool:
@@ -660,6 +729,10 @@ def status_payload(deps: DashboardDeps) -> dict:
     curve = hl_flows.curve(
         snaps, flows, now=now, window_s=30 * _DAY, flows_ok=flows_ok,
         flows_note="" if flows_ok else "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
+    # 回撤熔断（DD Guard）字段并进 curve.meta：面板与 /api/hl/status 共用同一份数字
+    # （§10.5 要求 curve meta 里出现 DD 字段）。**只读**执行器持久化的状态。
+    if isinstance(curve.get("meta"), dict):
+        curve["meta"].update(_dd_meta(deps, cfg, flows_ok))
 
     # ---------------- 事件 / 系统 ----------------
     events: List[dict] = []
@@ -1493,6 +1566,35 @@ def _signals_html(signals: list) -> str:
     return "".join(o)
 
 
+def _pct_txt(v: Any, dash: str = "—") -> str:
+    """阈值 → 人话百分比（0.25 → 25%）。面板上只讲「25%」，不暴露内部小数。"""
+    f = _opt_num(v)
+    return dash if f is None else f"{f * 100:g}%"
+
+
+def _dd_line_html(meta: Dict[str, Any]) -> str:
+    """「策略回撤 …」那一行（§7）：可见文字，不靠 title 悬停。
+
+    必须写清两个「回撤」的区别 —— 同一区块里「最大回撤 19.54U」是 **U 金额**口径
+    （pnl 序列峰谷），本行是 **百分比**口径（TWR 峰谷、已剔除出入金）；不写清用户会
+    以为两个数字在打架。
+    """
+    st = str(meta.get("dd_status") or "unavailable")
+    txt = str(meta.get("dd_status_text") or _DD_ST_TXT.get(st, "暂不可用"))
+    note = str(meta.get("dd_note") or "")
+    # 不可用/已关闭都要把**原因**写在括号里：只写「暂不可用」等于让人去猜是流水坏了
+    # 还是自己把开关关了。
+    if st in ("unavailable", "off") and note:
+        txt = f"{txt}（{note}）"
+    pct = _opt_num(meta.get("dd_pct"))
+    pct_txt = "—" if pct is None else f"{pct * 100:.2f}%"
+    cls = "neg" if st == "killed" else ("muted" if st != "warn" else "")
+    span = f"<span class='{cls}'>{_esc(txt)}</span>" if cls else _esc(txt)
+    return (f"<div class=\"legend\">策略回撤 {pct_txt}（剔除出入金，峰值以来）· "
+            f"告警线 {_pct_txt(meta.get('dd_warn_pct'))} · "
+            f"熔断线 {_pct_txt(meta.get('dd_kill_pct'))} · 当前状态：{span}</div>")
+
+
 def _render_body(p: dict) -> str:
     mode = str(p.get("mode") or "off")
     net = _as_dict(p.get("network"))
@@ -1629,6 +1731,9 @@ def _render_body(p: dict) -> str:
     else:
         o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
         o.append(_pnl_svg([], []))
+    # 策略回撤（DD Guard）：**任何分支都要有这一行** —— 曲线画不出来（流水坏）时更需要
+    # 告诉人「回撤判据现在可不可信」，而「暂不可用」本身就是一句结论。
+    o.append(_dd_line_html(curve_meta))
     o.append("</div>")
 
     # ---------------- 仓位 ----------------

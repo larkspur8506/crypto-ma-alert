@@ -26,10 +26,11 @@ from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, 
                     PURPOSE_STOP,
                     ST_CANCELLED, ST_FAILED, ST_FILLED, ST_INTENT, ST_PLANNED, ST_RESTING, ST_SENT,
                     ST_SKIPPED,
-                    EV_DECISION, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
+                    EV_DECISION, EV_DD, EV_ERROR, EV_HEARTBEAT, EV_KILL, EV_ORDER, EV_RECONCILE)
 from app.hl import sizing as hl_sizing
 from app.hl import pnl as hl_pnl
 from app.hl import flows as hl_flows
+from app.hl import dd as hl_dd
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
@@ -308,6 +309,13 @@ class ExecParams:
     # 低频事件（本账户至今 2 笔）→ 不必每轮拉，默认 30 分钟。范围 300~86400，
     # 由 Config.hl_flow_sync_s / DB 键同名控制；**没有面板开关**（用户明确要求）。
     flow_sync_s: int = 1800
+    # 回撤熔断（DD Guard）：判据 = 策略口径 TWR 峰谷回撤（已剔除出入金）。
+    #   dd_guard    —— 总开关。关 = L2/L3 全不生效（L1 修好口径后照旧生效）。
+    #   dd_warn_pct / dd_kill_pct —— 覆盖阈值；0 = 按 risk_pct 档位自动（§3.4）。
+    # 默认全开 + 全自动：升档时线必须同批跟着走，所以默认不把 25/30 抄成常量。
+    dd_guard: bool = True
+    dd_warn_pct: float = 0.0
+    dd_kill_pct: float = 0.0
     code_rev: str = ""
 
     @property
@@ -381,6 +389,9 @@ class Executor:
         # _on_exit 自己的那次同步撞车，10s 内不重复打同一个接口（同一实例内判断，
         # 跨实例本来就会重新同步，语义不变）。
         self._last_sync_at = 0.0
+        # 本轮出入金流水是否**成功**读到（fail-closed 的开关，见 _sync_flows / _dd_guard）。
+        # 默认 False：没跑过同步就当作「不可用」，回撤判断与 L1 的剔流水口径都退回保守做法。
+        self._flows_ok = False
 
     # ------------------------------------------------------------ 工具
     def _coin_or_none(self, symbol: str) -> Optional[str]:
@@ -2686,6 +2697,9 @@ class Executor:
         （下轮会再试；面板读侧看到没有成功标记且无流水 → 不画曲线并显示提示文案）。
         """
         now = time.time() if now is None else float(now)
+        # 每轮先当「流水不可用」，成功路径再翻成 True —— 这样任何异常分支都不会
+        # 留下上一轮的 True（fail-closed：算不出回撤就不判，见 _dd_guard）。
+        self._flows_ok = False
         try:
             interval = int(getattr(self.p, "flow_sync_s", self.FLOW_SYNC_DEFAULT)
                            or self.FLOW_SYNC_DEFAULT)
@@ -2696,6 +2710,10 @@ class Executor:
         except (TypeError, ValueError):
             synced_at = 0.0
         if synced_at and (now - synced_at) < interval:
+            # 未到间隔：**本轮没有新流水**，但本地这份是上一次**成功**同步的，
+            # 读侧照旧可信（所以算「可用」）。这也是提前到熔断之前不会增加交易所
+            # 调用频率的原因（§4.4）。
+            self._flows_ok = True
             return 0                        # 未到间隔，本轮不拉
 
         address = str(getattr(self.p, "account_address", "") or "")
@@ -2715,6 +2733,8 @@ class Executor:
             return 0
 
         res = hl_flows.record_flows(self.db, rows, address, now=now)
+        # 流水落库成功 = 本轮回撤/L1 可以按「剔除出入金」的口径算（§3.1 / §5）。
+        self._flows_ok = True
         # 只有**成功**才写时间水位：失败时写它会让「刚失败」看起来像「刚同步过」，
         # 面板会以为流水是新的，而实际上一条都没有。
         try:
@@ -2724,6 +2744,224 @@ class Executor:
         if res["added"]:
             logger.info("[hl-exec] 新增 %d 笔出入金流水（拉到 %d 条）", res["added"], res["seen"])
         return res["added"]
+
+    # ------------------------------------------------------------ 回撤熔断（DD Guard）
+    # 规格 §3：判据是**策略口径**的峰谷回撤（TWR 链、剔除出入金），不是账户权益回撤。
+    # 本段只做三件事：只读计算、置 kill、推送告警 —— 不平仓、不撤单、不改下单语义
+    # （§2 / §11：熔断只挡「新增风险」，持仓按既有规则离场）。
+    def _flows_all(self) -> Optional[List[Any]]:
+        """读全部出入金流水（一生几百条级别，一次读全表最省事）。读不到 → None。
+
+        窗口语义不在这里做：`hl_dd.net_flow(flows, lo, hi)` 是唯一的左开区间实现
+        （`(lo, hi]`），三处调用（锚点累计、每步 flow_k、L1 当日累计）共用它，
+        免得「同一个窗口」在不同地方各写一遍、边界差一笔。
+        """
+        try:
+            return list(self.db.hl_flows_since(0.0))
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning("[hl-exec] 读出入金流水失败（回撤/当日亏损退回保守口径）：%s", e)
+            return None
+
+    def _dd_due(self, key: str, window_s: float, now: float) -> bool:
+        """节流判断：距上次**推送成功**的时间 >= window_s 才再推。
+
+        节流键只在推送成功后才写（_run_locked 末尾的 tuple 机制），所以这里读到的
+        一定是「用户真的看到过」的时刻，而不是「我们尝试过」的时刻。
+        """
+        try:
+            last = float(str(self.db.get_config_str(key, "0") or "0"))
+        except (TypeError, ValueError):
+            last = 0.0
+        return (float(now) - last) >= float(window_s)
+
+    def _dd_unavailable(self, alerts: List[str], reason: str, now: float) -> None:
+        """口径不可用：**不判、不 kill**，只在 24h 内最多提示一次（§8）。
+
+        为什么不是每轮都喊：口径坏掉通常要人修（流水接口/权限），每 5 分钟一条
+        会把真正要看的告警淹掉；而 L1 当日亏损线仍在，兜底没丢。
+        事件与告警同一个节流窗口 —— 否则 hl_events 里每轮一条「口径暂不可用」，
+        记录页会被刷满，反而看不见真正的事件。
+        """
+        if not self._dd_due(hl_dd.UNAVAIL_KEY, hl_dd.UNAVAIL_THROTTLE_S, now):
+            return
+        self._event(EV_DD, f"回撤口径暂不可用（{reason}），本轮未做回撤判断",
+                    data={"reason": reason, "ts": now})
+        alerts.append((hl_dd.UNAVAIL_KEY,
+                       f"【HL执行】ℹ️ 回撤口径暂不可用（{reason}），本轮未做回撤判断。"
+                       f"L1 当日亏损熔断仍在生效。"))
+
+    def _dd_bootstrap(self, flows: List[Any], now_ts: float) -> Optional[Dict[str, Any]]:
+        """首次建立锚点 + **逐张快照链式重放**（§4.3.1），返回待持久化状态。
+
+        为什么必须重放而不是「锚点 → 当前」一步算：锚点距今可能已经跨过一次入金，
+        一步算等于把那笔入金当成亏损（实测 index 88.75 vs 97.68，DD 差 7.8 个百分点，
+        够让没亏到线的账户凭空触发 25% 告警）。重放把每一步的流水单独扣掉，入金前后
+        指数自然连续。
+
+        重放范围用**全表**：30 天前的快照正是 bootstrap 要用的（prune 之后靠 state 续算）。
+        """
+        anchor = None
+        try:
+            anchor = self.db.hl_first_positive_snapshot()
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning("[hl-exec] 取首张正权益快照失败（改用扫描）：%s", e)
+        snaps: List[Any] = []
+        try:
+            snaps = list(self.db.hl_snapshots(0.0, 20000) or [])
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning("[hl-exec] 读快照全表失败（无法 bootstrap 回撤）：%s", e)
+            return None
+        if anchor is None:
+            # 兼容替身/老库没有 hl_first_positive_snapshot：自己扫一遍（只认 equity>0）
+            for r in snaps:
+                try:
+                    if float(r["equity"] or 0.0) > 0:
+                        anchor = r
+                        break
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+        if anchor is None:
+            return None
+        try:
+            a_ts = float(anchor["ts"] or 0.0)
+            a_eq = float(anchor["equity"] or 0.0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        if a_ts <= 0 or a_eq <= 0:
+            return None
+
+        replay = hl_dd.bootstrap(snaps, flows, anchor_ts=a_ts, anchor_eq=a_eq)
+        st = hl_dd.make_state(anchor_ts=a_ts, anchor_eq=a_eq,
+                              anchor_cumflow=hl_dd.cum_flow(flows, a_ts),
+                              replay=replay, now=now_ts)
+        try:
+            hl_dd.save_state(self.db, st)
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning("[hl-exec] 写 hl_dd_state 失败（下轮重新 bootstrap）：%s", e)
+        self._event(
+            EV_DD,
+            f"回撤锚点建立：锚点权益 {a_eq:,.2f}U（{len(snaps)} 张快照重放 {replay['points']} 步）"
+            f" → 指数 {st['index']:.2f} · 峰值 {st['peak_index']:.2f}",
+            data={"anchor_ts": a_ts, "anchor_eq": a_eq, "index": round(st["index"], 6),
+                  "peak_index": round(st["peak_index"], 6), "points": replay["points"],
+                  "twr_skipped": replay["twr_skipped"]})
+        return st
+
+    @staticmethod
+    def _dd_warn_text(dd_pct: float, th: dict, equity: float, net_dep: float) -> str:
+        """L2 文案：必须**说清当前动作**（L2 不停手），否则用户会以为已经停了。"""
+        return ("【HL执行】⚠️ 策略回撤 %.1f%%（≥ 告警线 %g%%）\n"
+                "峰值以来最大回撤，当前权益 %s U，净入金 %s U。\n"
+                "已暂停开新仓吗？未暂停 —— 达 %g%% 会自动熔断（停开新仓，不平现有仓）。"
+                % (dd_pct * 100.0, th["warn"] * 100.0, f"{equity:,.2f}",
+                   f"{net_dep:,.2f}", th["kill"] * 100.0))
+
+    @staticmethod
+    def _dd_kill_text(dd_pct: float, th: dict, repeat: bool = False) -> str:
+        head = ("🛑 回撤熔断仍在生效：策略回撤 %.1f%% ≥ 熔断线 %g%%" if repeat
+                else "🛑 回撤熔断：策略回撤 %.1f%% ≥ 熔断线 %g%%")
+        return ("【HL执行】" + (head % (dd_pct * 100.0, th["kill"] * 100.0)) +
+                "\n已停止开新仓（持仓按既有规则离场，不强制平仓）。\n"
+                "请人工核对后到「开关」页解除。")
+
+    def _dd_guard(self, snap: dict, alerts: List[str]) -> Optional[Dict[str, Any]]:
+        """算一轮策略口径回撤并判线（L2 告警 / L3 熔断）。返回本轮结果，未判 → None。
+
+        流程严格照 §4.3：
+          读状态 → （无锚点则 bootstrap 重放）→ 推进一格 → 写回 → 判线。
+        `ts_now <= last_ts`（时钟回拨/同秒重复）时**不推进也不写库**，直接用现有
+        index 判线 —— 再推一次会把这段收益率算两遍。
+        """
+        if not bool(getattr(self.p, "dd_guard", True)):
+            return None
+        now_ts = float(snap.get("ts") or time.time())
+        equity_now = float(snap.get("equity_total", snap.get("equity")) or 0.0)
+        # 现货读不到时 equity_total 只剩浮盈（不是账户总值）→ 算出来的回撤是假的
+        if not bool(snap.get("spot_ok", True)):
+            logger.warning("[hl-exec] 现货余额读取失败（spot_ok=False），本轮跳过回撤判断")
+            return None
+        flows = self._flows_all()
+        if not self._flows_ok or flows is None:
+            self._dd_unavailable(alerts, "出入金流水读取失败", now_ts)
+            return None
+
+        st = hl_dd.load_state(self.db)
+        if st is None:
+            st = self._dd_bootstrap(flows, now_ts)
+            if st is None:
+                self._dd_unavailable(alerts, "找不到正权益快照，无法建立回撤锚点", now_ts)
+                return None
+
+        prev_ts = float(st["last_ts"])
+        flow_k = hl_dd.net_flow(flows, prev_ts, now_ts)      # 落在 (last_ts, now] 的净流水
+        new = hl_dd.step(st, ts_now=now_ts, equity_now=equity_now, flow_k=flow_k)
+        if new is None:
+            # 指数算出负值 = 权益与流水自相矛盾。宁可这轮不判（fail-closed），
+            # 也不拿一个负数去触发熔断。
+            self._event(EV_DD, "回撤指数算出负值（权益/流水自相矛盾），本轮不判",
+                        data={"prev_eq": st.get("last_eq"), "equity": equity_now,
+                              "flow_k": flow_k})
+            return None
+        advanced = float(new.get("last_ts") or 0.0) > prev_ts
+        if advanced:
+            new["updated_at"] = now_ts
+            try:
+                hl_dd.save_state(self.db, new)
+            except Exception as e:                                 # noqa: BLE001
+                logger.warning("[hl-exec] 写 hl_dd_state 失败（下轮从旧状态续算）：%s", e)
+
+        dd_pct = hl_dd.drawdown(new.get("index"), new.get("peak_index"))
+        if dd_pct is None:
+            return None
+        th = hl_dd.thresholds(getattr(self.p, "risk_pct", 0.02),
+                              getattr(self.p, "dd_warn_pct", 0.0),
+                              getattr(self.p, "dd_kill_pct", 0.0))
+        res = {"ok": True, "dd": dd_pct, "index": float(new["index"]),
+               "peak_index": float(new["peak_index"]), "warn": th["warn"], "kill": th["kill"],
+               "auto": th["auto"], "advanced": advanced, "ts": now_ts,
+               "twr_skipped": int(new.get("twr_skipped") or 0)}
+
+        killed = False
+        origin = ""
+        try:
+            killed = bool(self.db.hl_kill())
+            origin = str(self.db.hl_kill_origin() or "")
+        except Exception as e:                                     # noqa: BLE001
+            logger.warning("[hl-exec] 读 kill 状态失败（按未触发处理）：%s", e)
+
+        if dd_pct >= th["kill"]:
+            if not killed:
+                self.db.hl_set_kill(
+                    True, f"策略回撤 {dd_pct * 100:.1f}%（≥ 熔断线 {th['kill'] * 100:g}%）",
+                    origin="dd")
+                self._event(EV_KILL,
+                            f"策略回撤 {dd_pct * 100:.1f}% ≥ 熔断线 {th['kill'] * 100:g}% → "
+                            f"kill（origin=dd，只停开新仓，人工解除）",
+                            data={"dd": round(dd_pct, 6), "index": round(res["index"], 6),
+                                  "peak_index": round(res["peak_index"], 6),
+                                  "warn": th["warn"], "kill": th["kill"]})
+                alerts.append((hl_dd.KILL_KEY, self._dd_kill_text(dd_pct, th, repeat=False)))
+            elif origin == "dd":
+                # 已经在 dd 熔断里：每 6h 提醒一次「仍在熔断中」，别每轮都喊
+                if self._dd_due(hl_dd.KILL_KEY, hl_dd.KILL_REPEAT_S, now_ts):
+                    alerts.append((hl_dd.KILL_KEY, self._dd_kill_text(dd_pct, th, repeat=True)))
+            else:
+                # 已有别的来源造成停手（人工/对账/当日亏损/数量/到期）：**不改写 origin**。
+                # 改写会把「人工停手」变成「可自解的对账 kill」或丢掉归因（与 H1 守卫同口径）。
+                self._event(EV_KILL,
+                            f"策略回撤 {dd_pct * 100:.1f}% ≥ 熔断线，但 kill 已由 "
+                            f"{origin or '未知来源'} 触发：保留原 origin，不重复置位",
+                            data={"origin": origin, "dd": round(dd_pct, 6)})
+            res["killed"] = True
+        elif dd_pct >= th["warn"] and not killed:
+            res["killed"] = False
+            if self._dd_due(hl_dd.ALERT_KEY, hl_dd.ALERT_THROTTLE_S, now_ts):
+                net_dep = hl_dd.cum_flow(flows, now_ts)
+                alerts.append((hl_dd.ALERT_KEY,
+                               self._dd_warn_text(dd_pct, th, equity_now, net_dep)))
+        else:
+            res["killed"] = killed
+        return res
 
     def _r_multiple(self, row, exit_px: float) -> float:
         entry = float(row["actual_entry"] or row["entry_price"])
@@ -2952,6 +3190,17 @@ class Executor:
         except Exception as e:                                       # noqa: BLE001
             logger.warning("[hl-exec] 同步成交失败（不影响交易）：%s", e)
 
+        # 1b) 同步出入金流水 —— **必须早于回撤判断**（§4.4）。
+        #     以前它在第 4b 步、熔断判断在第 3 步，等于拿最长 30 分钟前的流水算回撤
+        #     （那段时间里的入金会被当成亏损 → 假回撤/假熔断）。`_sync_flows` 自带
+        #     30 分钟间隔闸门 + 20s 预算 + 失败只 warning，提前**不增加**交易所调用频率。
+        #     与 PR #44 把 `_sync_fills` 提到对账之前是同一纪律：判据必须基于本轮的数据。
+        self._flows_ok = False
+        try:
+            self._sync_flows()
+        except Exception as e:                                       # noqa: BLE001
+            logger.warning("[hl-exec] 同步出入金流水失败（不影响交易）：%s", e)
+
         # 2) 对账
         rec = self.reconcile(snap, kill_before=kill_before)
         if not rec["ok"]:
@@ -3066,23 +3315,56 @@ class Executor:
                 alerts.append(f"【HL执行】ℹ️ {fc['coin']} 已在交易所被平仓（人工/外部）"
                               f"@ {fc['px']:,.2f}，本地已按成交价关账，{tail}{grace_note}")
 
-        # 3) 当日亏损熔断（基线 = 当日第一张快照；当前值用刚读到的实时权益）
+        # 3) 当日亏损熔断（L1）。基线 = 北京时间零点那张首快照的权益，当前 = 实时权益。
+        #    口径（规格 §5）：
+        #      daily_loss_rate = ((equity_now − equity_day0) − Σflows(ts_day0_snapshot < ts ≤ now))
+        #                        / equity_day0
+        #    为什么剔流水：旧口径不含出入金 —— 提现 = 假亏损（可能误 kill），入金把亏损
+        #    稀释（该报的不报）。
+        #    为什么左端是**首快照自己的时间戳**而不是 day0：落在「零点 → 首快照」之间的
+        #    入金已经体现在 equity_day0 里了，再扣一次 = 同一笔钱算两遍 = 假亏损
+        #    （实测一笔 50U 落在零点后 0.5s 时，错误口径 −5.78% 会误触发 5% 线，正确口径 −0.96%）。
         day0 = _today_start_ts()
         base = self.db.hl_snapshots(since_ts=day0, limit=1)
         spot_ok = bool(snap.get("spot_ok", True)) if snap else False
+        flows = self._flows_all()
+        flows_ok = bool(self._flows_ok) and flows is not None
         if base and not self.db.hl_kill():
             # 统一账户下 snap["equity"]（永续口径）恒为 0 → 必须用账户总值，否则熔断永不触发
             start_eq = float(base[0]["equity"] or 0.0)
             now_eq = float(snap.get("equity_total", snap.get("equity")) or 0.0)
+            now_ts = float(snap.get("ts") or time.time())
             # 现货读取失败时 equity_total 只剩浮盈 —— 数据不可信，宁可跳过也不误熔断
             if not spot_ok:
                 logger.warning("[hl-exec] 现货余额读取失败，本轮跳过亏损熔断判断（数据不可信）")
-            elif start_eq > 0 and (now_eq - start_eq) / start_eq <= -self.p.max_daily_loss_pct:
-                self.db.hl_set_kill(True, "当日亏损熔断", origin="daily_loss")
-                self._event(EV_KILL, f"当日亏损 {((now_eq - start_eq) / start_eq) * 100:.1f}% → kill",
-                            data={"start_equity": start_eq, "equity": now_eq})
-                alerts.append(f"【HL执行】⚠️ 当日亏损 {(now_eq - start_eq) / start_eq * 100:.1f}%"
-                              f"（阈值 -{self.p.max_daily_loss_pct * 100:g}%）→ 已停止自动交易")
+            elif start_eq > 0:
+                try:
+                    base_ts = float(base[0]["ts"] or day0)
+                except (KeyError, IndexError, TypeError, ValueError):
+                    base_ts = float(day0)
+                flow_today = hl_dd.net_flow(flows, base_ts, now_ts) if flows_ok else 0.0
+                # 流水不可用 → 退回旧口径（不剔出入金），文案里必须标注，不猜
+                flow_note = "" if flows_ok else "（未剔除出入金）"
+                loss_rate = ((now_eq - start_eq) - flow_today) / start_eq
+                if loss_rate <= -self.p.max_daily_loss_pct:
+                    self.db.hl_set_kill(True, "当日亏损熔断", origin="daily_loss")
+                    self._event(EV_KILL, f"当日亏损 {loss_rate * 100:.1f}% → kill",
+                                data={"start_equity": start_eq, "equity": now_eq,
+                                      "flows": round(flow_today, 6), "flows_ok": flows_ok,
+                                      "base_ts": base_ts})
+                    alerts.append(f"【HL执行】⚠️ 当日亏损 {loss_rate * 100:.1f}%{flow_note}"
+                                  f"（阈值 -{self.p.max_daily_loss_pct * 100:g}%）→ 已停止自动交易")
+
+        # 3b) 回撤熔断（DD Guard，L2 告警 / L3 熔断）。判据 = **策略口径**峰谷回撤
+        #     （TWR 链、剔除出入金），看的是「温水煮青蛙」型累计回撤 —— 日内 5% 那条线
+        #     每天重置，一个每天亏 4% 的系统永远不会触发它。
+        #     只置 kill + 推送，**不平仓**：持仓按既有规则（止损单/SMA20 离场）走完。
+        try:
+            self._dd_guard(snap, alerts)
+        except Exception as e:                                       # noqa: BLE001
+            # 口径算错绝不能连累交易主流程；但也不能静默：记一条事件留痕。
+            logger.warning("[hl-exec] 回撤熔断计算失败（本轮不判）：%s", e)
+            self._event(EV_ERROR, f"回撤熔断计算失败（本轮不判）：{e}"[:300])
 
         # 4) 死手开关（HL 原生 scheduleCancel）：**默认关闭**，见 ExecParams.use_schedule_cancel。
         #    关闭时这一步完全不碰交易所；即使在开启状态下调用失败/抛异常，也绝不外泄 ——
@@ -3106,15 +3388,7 @@ class Executor:
             except Exception as ex:                                   # noqa: BLE001
                 logger.warning("[hl-exec] 死手开关记账失败（忽略）：%s", ex)
 
-        # 4b) 出入金流水（盈亏曲线要剔除它）。**纯观测**：失败只记事件 + warning，
-        #     绝不影响交易。放在这里（交易动作之后、心跳之前）的理由：心跳是「本轮跑完
-        #     了」的信标，流水同步属于本轮工作的一部分，must not 拖住心跳的语义 —— 但它
-        #     自己有 20s 预算 + 300s+ 的间隔闸门，跑不跑得起来都不改变判活时间。
-        try:
-            self._sync_flows()
-        except Exception as e:                                       # noqa: BLE001
-            logger.warning("[hl-exec] 同步出入金流水失败（不影响交易）：%s", e)
-
+        # （出入金流水已提前到 1b 步：回撤判断要用本轮的流水，见 §4.4）
         # 5) 心跳（看守据此判断执行器存活）
         self._event(EV_HEARTBEAT,
                     f"executor 心跳（equity {snap.get('equity_total', snap.get('equity'))}）",
