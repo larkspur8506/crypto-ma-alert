@@ -1565,7 +1565,16 @@ class Executor:
         row = self.db.position_by_id(position_id)
         if row is None or self.p.mode == MODE_OFF:
             return False
-        if (row["hl_status"] or "") not in ("open",):
+        # 守卫：只有「本地还认为仓在交易所」的行才由执行器接管。
+        # 例外**仅**给 `mismatch` + 止损事件（2026-10-22 事故的第二入口）：对账已把该仓
+        # 打成 mismatch（交易所无仓、本地有仓）后，4h 收盘的止损离场进来时旧守卫直接
+        # return False → 执行器让出接管权 → 引擎回落到**人工流**，发出「到 MEXC 核对
+        # 持仓已平」这种对 HL 仓完全错误的指引（实盘 16:03 就这么发生）。
+        # 这里只放行，不改语义：真正的关账必须落在下面「reason=='stop' 且交易所无仓」
+        # 那一支（用真实成交价）；那支不成立（交易所有仓/快照不可读）会逐条 return False，
+        # 绝不允许 mismatch 行进到「撤止损 → 下平仓单」那一段去赌方向。
+        hl_status = row["hl_status"] or ""
+        if hl_status != "open" and not (reason == "stop" and hl_status == "mismatch"):
             return False
         symbol, side = row["symbol"], int(row["side"] or 1)
         # 离场也不能猜 coin：解析不出就**让出接管权**（return False）→ 引擎照常走人工提醒流，
@@ -1590,12 +1599,22 @@ class Executor:
         # 止损已由交易所触发（stop 事件）→ 用真实成交价关账，不发平仓单
         if reason == "stop" and snap is not None and coin not in ex_pos:
             px, fills = self._last_fill_px(coin)
+            if px is None and hl_status == "mismatch":
+                # mismatch 行 + 读不到成交价：账本本来就不一致，再按参考价关一次等于
+                # 「猜一个价把仓抹掉」。让出接管权（引擎会喊人去交易所核对），不关账。
+                self._event(EV_ERROR, f"{symbol} mismatch 止损离场但读不到成交价，未关账",
+                            symbol=symbol)
+                return False
             self._close_local(position_id, px or ref_price, "stop", sz)
             r = self._r_multiple(row, px or ref_price)
             self._alert(f"【HL执行】🛑 止损离场 · {coin} {'做多' if side == 1 else '做空'}\n"
                         f"止损单已由交易所触发 @ {px or ref_price:,.2f}，本地已关账（R {r:+.2f}）")
             return True
         if reason == "stop" and snap is None:
+            if hl_status == "mismatch":
+                # mismatch 行 + 快照读不到：既证明不了「已被交易所平掉」，也确认不了
+                # 「还在不在」—— 不下结论，让出接管权（旧行为本来就不接管这种行）。
+                return False
             # 快照读不到 ≠ 仓位没了。不能按参考价关账 —— 万一仓位还在（且止损单也丢了），
             # 本地关账后就没人管它了。只提醒，留给下一轮/人工。
             self._event(EV_ERROR, f"{symbol} 止损事件但快照不可读，未关账（下一轮再核对）",
@@ -1603,6 +1622,15 @@ class Executor:
             self._alert(f"【HL执行】⚠️ {coin} 判定止损离场，但账户快照读取失败，"
                         f"本地暂未关账 —— 请人工核对交易所。")
             return True
+
+        if hl_status == "mismatch":
+            # 走到这里 = 交易所**仍有**该 coin 的仓（上面「无仓」那支已返回）。
+            # mismatch 行只允许走「已确认被交易所平掉」那一条路径；账本已经不一致时
+            # 再由执行器撤止损/下平仓单，就是拿一本错账去真实下单 —— 让出接管权，交人工。
+            self._event(EV_DECISION,
+                        f"{symbol} mismatch 行止损离场但交易所仍有仓，让出接管权",
+                        symbol=symbol)
+            return False
 
         if not self.p.live:
             # 真实仓位在交易所、执行器却不是 live：绝不能替引擎把本地关账（会造成本地/交易所不一致），

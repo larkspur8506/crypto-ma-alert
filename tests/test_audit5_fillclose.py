@@ -292,5 +292,76 @@ class TestSyncBeforeReconcile(FillCloseBase):
         self.assertEqual(self.row()["status"], "closed")
 
 
+class TestMismatchStopExit(FillCloseBase):
+    """事故第二入口（2026-10-22 16:03 线上）：对账已把仓打成 mismatch 后，4h 收盘的
+    止损离场事件进来 —— 旧守卫直接让出接管权，引擎回落人工流并发「到 MEXC 核对」。
+
+    新口径：mismatch + reason='stop' 放行，但**只**走「交易所已无仓 → 按真实成交价关账」
+    这一条；条件不成立就让出接管权（return False），绝不下单。
+    """
+
+    def _mark_mismatch(self):
+        self.db.set_pos_hl(self.pid, hl_status="mismatch")
+
+    def test_mismatch_stop_closes_at_fill_price(self):
+        self._mark_mismatch()
+        self.info._fills = _fills()
+        ex = self.executor()
+
+        took_over = ex.on_exit(self.pid, "stop", STOP)
+
+        self.assertTrue(took_over, "止损已成交，执行器必须接管关账，不能回落人工流")
+        row = self.row()
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["hl_status"], "closed")
+        self.assertEqual(row["exit_reason"], "stop")
+        self.assertAlmostEqual(row["exit_price"], FILL_PX, places=4)   # 按真实成交价，不是参考价
+        text = self.alerts_text()
+        self.assertIn("🛑 止损离场", text)
+        self.assertIn("本地已关账", text)
+        self.assertNotIn("MEXC", text, "HL 仓已平，不能再给 MEXC 人工流指引")
+        self.assertNotIn("order", [c[0] for c in self.ex.calls], "不该下任何单")
+
+    def test_mismatch_stop_with_exchange_position_hands_off(self):
+        self._mark_mismatch()
+        self.info._snap = _snap(equity=987.3, positions=[_pos(coin="BTC", size=QTY,
+                                                              entry=ENTRY)],
+                                orders=[_stop_order(coin="BTC", trigger=STOP)])
+        ex = self.executor()
+
+        took_over = ex.on_exit(self.pid, "stop", STOP)
+
+        self.assertFalse(took_over, "交易所仍有仓时 mismatch 行必须让出接管权")
+        row = self.row()
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["hl_status"], "mismatch")
+        self.assertIsNone(row["exit_price"])
+        # 既不能撤单也不能下单（拿错账去动交易所）
+        self.assertEqual(self.ex.calls, [])
+
+    def test_mismatch_stop_without_fill_price_hands_off(self):
+        """mismatch + 交易所无仓但读不到成交价 → 不猜参考价关账，让出接管权。"""
+        self._mark_mismatch()
+        self.info._fills = []
+        ex = self.executor()
+
+        self.assertFalse(ex.on_exit(self.pid, "stop", STOP))
+        row = self.row()
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["hl_status"], "mismatch")
+
+    def test_mismatch_non_stop_reason_still_hands_off(self):
+        """放行只针对 stop：其它离场原因碰上 mismatch 一律照旧让出接管权。"""
+        self._mark_mismatch()
+        self.info._fills = _fills()
+        ex = self.executor()
+
+        self.assertFalse(ex.on_exit(self.pid, "ma20", ENTRY))
+        row = self.row()
+        self.assertEqual(row["status"], "open")
+        self.assertEqual(row["hl_status"], "mismatch")
+        self.assertEqual(self.ex.calls, [])
+
+
 if __name__ == "__main__":
     unittest.main()
