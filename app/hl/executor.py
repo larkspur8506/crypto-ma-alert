@@ -447,6 +447,11 @@ class Executor:
                 if proof is not None:
                     self._close_local(int(r["id"]), proof["px"], proof["reason"], proof["sz"])
                     self._mark_closing_order_filled(r, proof)
+                    # 人工/外部平仓：那张**没成交**的 reduce-only 止损还挂在交易所上，
+                    # 必须搬掉，否则会咬下一笔开仓（见 _cancel_residual_stops）。
+                    # reason=='stop' 不走这里：那张单就是成交的那张，撤它没有意义。
+                    if proof["reason"] == "exchange":
+                        self._cancel_residual_stops(r, coin)
                     self._event(EV_ORDER,
                                 f"{r['symbol']} 交易所侧已平仓（{proof['reason']}），"
                                 f"本地按成交价 {proof['px']:.2f} 关账",
@@ -552,6 +557,14 @@ class Executor:
         # 整仓关掉会把剩余敞口从账本里抹掉。容差只给 1 tick（浮点往返的末位误差）。
         if total < qty - tick:
             return None
+        # 上限同样要卡（对抗自查 A）：平仓腿合计**超过**本仓持仓量，说明这个时间窗里
+        # 混进了不属于这一仓的成交（同一 coin 上一仓的平仓残腿、或人工另外平了一笔）。
+        # 这种账已经不可归因：照 2×持仓算下去会把仓位关在一个既不是止损价、也不是
+        # 任何成交价的「混合均价」上，凭空造出一笔巨亏、并抹掉真实仓位归属。
+        # 比「不关账」更糟 —— 所以同样 fail-closed，退回 mismatch + kill 让人看。
+        # 上限也给 1 tick（同一套浮点末位容差），不多给。
+        if total > qty + tick:
+            return None
         px = sum(c["px"] * c["sz"] for c in closing) / total
         stop_oid = row["hl_stop_oid"]
         # 全部成交都出自本仓的止损单才是「止损离场」；只要有一笔来源不明（oid 缺失或
@@ -614,6 +627,88 @@ class Executor:
         self.db.hl_update_order(hit["symbol"], int(hit["bar_ms"]), hit["purpose"],
                                 status=ST_FILLED, filled_sz=proof["sz"], avg_px=proof["px"])
         return hit
+
+    def _cancel_residual_stops(self, row, coin: str) -> None:
+        """人工/外部平仓后，撤掉交易所侧**残留**的 reduce-only 止损单。
+
+        为什么必须动这一手（对抗自查 B）：``_fill_close_proof`` 判定 reason=='exchange'
+        的依据是「这笔平仓成交的 oid 不是本仓的 hl_stop_oid」—— 也就是说那张 reduce-only
+        止损**没有成交**、此刻仍挂在账户上。仓位已经没了、触发单还在，它对下一次开仓
+        是致命的：同一 coin 再开仓时它会被触发，把新仓直接平掉（等于用上一笔的挂单毁掉
+        下一笔交易），而本地账本会以为新仓有保护。
+        reason=='stop' 绝不进来：那张单本身就是成交的那张，既不该撤也无从撤。
+
+        只撤本地库里有**明确 oid**、状态仍是 resting/sent 的 stop / stop:fix / exit:rehang
+        行：没有 oid 就不知道撤哪张，退化成 cancel_all 会把别的仓的保护单一起撤掉。
+        不新增每轮交易所调用 —— 只有「这一轮真的判定为已平仓」才会发 cancel。
+
+        失败一律 fail-closed：行保持原状 + EV_ERROR + 一条告警喊人。撤不掉可能只是
+        接口抖动/单已不在场，但对账户来说「还在不在」读不准，宁可喊人确认，也不能
+        静默留一张幽灵触发单。
+        """
+        symbol = str(row["symbol"])
+        purposes = (PURPOSE_STOP, PURPOSE_STOP + ":fix", PURPOSE_EXIT_REHANG)
+        cands: List[dict] = []
+        for purpose in purposes:
+            try:
+                o = self.db.hl_order(symbol, int(row["signal_bar_ms"] or 0), purpose)
+            except Exception as e:                                    # noqa: BLE001
+                logger.warning("[hl-exec] 读挂单行失败（%s/%s）：%s", symbol, purpose, e)
+                continue
+            if o is not None:
+                cands.append(dict(o))
+        scan_failed = None
+        try:
+            # 止损可能在**别的 bar** 上补挂（stop:fix 记原 bar，exit:rehang 记离场 bar），
+            # 只按本 bar 三元键取一条会漏 —— 与 _mark_closing_order_filled 同口径。
+            for o in self.db.hl_recent_orders(100):
+                d = dict(o)
+                if d["symbol"] != symbol or d["purpose"] not in purposes:
+                    continue
+                if any(c["id"] == d["id"] for c in cands):
+                    continue
+                cands.append(d)
+        except Exception as e:                                        # noqa: BLE001
+            scan_failed = str(e)
+            logger.warning("[hl-exec] 扫挂单表失败（残留止损可能漏撤）：%s", e)
+
+        failed: List[str] = []
+        for c in cands:
+            # 只碰「活着」且有 oid 的行：已 filled/cancelled 的行没有可撤的东西，
+            # 没有 oid 的行不知道撤哪张。
+            if c["status"] not in (ST_RESTING, ST_SENT) or not c["oid"]:
+                continue
+            oid = int(c["oid"])
+            try:
+                res = self.ex.cancel(coin, oid)
+            except Exception as e:                                    # noqa: BLE001
+                res = {"ok": False, "error": f"撤单异常：{e}"}
+            if bool(res.get("ok")):
+                self.db.hl_update_order(symbol, int(c["bar_ms"]), c["purpose"],
+                                        status=ST_CANCELLED)
+                self._event(EV_ORDER,
+                            f"{symbol} 人工/外部平仓后撤掉残留止损单 {oid}（{c['purpose']}）",
+                            symbol=symbol, data={"oid": oid, "purpose": c["purpose"]})
+                continue
+            err = str(res.get("error") or "未知错误")[:300]
+            # 行**不**改状态（仍 resting）：本地认为它可能还在场上，看护/面板照旧会提，
+            # 人工核对时不会被「已撤」骗过去。
+            self.db.hl_update_order(symbol, int(c["bar_ms"]), c["purpose"], error=err)
+            self._event(EV_ERROR,
+                        f"{symbol} 已判定人工/外部平仓，但残留止损单 {oid} 撤销失败（{err}）"
+                        f"→ 行保持 {c['status']}，需人工撤单",
+                        symbol=symbol, data={"oid": oid, "purpose": c["purpose"], "error": err})
+            failed.append(f"{oid}（{err}）")
+
+        if failed:
+            self._alert(f"【HL执行】⚠️ {symbol} 已在交易所被平仓（人工/外部），"
+                        f"但残留的 reduce-only 止损单撤不掉：{'；'.join(failed)}。"
+                        f"该单若仍在场上，下次开仓可能被它平掉 —— 请到 HL 手动撤单并核对。",
+                        symbol=symbol)
+        elif scan_failed:
+            self._alert(f"【HL执行】⚠️ {symbol} 已按成交价关账，但挂单表读取失败"
+                        f"（{scan_failed[:120]}），无法确认是否还残留 reduce-only 止损单 —— "
+                        f"请到 HL 看一眼挂单。", symbol=symbol)
 
     # ------------------------------------------------------------ 数量对账（PR-3）
     def _size_tick(self, coin: str) -> Optional[float]:

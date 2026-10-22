@@ -292,6 +292,102 @@ class TestSyncBeforeReconcile(FillCloseBase):
         self.assertEqual(self.row()["status"], "closed")
 
 
+class TestOverfillRefused(FillCloseBase):
+    """A（对抗自查）：平仓腿合计**超过**持仓量 → 拒绝证明，退回 mismatch + kill。
+
+    造景：同一窗口两笔 Close，各 QTY、价差巨大（82375 / 70000）。若照旧关账，仓位会被
+    关在 76,187.5 这个「混合均价」上 —— 既不是任何真实成交价，还会把上一仓的成交算进
+    本仓，凭空造一笔巨亏。正确行为：账不可归因 → 不动账、kill 让人看。
+    """
+
+    def overfill(self):
+        now_ms = int(time.time() * 1000)
+        base = {"coin": "BTC", "oid": STOP_OID, "dir": "Close Long", "time": now_ms - 60_000,
+                "closedPnl": -1.0, "fee": 0.01, "feeToken": "USDC", "hash": "0xbbb"}
+        return [dict(base, sz=QTY, px=82375.0, tid=900001),
+                dict(base, sz=QTY, px=70000.0, tid=900002)]
+
+    def test_mixed_overfill_is_not_booked(self):
+        self.info._fills = self.overfill()
+        ex = self.executor()
+        alerts = ex.run()
+
+        row = self.row()
+        self.assertEqual(row["status"], "open", "超额成交不能拿来关账")
+        self.assertEqual(row["hl_status"], "mismatch")
+        self.assertIsNone(row["exit_price"], "不许写混合均价")
+        self.assertIsNone(row["exit_reason"])
+        self.assertTrue(self.db.hl_kill(), "账不可归因必须 fail-closed（kill）")
+        self.assertIn("本地有仓", self.alerts_text())
+        self.assertNotIn("已在交易所被平仓", "\n".join(alerts))
+        # 拒绝归拒绝，止损单也不能被顺手撤掉（仓还开着，撤了就是裸仓）
+        self.assertEqual(self.stop_row()["status"], "resting")
+        self.assertEqual([c for c in self.ex.calls if c[0] == "cancel"], [])
+
+
+class NoCancelExchange(FakeExchange):
+    """撤单必失败：模拟接口抖动，或那张单其实已经不在场上。"""
+
+    def cancel(self, coin, oid):
+        self.calls.append(("cancel", coin, oid))
+        return {"ok": False, "status": None, "oid": oid,
+                "error": "Order was never placed, already canceled, or filled.",
+                "avg_px": None, "filled_sz": None, "raw": None}
+
+
+class TestResidualStopCancelled(FillCloseBase):
+    """B（对抗自查）：人工/外部平仓后，交易所侧残留的 reduce-only 止损必须撤掉。
+
+    不撤的后果：仓没了、触发单还在，下一次同 coin 开仓会被它平掉。
+    """
+
+    def test_exchange_close_cancels_residual_stop(self):
+        self.info._fills = _fills(oids=(OTHER_OID, OTHER_OID))
+        ex = self.executor()
+        ex.run()
+
+        row = self.row()
+        self.assertEqual(row["status"], "closed")
+        self.assertEqual(row["exit_reason"], "exchange")
+        self.assertEqual(self.stop_row()["status"], "cancelled", "残留止损必须落终态")
+        self.assertEqual([c for c in self.ex.calls if c[0] == "cancel"],
+                         [("cancel", "BTC", STOP_OID)])
+        self.assertNotIn("撤不掉", self.alerts_text())
+
+        # 幂等：第二轮不再发撤单（不是每轮一次的交易所调用）
+        ex.run()
+        self.assertEqual(len([c for c in self.ex.calls if c[0] == "cancel"]), 1)
+
+    def test_stop_fill_path_does_not_cancel(self):
+        """reason='stop'：那张单本身已成交，绝不能再去撤。"""
+        self.info._fills = _fills()
+        self.executor().run()
+        self.assertEqual(self.row()["exit_reason"], "stop")
+        self.assertEqual([c for c in self.ex.calls if c[0] == "cancel"], [])
+
+
+class TestResidualStopCancelFails(FillCloseBase):
+    """B 失败分支：撤不掉 → 行保持 resting + EV_ERROR + 一条告警（不静默）。"""
+
+    def test_failed_cancel_keeps_row_and_alerts(self):
+        self.info._fills = _fills(oids=(OTHER_OID, OTHER_OID))
+        self.ex = NoCancelExchange()
+        ex = self.executor()
+        ex.run()
+
+        self.assertEqual(self.row()["status"], "closed")     # 关账本身仍然完成
+        self.assertEqual(self.stop_row()["status"], "resting",
+                         "撤单失败不能把行标成 cancelled（会骗过人工核对）")
+        self.assertIn("cancel", [c[0] for c in self.ex.calls])
+
+        text = self.alerts_text()
+        self.assertIn("撤不掉", text)
+        self.assertIn(str(STOP_OID), text)
+
+        errs = [r["message"] for r in self.db.hl_recent_events(50, kind="error")]
+        self.assertTrue(any("撤销失败" in m for m in errs), errs)
+
+
 class TestMismatchStopExit(FillCloseBase):
     """事故第二入口（2026-10-22 16:03 线上）：对账已把仓打成 mismatch 后，4h 收盘的
     止损离场事件进来 —— 旧守卫直接让出接管权，引擎回落人工流并发「到 MEXC 核对」。
