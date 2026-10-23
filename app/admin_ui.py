@@ -155,7 +155,8 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
     ("hl_dd_guard", "回撤熔断（策略口径峰谷回撤）",
      "开 = 策略回撤达告警线推一条提醒、达熔断线停止开新仓（持仓按既有规则离场，"
      "不强制平仓，需人工到本页解除）；阈值按当前「单笔风险」档位自动选"
-     "（1.5% 档 25/30、2.5% 档 30/40、3% 档 40/50），下面两个框可覆盖。"
+     "（1.5% 档 25/30、2.5% 档 30/40、3% 档 40/50），"
+     "要覆盖到参数页「风控阈值」组填。"
      "关 = 只保留日内 5% 那条线", True, "HL_DD_GUARD"),
 )
 
@@ -470,6 +471,11 @@ PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
 _GROUPS: Tuple[Tuple[str, str], ...] = (
     ("策略", "决定什么信号会被发出来；方向开关已迁到「开关」页"),
     ("执行与推送", "决定下多大、占多少保证金（每日心跳推送在「开关」页）"),
+    # 回撤阈值 2026-10-23 从「开关」页迁来（分类：数值型保护阈值归参数页，与
+    # hl_churn_max / hl_close_grace_s 同类；布尔开关才归「开关」页）。
+    # 放这里的原因：它的默认值**由 risk_pct 档位联动**（1.5% 档 25/30、2.5% 档
+    # 30/40、3% 档 40/50），改「单笔风险」时两条线自动跟着走 —— 属于「参数」的心智。
+    ("风控阈值", "回撤熔断线等保护阈值；留空 = 按「单笔风险」档位自动"),
     ("资金", "下单基数怎么算"),
     ("API 有效期", "接口查不到有效期时的手工兜底；到期前要不要自动清仓在「开关」页"),
 )
@@ -722,6 +728,11 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
                 o.append(_num_field(key, label, _cur_val(cfg, key, default, kind),
                                     hint, src, step="1" if kind == "int" else "",
                                     attrs=attrs))
+        # 「风控阈值」组没有 PARAM_FIELDS 条目：回撤阈值是**两个联动的可选数值**
+        # （不是单个字段），输入框的语义也与普通数值项不同（留空 = 保持原值，
+        # 显式 0 = 回到档位自动，而不是「不改动」），所以自己渲染。
+        if group == "风控阈值":
+            o.append(_dd_threshold_fields(cfg, raw))
         o.append("</div>")
 
     o.append("<button type='submit'>保存全部参数</button></form>")
@@ -935,7 +946,8 @@ def _dd_threshold_fields(cfg: Any, raw: Dict[str, Any]) -> str:
             f"<div class='hint'>{_esc(hint)}</div></div>")
 
 
-def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
+def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any,
+                         risk_pct: Any = None) -> tuple:
     """解析两个可选回撤阈值 → ({key: value}, 提示文案)。
 
     规则（§6）：
@@ -943,6 +955,13 @@ def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
       - 非数字 / 越界 / 与另一条线自相矛盾 → **两个都拒收**（保留原值），并给一句人话说明。
     范围（0 或 5%~95%）与「warn < kill」全部由 `app/hl/dd.py` 判（`pct_ok` /
     `thresholds`，含档位联动）—— 这里不再抄一遍区间（§6 低4）。
+
+    ``risk_pct``：**本次提交后**的单笔风险（2026-10-23 加）。档位联动时判据依赖
+    risk_pct，而装配层 `Config.apply_db` 用的是**同一次提交后**的 risk_pct ——
+    两层必须判在同一个档位上，否则会出现「面板放行、装配拒收」：用户同时改
+    risk_pct 和回撤阈值、且只填了其中一条线时，留空那条按档位补出来的值，
+    在旧档位下成立、在新档位下不成立。不传 risk_pct 时退回 cfg 里的当前值
+    （= 同一次提交没改 risk_pct 的情形，与装配层一致）。
     """
     if warn_raw is None and kill_raw is None:
         return {}, ""
@@ -967,7 +986,10 @@ def _parse_dd_thresholds(warn_raw: Any, kill_raw: Any, cfg: Any) -> tuple:
         out[key] = v
     if not out:
         return {}, ""
-    risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
+    # 档位判据必须与装配层 apply_db 一致：都用**本次提交后**的 risk_pct。
+    risk = _num(risk_pct, None)
+    if risk is None:
+        risk = _num(getattr(cfg, "risk_pct", 0.02), 0.02)
     if hl_dd.thresholds(risk, out.get("hl_dd_warn_pct", cur["hl_dd_warn_pct"]),
                         out.get("hl_dd_kill_pct", cur["hl_dd_kill_pct"]))["rejected"]:
         # 【低5】文案必须让用户知道「你填的值没生效」，不只是「被拒收」：DB 里保留的
@@ -1029,10 +1051,10 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
         cur = getattr(cfg, key, dflt)
         on = _b(cur) if not isinstance(cur, bool) else cur
         o.append(_bool_field(key, label, bool(on), hint, _source(raw, key, env_key)))
-    # 回撤阈值覆盖（可选）：留空 = 按 risk_pct 档位自动。
-    # 数值项的铁律（与开关相反）：**留空不许写成 0** —— 0 在这个键上是「自动档位」
-    # 的意思，把「没填」当 0 写进去会把用户在别的入口设的覆盖值静默清掉。
-    o.append(_dd_threshold_fields(cfg, raw))
+    # 回撤阈值的**两个输入框** 2026-10-23 迁到参数页「风控阈值」组（数值型保护
+    # 阈值归参数页，与 hl_churn_max / hl_close_grace_s 同类；这里只留布尔开关）。
+    # 迁移前它们就在这张卡里 —— 那是上一轮做 DD Guard 时「顺手放进已有卡片」的
+    # 连带结果，不是分类上的选择。
     o.append("<button type='submit'>保存策略与保护</button></form></div>")
 
     # ---- 推送开关 ----
@@ -1550,6 +1572,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                      hl_churn_max: Optional[str] = Form(None),
                      hl_close_grace_s: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
+                     hl_dd_warn_pct: Optional[str] = Form(None),
+                     hl_dd_kill_pct: Optional[str] = Form(None),
                      k: str = Form("")):
         token = _auth(deps, request, k or None)
         values, errs = _parse_params({
@@ -1565,13 +1589,34 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         })
         if errs:
             raise HTTPException(400, "参数校验失败：" + "；".join(errs))
+        # 回撤阈值（2026-10-23 从「开关」页迁到参数页「风控阈值」组）。
+        #
+        # **为什么单独处理、不走 _parse_params**：这两个键的「0」不是「关闭」而是
+        # 「回到档位自动」，而 _parse_params 里 0 对 hl_churn_max 是「关闭」——
+        # 语义正好相反，共用一个解析器必然错一个。校验/拒收规则全部委托给
+        # _parse_dd_thresholds（唯一真相在 app/hl/dd.py:thresholds）。
+        #
+        # **拒收降级为提示、不 400**：本路由是「全有或全无」（任一字段非法就
+        # raise 400 且一个字段都不写库）。若把 DD 的拒收也做成 400，用户为了改
+        # 风险率而顺手填错的阈值，会把同一次提交里的其它参数一起丢掉 —— 那是
+        # 静默丢改动，比「阈值没生效」严重得多。所以：DD 拒收 → 不写这两个键、
+        # 其余照存、页面上给一句人话说明。
+        dd_vals, dd_msg = _parse_dd_thresholds(hl_dd_warn_pct, hl_dd_kill_pct,
+                                               deps.config_fn(),
+                                               risk_pct=values.get("risk_pct"))
+        values.update(dd_vals)
         put_errs = [err for err in (deps.put(key, val) for key, val in values.items()) if err]
         if put_errs:
             raise HTTPException(400, "保存失败（其余字段可能已写入）：" + "；".join(put_errs))
-        deps.log_event("decision",
-                       f"面板修改参数（{', '.join(f'{k}={v:g}' if isinstance(v, float) else f'{k}={v}'
-                                                  for k, v in sorted(values.items()))}）")
-        return RedirectResponse(_back(token, "params"), status_code=303)
+        if values:
+            deps.log_event("decision",
+                           f"面板修改参数（{', '.join(f'{k}={v:g}' if isinstance(v, float) else f'{k}={v}'
+                                                      for k, v in sorted(values.items()))}）")
+        # 提示语：DD 拒收优先显示（那才是「你填的值没生效」），其次是保存成功。
+        if dd_msg:
+            return RedirectResponse(_back(token, "params", dd_msg), status_code=303)
+        return RedirectResponse(_back(token, "params", "已保存" if values else "无改动"),
+                                status_code=303)
 
     # ---------------- 执行模式 ----------------
     @router.post("/admin/switch/mode")
