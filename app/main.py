@@ -24,6 +24,8 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Resp
 from app import engine, market, posfields, sizing, strategy
 from app.config import Config
 from app.db import DB
+from app.hl import pnl as hl_pnl
+from app.hl import funding as hl_funding
 from app.notify import get_notifier
 from app.ui_theme import THEME_CSS, normalize_theme, page_shell
 
@@ -861,6 +863,54 @@ def _exit_label(row) -> str:
     return engine._exit_reason_plain(row["exit_reason"], row["side"])
 
 
+def _hl_funding_lines(row) -> list:
+    """确认页（/c 摘要）HL 仓的单粒度资金费两行（feat/funds-ledger，P3）。
+
+    - 「本单资金费合计 ±X U」：hl_funding 按 position_id 归集的合计（正=收入）；
+      没有资金费记录显示「暂无资金费记录（或尚未同步）」，不猜 0。
+    - 「本单净盈亏（含手续费，不含资金费）」= positions.net_pnl **原口径原值**（本
+      轮拍板一律不动）；「本单总成本（含资金费）」与之并列 = 手续费合计 + 资金费
+      支出合计（收入不抵扣成本，收入已在上一行如实展示）。手续费合计走引擎同款
+      聚合（hl_pnl.aggregate_fills + hl_fills_window），不另写一套口径。
+    """
+    lines: list = []
+    pid = row["id"]
+    fund_sum = db.hl_funding_by_position().get(int(pid))
+    coin = registry_like_coin(row["symbol"])
+    if fund_sum is None:
+        lines.append("<span class='muted'>本单资金费合计：暂无资金费记录（或尚未同步）</span>")
+        fund_sum = 0.0
+    else:
+        cls = "pos" if fund_sum > 0 else ("neg" if fund_sum < 0 else "")
+        lines.append(f"本单资金费合计 <b class='{cls}'>{fund_sum:+,.2f} U</b>（正=收入）")
+    # 手续费合计：引擎同款窗口聚合（±300s，见 app/hl/pnl.py docstring）
+    fee_total = 0.0
+    try:
+        lo, hi = hl_pnl.window_bounds(row["opened_at"], row["closed_at"])
+        fills = db.hl_fills_window(coin, lo, hi) if coin else []
+        agg = hl_pnl.aggregate_fills(fills, row["opened_at"], row["closed_at"], coin,
+                                     row["side"] or 1)
+        fee_total = float(agg.get("fee_total") or 0.0)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[confirm] 本单手续费聚合失败（成本行按 0 展示）：%s", e)
+    funding_paid = max(0.0, -fund_sum)      # 支出 = 负的合计取绝对值；收入不算成本
+    net = row["net_pnl"]
+    net_txt = "—（无成交数据）" if net is None else f"{float(net):+,.2f} U"
+    cost = fee_total + funding_paid
+    lines.append(f"<span class='muted'>本单净盈亏（含手续费，不含资金费）"
+                 f"<b>{net_txt}</b>｜本单总成本（含资金费）<b>{cost:,.2f} U</b></span>")
+    return lines
+
+
+def registry_like_coin(symbol: str) -> str:
+    """symbol → HL coin：注册表优先，未登记回落下划线前缀（与执行器默认映射一致）。"""
+    try:
+        from app import symbol_registry as _reg
+        return _reg.hl_coin(symbol)
+    except Exception:                                             # noqa: BLE001
+        return hl_funding.coin_of_symbol(symbol)
+
+
 def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     """只读摘要页：只显示当前记录 + 显式入口（修改 / 手动平仓）。"""
     tok = lambda act: engine.sign_token(config.token_secret, pid, act)      # noqa: E731
@@ -897,6 +947,9 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
         btns.append("<br><span class='muted'>本仓由 HL 执行器管理，真实成交见面板"
                     "「记录」页的成交（hl_fills）与下单记录（hl_orders），"
                     "不支持在此修改开仓数据。</span>")
+        # 单粒度资金费收口（feat/funds-ledger，P3）：HL 持仓/已平仓摘要页新增可见两行；
+        # 非 HL 仓不加（is_hl 已过滤）。net_pnl 原口径原值，只在文案里注明「不含资金费」。
+        lines.extend(_hl_funding_lines(row))
     body = (f"<h1>{_status_label(row)} #{pid}</h1>"
             f"<div class='card'>{'<br>'.join(lines)}</div>"
             f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")

@@ -30,6 +30,7 @@ from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, 
 from app.hl import sizing as hl_sizing
 from app.hl import pnl as hl_pnl
 from app.hl import flows as hl_flows
+from app.hl import funding as hl_funding
 from app.hl import dd as hl_dd
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
@@ -2811,6 +2812,22 @@ class Executor:
             logger.warning("[hl-exec] 写 hl_flows_synced_at 失败（忽略）：%s", e)
         if res["added"]:
             logger.info("[hl-exec] 新增 %d 笔出入金流水（拉到 %d 条）", res["added"], res["seen"])
+
+        # 资金费同步搭同一趟闸门（feat/funds-ledger，spec：不新增调度 job、不加限流
+        # 负担）：只有这轮真的开了流水闸门，才顺带拉一次 userFunding。失败只记事件
+        # + warning、下轮随闸门重试 —— **绝不影响 _flows_fresh**（那是流水自己的可信
+        # 标记，回撤/DD Guard 靠它 fail-closed；资金费是纯记账，没资格弄脏它）。
+        # 测试替身（FakeInfo/FakeDB）没有 userFunding 能力 → 静默跳过，不刷错误事件。
+        if (hasattr(self.info, "user_funding_history")
+                and hasattr(self.db, "hl_funding_last_ts")):
+            try:
+                hl_funding.sync_funding(
+                    self.info, self.db, address,
+                    deadline_ts=time.time() + self.FLOW_SYNC_BUDGET_S)
+            except Exception as e:                                   # noqa: BLE001
+                logger.warning("[hl-exec] 拉取资金费失败（下轮随闸门重试）：%s", e)
+                self._event(EV_ERROR, f"资金费同步失败（流水表暂缺资金费行）：{e}"[:300],
+                            data={"error": str(e)[:300]})
         return res["added"]
 
 
