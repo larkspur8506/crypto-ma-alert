@@ -189,7 +189,8 @@ class TestWithClosedPositions(WeeklyFixture):
         self.assertEqual(self.text.count("+87.4 U"), 1, "净值差只该在概览出现一次")
 
     def test_per_trade_lines(self):
-        self.assertIn("▍本周逐笔（1R = 这笔交易计划的亏损额，即开仓时净值的 1.33%）", self.text)
+        self.assertIn("▍本周逐笔（1R = 该笔开仓时计划的风险额；空单开启减半时按全额的一半计）",
+                      self.text)
         # 日期从夹具的 close_days_ago 推导（同一时间来源），不再写死 10-17/10-18
         self.assertIn(f"① {date_of(2.0)} BTC 做空 82,909 → 83,930　{MINUS}0.89R　价格收上均线，正常离场",
                       self.text)
@@ -322,18 +323,31 @@ class TestLosingStreakNote(WeeklyFixture):
 
 
 class TestRiskDefinitionLine(WeeklyFixture):
-    """R 定义行的百分比必须保留两位（旧 :.0f 把 1.33% 写成 1%）。"""
+    """1R 的定义行：方向中性、不写死百分比。
 
-    def test_two_decimals(self):
+    旧文案「即开仓时净值的 {risk_pct}%」在「空单风险减半」打开后对空单为假
+    （空单的 1R 只有净值的一半）—— 所以定义行只说口径、不再复述配置百分比，
+    也不随 risk_pct 变化。
+    """
+
+    LINE = "▍本周逐笔（1R = 该笔开仓时计划的风险额；空单开启减半时按全额的一半计）"
+
+    def test_definition_is_direction_neutral(self):
         add_position(self.db, status="closed", r_multiple=-1.0, close_days_ago=1.0)
         text = self.render()
-        self.assertIn("即开仓时净值的 1.33%）", text)
-        self.assertNotIn("净值的 1%）", text)
+        self.assertIn(self.LINE, text)
+        self.assertNotIn("净值的", text)          # 不再对空单说谎
+        for pct in ("2.00%", "1.33%"):
+            self.assertNotIn(pct, text)
 
-    def test_follows_cfg(self):
+    def test_text_never_follows_risk_pct(self):
+        """改 risk_pct / 打开空单减半 —— 这行必须一字不变（口径不随参数漂）。"""
         self.cfg.risk_pct = 0.02
-        add_position(self.db, status="closed", r_multiple=-1.0, close_days_ago=1.0)
-        self.assertIn("即开仓时净值的 2.00%）", self.render())
+        self.cfg.short_risk_half = True
+        add_position(self.db, side=-1, status="closed", r_multiple=-1.0, close_days_ago=1.0)
+        self.assertIn(self.LINE, self.render())
+        self.cfg.risk_pct = 0.0133
+        self.assertIn(self.LINE, self.render())
 
 
 class TestExitReasonPlain(WeeklyFixture):

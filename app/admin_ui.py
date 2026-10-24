@@ -417,6 +417,21 @@ def effective_base(deps: AdminDeps, cfg: Any, payload: dict) -> Tuple[float, flo
     return live, eff, "跟随实时权益"
 
 
+def _risk_pair(equity: float, rp: float, half: bool) -> Tuple[float, float]:
+    """(多单风险U, 空单风险U)。开关关闭时两者相同 —— 唯一的折算入口是 sizing。"""
+    return equity * rp, equity * sizing.effective_risk_pct(rp, -1, half)
+
+
+def _risk_phrase(risk_u: float, risk_u_short: float, half: bool) -> str:
+    """「单笔风险」的白话：开关打开时**必须**区分多空，否则面板在骗人。
+
+    关闭时保持原来的一句话（逐字不变）；打开时两个数各写一次，不重复。
+    """
+    if half:
+        return f"单笔风险 多单 {risk_u:,.2f}U · 空单 {risk_u_short:,.2f}U"
+    return f"单笔风险 {risk_u:,.2f}U"
+
+
 def impact(cfg: Any, price: float, base: Optional[float] = None,
            *, equity: Optional[float] = None, risk_pct: Optional[float] = None,
            leverage: Optional[float] = None, stop_dist: Optional[float] = None
@@ -431,11 +446,19 @@ def impact(cfg: Any, price: float, base: Optional[float] = None,
     sd = stop_dist if stop_dist is not None else _num(getattr(cfg, "stop_min", 0.0))
     if price <= 0 or eq <= 0 or rp <= 0 or sd <= 0 or lev <= 0:
         return None
-    risk_u = eq * rp
+    # 空单风险减半（short_risk_half）开着时，空单的单笔风险只有一半 —— 预览行
+    # 必须把两个方向分开写，否则面板会告诉用户「单笔风险 20U」，而他真去开空
+    # 只有 10U（或反过来照着 20U 加仓 = 风险翻倍）。
+    short_half = bool(getattr(cfg, "short_risk_half", False))
+    risk_u, risk_u_short = _risk_pair(eq, rp, short_half)
     notional = risk_u / sd
+    notional_short = (risk_u_short / sd) if risk_u_short > 0 else 0.0
     return {"price": price, "equity": eq, "risk_pct": rp, "leverage": lev,
             "stop_dist": sd, "risk_u": risk_u, "notional": notional,
             "margin": notional / lev, "liq": sizing.liq_price(price, lev, 1),
+            # 空单口径（开关关闭时与多单完全相同）
+            "short_half": short_half, "risk_u_short": risk_u_short,
+            "notional_short": notional_short, "margin_short": notional_short / lev,
             # 做空参考（同参数镜像）：预览页给出两个方向的强平价，防误读
             "liq_short": sizing.liq_price(price, lev, -1)}
 
@@ -443,7 +466,15 @@ def impact(cfg: Any, price: float, base: Optional[float] = None,
 def _impact_line(d: Optional[dict]) -> str:
     if not d:
         return "影响预览：无法取价（等只读接口恢复后再算）"
-    return (f"按 BTC 现价 {d['price']:,.0f}：单笔风险 {d['risk_u']:.2f}U · "
+    if d.get("short_half"):
+        # 多空分开写：风险/名义/保证金各自一组，同一数字不重复
+        return (f"按 BTC 现价 {d['price']:,.0f}："
+                f"{_risk_phrase(d['risk_u'], d['risk_u_short'], True)} · "
+                f"名义 多 {d['notional']:,.0f}U/空 {d['notional_short']:,.0f}U · "
+                f"保证金 多 {d['margin']:,.0f}U/空 {d['margin_short']:,.0f}U · "
+                f"强平 多{d['liq']:,.0f}/空{d['liq_short']:,.0f}")
+    return (f"按 BTC 现价 {d['price']:,.0f}："
+            f"{_risk_phrase(d['risk_u'], d['risk_u_short'], False)} · "
             f"名义 {d['notional']:,.0f}U · 保证金 {d['margin']:,.0f}U · "
             f"强平 多{d['liq']:,.0f}/空{d['liq_short']:,.0f}")
 
@@ -513,8 +544,11 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
                   imp: Optional[dict], imp_max: Optional[dict]) -> str:
     """每项旁的一行小字：这个字段改动能带来什么变化（按当前值实算，不靠猜）。"""
     if key == "equity":
-        return f"仅「固定基数」模式用：基数 {_num(getattr(cfg, 'equity', 0)):,.0f}U → 单笔风险 " \
-               f"{_num(getattr(cfg, 'equity', 0)) * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
+        eq_v = _num(getattr(cfg, "equity", 0))
+        return f"仅「固定基数」模式用：基数 {eq_v:,.0f}U → " + _risk_phrase(
+            *_risk_pair(eq_v, _num(getattr(cfg, "risk_pct", 0)),
+                        bool(getattr(cfg, "short_risk_half", False))),
+            bool(getattr(cfg, "short_risk_half", False)))
     if key == "equity_mode":
         mode = str(getattr(cfg, "equity_mode", "follow") or "follow")
         if mode == "fixed":
@@ -525,8 +559,10 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
     if key == "equity_min":
         return f"仅「跟随实时权益」模式用：基数不低于 {_num(getattr(cfg, 'equity_min', 0)):,.0f}U"
     if key == "risk_pct":
-        return f"{_num(getattr(cfg, 'risk_pct', 0)) * 100:.2f}% × 基数 {base:,.0f}U = 单笔风险 " \
-               f"{base * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
+        rp_v = _num(getattr(cfg, "risk_pct", 0))
+        half = bool(getattr(cfg, "short_risk_half", False))
+        return f"{rp_v * 100:.2f}% × 基数 {base:,.0f}U = " + \
+            _risk_phrase(*_risk_pair(base, rp_v, half), half)
     if key == "leverage":
         lev = _num(getattr(cfg, 'leverage', 5))
         if imp:

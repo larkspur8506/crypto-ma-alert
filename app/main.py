@@ -780,6 +780,10 @@ def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLRe
                 f"张数 {(row['actual_contracts'] if row['actual_contracts'] is not None else row['contracts']):g}）。</p>")
     cur_entry = posfields.entry_px(row) if editing else row["entry_price"]
     cur_stop = posfields.stop_px(row) if editing else row["stop_price"]
+    # 双口径判定（app/posfields.py）：**一行一判**，下面五处（张数回退、金额换算
+    # 禁用、币量标签、提示语）都依赖它。缺了这行 = 任何 pending 行/修改页直接
+    # NameError 500（2026-10-24 审查 B1 实锤：这行在 c950bdc 收敛时被顺手删了）。
+    _is_hl = posfields.is_hl(row)
     cur_qty = posfields.qty(row) if editing else (posfields.contracts_raw(row)
                                                   if not _is_hl else posfields.qty(row))
     edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
@@ -1021,9 +1025,13 @@ async def confirm_post(pid: int, request: Request):
         # MEXC 行是建行时的配置 equity），不再拿当前配置值硬套 —— 否则 HL 仓
         # 真实基数 100U 会被按配置 1000U 读成 0.2%。
         _eq_base = posfields.equity_base(row, current_config().equity)
+        # 目标风险用**这行建行时**的计划风险（row["risk_u"]），不用当前 cfg × 当前开关
+        # 现算：开关在建行与确认之间可能被切换，现算会把一笔按旧政策下的单判成
+        # 「偏离 +102% / -50%」并反向建议（开双倍 / 砍一半）—— 见 review_fill 文档。
         rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
                                  row["contracts"], entry, stop, qty, source,
-                                 equity=_eq_base, side=row["side"])
+                                 equity=_eq_base, side=row["side"],
+                                 target_risk_u=row["risk_u"])
         src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"
                    if source == "amount" else "按你填的张数")
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"

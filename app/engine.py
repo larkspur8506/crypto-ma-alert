@@ -213,7 +213,8 @@ def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
 
 def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: int,
                 entry: float, stop: float, contracts: int, source: str = "contracts",
-                equity: Optional[float] = None, side: Optional[int] = None) -> dict:
+                equity: Optional[float] = None, side: Optional[int] = None,
+                target_risk_u: Optional[float] = None) -> dict:
     """确认开仓后按**真实成交**做一次风险体检（纯计算，不落库）。
 
     为什么需要：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额
@@ -233,12 +234,29 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
     否则体检会把一笔**本来就该只有一半风险**的空单判成「偏离目标 -50%」，还会
     建议你「要正好 20U 就该开双倍张数」，那正是这个开关要防的事。
     不传（老脚本/测试）按多单口径 ⇒ 不折算 ⇒ 与改动前完全一致。
+
+    `target_risk_u`：这一行**建行时**的计划风险额（`positions.risk_u`）。传了就直接
+    用它当目标，不再按「当前配置 × 当前开关」现算。
+    为什么必须能传：开关是**可随时改的**，「建行」与「确认」之间用户可能切换开关
+    （半额空单建好 → 关开关再确认；或全额空单建好 → 开开关再确认）。用现算口径会
+    拿新的政策去审一笔按旧政策下的单：
+      - 全额仓（20U）+ 开关开 → 目标算成 10U → 判「偏离 +102%」并建议「只开 41 张」
+        → 用户照做就把一个正常的满额空单砍成半额；
+      - 半额仓（10U）+ 开关关 → 目标算成 20U → 判「-50%」并建议「开双倍」。
+    这条路径（main.confirm_post）永远传它；不传（老脚本）保持原有现算行为。
     """
     contract_size = CONTRACT_SPECS[symbol][0]
     m = sizing_metrics(symbol, entry, stop, contracts, cfg.leverage)
     base = float(equity) if equity else cfg.equity
-    target = base * effective_risk_pct(cfg.risk_pct, 1 if side is None else side,
-                                       getattr(cfg, "short_risk_half", False))
+    planned = None
+    try:
+        planned = float(target_risk_u) if target_risk_u is not None else None
+    except (TypeError, ValueError):
+        planned = None
+    # 建行时的计划风险是唯一事实来源（>0 才可信，0/脏值退回现算口径）
+    target = planned if (planned is not None and planned > 0) else \
+        base * effective_risk_pct(cfg.risk_pct, 1 if side is None else side,
+                                  getattr(cfg, "short_risk_half", False))
     drift = (entry - suggested_entry) / suggested_entry if suggested_entry else 0.0
     notes: List[str] = []
 
@@ -941,9 +959,12 @@ def weekly_text(db, cfg) -> str:
 
     # ---------------- 逐笔
     if week_rows:
-        risk_txt = f"{float(cfg.risk_pct) * 100:.2f}%"
         lines.append("")
-        lines.append(f"▍本周逐笔（1R = 这笔交易计划的亏损额，即开仓时净值的 {risk_txt}）")
+        # 方向中性：开启「空单风险减半」后，空单的 1R 是全额的一半 —— 不能写死
+        # 「开仓时净值的 2.00%」（对空单为假）。1R 的定义始终是**这笔自己的**计划
+        # 亏损额（positions.risk_u），所以只说口径、不复述配置百分比。
+        lines.append("▍本周逐笔（1R = 该笔开仓时计划的风险额；"
+                     "空单开启减半时按全额的一半计）")
         for i, r in enumerate(week_rows, 1):
             entry = posfields.entry_px(r)
             if entry is None:
