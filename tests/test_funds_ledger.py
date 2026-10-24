@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import importlib
 import json
+import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -53,9 +55,10 @@ def _pos(db: DB, symbol: str = "BTC_USDT", opened: float = 2000.0,
 
 def _fill(db: DB, tid: str, coin: str = "BTC", ts: float = 2100.0,
           closed_pnl: float = 0.0, fee_quote: float | None = 0.02,
-          fee: float = 0.02, dir_: str = "Open Long") -> None:
+          fee: float = 0.02, dir_: str = "Open Long",
+          fee_token: str = "USDC") -> None:
     db.hl_upsert_fill(tid=tid, symbol=f"{coin}_USDT", coin=coin, side=1, sz=0.001,
-                      px=100, fee=fee, fee_token="USDC", fee_quote=fee_quote,
+                      px=100, fee=fee, fee_token=fee_token, fee_quote=fee_quote,
                       dir=dir_, closed_pnl=closed_pnl, hash=f"h{tid}",
                       reduce_only=("Close" in dir_), oid=None, ts=ts, created_at=ts)
 
@@ -200,6 +203,68 @@ class TestSync(unittest.TestCase):
         self.assertEqual(raw["delta"]["coin"], "BTC", "原始 JSON 必须存档")
 
 
+# ================================================================ 2c. H1：分页游标含边界
+class _PagedInfo:
+    """模拟真实 userFunding 分页：startTime **含边界**、单页最多 FUNDING_PAGE 条。
+
+    这是 H1 的关键替身形状：请求 start=T 时，time==T 的事件会**再次返回**
+    （实测 startTime 为包含语义）。旧实现游标 last_t+1 会把同毫秒簇里排在
+    页边界之后的成员永久跳过。
+    """
+
+    def __init__(self, events):
+        self.events = sorted(events, key=lambda e: (e["time"], e["delta"]["coin"]))
+        self.starts: list = []
+
+    def user_funding_history(self, address, start_ms, end_ms=None):
+        self.starts.append(start_ms)
+        window = [e for e in self.events if e["time"] >= start_ms]
+        return window[:hl_funding.FUNDING_PAGE]
+
+
+class TestFetchPaginationH1(unittest.TestCase):
+    """H1 回归：同毫秒跨币簇跨 500 行页边界，多轮拉取后行数必须完整。
+
+    变异验证（必须做）：把 funding.py 游标改回 ``int(last_t) + 1`` 跑本类
+    **必须 FAIL**（同毫秒簇尾部成员被永久跳过），改回后绿。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="funds_h1_")
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cluster_events(self):
+        """502 条：498 条在 T0−1000ms，3 条同毫秒簇在 T0（跨页边界），1 条在 T1 抬水位。"""
+        t0 = 1_700_000_000_000
+        events = []
+        for i in range(498):                       # 第一页装满 500 的主体
+            events.append(_ev(t0 - 1000, coin="BTC", usdc=f"{i + 1}.0"))
+        for j, coin in enumerate(("BTC", "ETH", "SOL")):   # 同毫秒簇：页边界落在簇内
+            events.append(_ev(t0, coin=coin, usdc=f"900.{j + 1}"))
+        events.append(_ev(t0 + 60_000, coin="BTC", usdc="950.0"))   # 更晚事件抬高水位
+        return events
+
+    def test_same_ms_cluster_across_page_boundary_complete(self):
+        info = _PagedInfo(self._cluster_events())
+        r1 = hl_funding.sync_funding(info, self.db, ME)
+        total = self.db.conn.execute("SELECT count(*) FROM hl_funding").fetchone()[0]
+        self.assertEqual(total, 502,
+                         "同毫秒簇跨页边界的成员不能被 last_t+1 永久跳过")
+        self.assertEqual(r1["added"], 502)
+        # 多轮拉取：水位 = max(ts) − 60s 重叠 → 恰好回到 T0，簇整批重拉，ref 幂等吸收
+        r2 = hl_funding.sync_funding(info, self.db, ME)
+        self.assertEqual(r2["added"], 0, "含边界重拉必须被 ref UNIQUE 幂等吸收")
+        total2 = self.db.conn.execute("SELECT count(*) FROM hl_funding").fetchone()[0]
+        self.assertEqual(total2, 502, "第二轮拉取后行数不变（不重不漏）")
+        # 簇里三条都必须在库（旧实现会永久丢掉排在页边界后的簇成员）
+        coins = {r["coin"] for r in self.db.conn.execute(
+            "SELECT coin FROM hl_funding WHERE ts = ?", (1_700_000_000.0,))}
+        self.assertEqual(coins, {"BTC", "ETH", "SOL"}, "同毫秒簇三个币都必须落库")
+
+
 # ================================================================ 3. position 归集
 class TestAttribution(unittest.TestCase):
     def setUp(self):
@@ -293,6 +358,71 @@ class TestVLedger(unittest.TestCase):
         self.db.hl_add_flow({"ts": 6000.0, "kind": "send_out", "amount": -50.0, "hash": "h2"})
         row = [r for r in self.db.hl_ledger_rows() if r["kind"] == "send_out"][0]
         self.assertAlmostEqual(row["amount_usd"], -50.0)
+
+    def test_fee_token_passthrough_two_causes(self):
+        """M3：fee_missing 两种成因在视图层就能区分 —— fee_token 原样透传。
+
+        渲染层按 fee_token 是否计价币分流文案：非计价币 → 「费用未折算」，
+        计价币（含空）→ 「老数据缺手续费」。这里钉住视图透传，渲染分流在
+        TestPanelRender.test_fee_missing_wording_two_causes。
+        """
+        # ARB 计价手续费（fee_quote 按设计为 None，不是「老数据」）
+        _fill(self.db, "t7", ts=2300, closed_pnl=0.0, fee_quote=None, fee=1.5,
+              fee_token="ARB", dir_="Open Long")
+        rows = {r["ref"]: r for r in self.db.hl_ledger_rows()}
+        self.assertEqual(rows["fill:t7"]["fee_missing"], 1)
+        self.assertEqual(rows["fill:t7"]["fee_token"], "ARB",
+                         "非计价币 fee_token 必须透传给渲染层分流")
+        self.assertEqual(rows["fill:t3"]["fee_missing"], 1)
+        self.assertEqual(rows["fill:t3"]["fee_token"], "USDC",
+                         "计价币 + fee_quote NULL = 真老数据路径")
+        # 非成交源（flow/funding）没有手续费概念 → fee_token 为空串而不是 NULL
+        self.assertEqual(rows["flow:1"]["fee_token"], "")
+        self.assertEqual(rows["fund:3000000|BTC|+0.050000"]["fee_token"], "")
+
+
+# ================================================================ 4b. M2：毫秒 ts 归一
+class TestVLedgerMsTimestamp(unittest.TestCase):
+    """M2 回归：hl_fills 里 >1e12 的毫秒 ts 行必须被 v_ledger 归一成秒。
+
+    变异验证：把 db.py 的 fill_ts CASE 归一改回裸 ``COALESCE(l.ts, l.created_at)``
+    跑本类**必须 FAIL**（毫秒行排到表尾、永不归集、余额错位），改回后绿。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="funds_ms_")
+        self.db = DB(os.path.join(self.tmp, "t.db"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ms_row_normalized_order_attributed_balance(self):
+        # 1 入金 + 毫秒开仓腿 + 资金费 + 秒级平仓腿；窗口用真实量级 epoch（毫秒才 >1e12）
+        self.db.hl_add_flow({"ts": 1_699_990_000.0, "kind": "send_in",
+                             "amount": 500.0, "hash": "h1"})
+        pid = _pos(self.db, opened=1_699_999_000.0, closed=1_700_001_000.0)
+        _fill(self.db, "m1", ts=1_700_000_000_000, closed_pnl=0.0, fee_quote=0.02,
+              dir_="Open Long")                       # 毫秒行（历史导入形状）
+        _fill(self.db, "m2", ts=1_700_000_500.0, closed_pnl=1.0, fee_quote=0.02,
+              dir_="Close Long")
+        hl_funding.record_funding(self.db, [_ev(1_700_000_250_000, usdc="0.05")])
+        rows = self.db.hl_ledger_rows()
+        # 排序：毫秒行按归一后的秒参与排序，不能被甩到表尾
+        # （flow ref 是自增 id；funding ref 的金额走 ref_of 的 6 位小数格式）
+        self.assertEqual([r["ref"] for r in rows],
+                         ["flow:1", "fill:m1",
+                          "fund:1700000250000|BTC|+0.050000", "fill:m2"],
+                         "毫秒行必须归一成秒后参与排序")
+        # 归集：毫秒行落在仓位窗口内 → position_id（不归一就永远窗口外）
+        m1 = rows[1]
+        self.assertEqual(m1["position_id"], pid, "毫秒行必须能归集到 position")
+        self.assertAlmostEqual(m1["ts"], 1_700_000_000.0, places=6,
+                               msg="视图吐出的 ts 必须是归一后的秒")
+        # 后续余额不错位：500 − 0.02 → +0.05 → +0.98
+        bals = hl_funding.running_balances(rows)
+        self.assertAlmostEqual(bals[1], 499.98, places=6)
+        self.assertAlmostEqual(bals[2], 500.03, places=6)
+        self.assertAlmostEqual(bals[3], 501.01, places=6)
 
 
 # ================================================================ 5. running balance
@@ -420,6 +550,61 @@ class TestPanelRender(BaseCase):
         self.assertIn("401.03", h)
         self.assertIn("437.26", h)
         self.assertIn("36.23", h)
+
+    # ---- M1：渲染层余额列数值断言（此前 8/8 用例对余额数值零断言）----
+
+    def _ledger_balance_cells(self, h: str) -> list:
+        """从「资金流水」区块的表格里抽出每行的余额列（第 4 个 <td>）文本。"""
+        seg = h.split("<h2>资金流水</h2>", 1)[1].split("<h2>", 1)[0]
+        out = []
+        for row in re.findall(r"<tr><td class='num'>.*?</tr>", seg):
+            cells = re.findall(r"<td[^>]*>(.*?)</td>", row)
+            if len(cells) == 6:
+                out.append(cells[3].strip())
+        return out
+
+    def test_balance_column_values_rendered(self):
+        """M1 变异验证：running_balances 整列偏移 +1000 后本用例**必须 FAIL**。
+
+        12 条 +100 流水，页只显示最新 10 条：余额列必须是 1200…300（全量累计），
+        任何对余额数值的篡改（+1000 偏移、页内现算）都会让这列数值对不上。
+        """
+        for i in range(12):
+            self.db.hl_add_flow({"ts": 1000.0 + i, "kind": "send_in",
+                                 "amount": 100.0, "hash": f"bh{i}"})
+        h = self._records_html(10)
+        got = self._ledger_balance_cells(h)
+        expect = [f"{v:,.2f}" for v in range(1200, 299, -100)]   # 最新在前
+        self.assertEqual(len(got), 10, f"应渲染 10 行余额列，实际 {len(got)}")
+        self.assertEqual(got, expect,
+                         "余额列必须逐格等于全量正序累计值（最新在前）")
+
+    def test_balance_not_page_local(self):
+        """结构性用例：改成「页内现算余额」则 FAIL。
+
+        页内第一行自己的金额是 +100，但它的余额是 1,200 —— 前面还有 11 条
+        历史。页内现算会把首行余额画成 100.00，这里直接钉死 1,200.00。
+        """
+        for i in range(12):
+            self.db.hl_add_flow({"ts": 1000.0 + i, "kind": "send_in",
+                                 "amount": 100.0, "hash": "bh2"})
+        got = self._ledger_balance_cells(self._records_html(10))
+        self.assertEqual(got[0], "1,200.00",
+                         "首页最新一行的余额 = 全账户累计（含页外 11 条历史），"
+                         "页内现算会错成 100.00")
+        self.assertEqual(got[-1], "300.00",
+                         "首页最旧一行的余额含更早 2 条页外历史（300 而非 100）")
+
+    def test_fee_missing_wording_two_causes(self):
+        """M3：fee_missing 两种成因渲染文案分流 —— 非计价币 vs 真老数据。"""
+        self._seed()                    # t9 = USDC 但 fee_quote 缺失（真老数据路径）
+        _fill(self.db, "t8", ts=3300, closed_pnl=0.0, fee_quote=None, fee=1.5,
+              fee_token="ARB", dir_="Open Long")      # 非计价币：fee_quote 按设计 None
+        h = self._records_html()
+        self.assertIn("费用未折算（非计价币 ARB）", h,
+                      "非计价币手续费必须说「费用未折算」，不能冒充老数据")
+        self.assertIn("老数据缺手续费", h,
+                      "计价币但 fee_quote 缺失（t9）仍走「老数据缺手续费」路径")
 
     def test_same_number_appears_once(self):
         self._seed()
@@ -568,6 +753,95 @@ class TestExecutorHook(unittest.TestCase):
         self.db.set_config("hl_flows_synced_at", str(int(NOW - 60)))   # 闸门内
         ex._sync_flows(now=NOW)
         self.assertEqual(info.funding_calls, 0, "闸门未开就不许多发请求")
+
+    # ---- L①/L②：失败事件 24h 去重 + 能力缺失只警告一次 ----
+
+    def _funding_sync_errors(self) -> list:
+        evs = self.db.hl_recent_events(50, kind="error") or []
+        out = []
+        for e in evs:
+            try:
+                d = json.loads(e["data"] or "{}")
+            except (TypeError, ValueError):
+                d = {}
+            if (d or {}).get("src") == "funding_sync":
+                out.append(e)
+        return out
+
+    def _capture_executor_warnings(self):
+        """挂一个临时 handler 收 app.hl.executor 的 warning 文本（返回 (handler, 列表)）。"""
+        logs: list = []
+
+        class _Cap(logging.Handler):
+            def emit(self, record):
+                logs.append(record.getMessage())
+
+        h = _Cap()
+        logging.getLogger("app.hl.executor").addHandler(h)
+        return h, logs
+
+    def test_funding_fail_error_event_deduped_24h(self):
+        """L①：连续两轮失败只记一条 error 事件（data.src=funding_sync 去重），
+        但 warning 日志每轮照记 —— 事件是喊人的，复读是刷屏。"""
+        info = _HookInfo(flows=[], funding_raise=True)
+        ex, _ = self._exec(info)
+        h, logs = self._capture_executor_warnings()
+        try:
+            ex._sync_flows(now=NOW)
+            self.db.set_config("hl_flows_synced_at", str(int(NOW - 3600)))  # 重开闸门
+            ex._sync_flows(now=NOW + 120)
+        finally:
+            logging.getLogger("app.hl.executor").removeHandler(h)
+        self.assertEqual(len(self._funding_sync_errors()), 1,
+                         "24h 内同一失败只许记一条 error 事件")
+        warns = [m for m in logs if "拉取资金费失败" in m]
+        self.assertEqual(len(warns), 2, "warning 每轮照记（去重只针对事件，不静音日志）")
+
+    def test_info_without_funding_capability_warns_once(self):
+        """L②：info 没有 user_funding_history → 首轮 warning 一声，之后保持安静。"""
+
+        class NoFundInfo:
+            def ledger_updates(self, address, start_ms=0, deadline_ts=None, **kw):
+                return []
+
+        info = NoFundInfo()
+        ex, _ = self._exec(info)
+        h, logs = self._capture_executor_warnings()
+        try:
+            ex._sync_flows(now=NOW)
+            self.db.set_config("hl_flows_synced_at", str(int(NOW - 3600)))
+            ex._sync_flows(now=NOW + 120)
+        finally:
+            logging.getLogger("app.hl.executor").removeHandler(h)
+        warns = [m for m in logs if "userFunding" in m]
+        self.assertEqual(len(warns), 1,
+                         "能力缺失是配置事实：只警告一次，不每轮刷屏")
+
+
+# ================================================================ 9. L③：常量同源
+class TestConstantsSingleSource(unittest.TestCase):
+    """L③：±300s 归集窗口与毫秒阈值只能有一份来源（app/hl/pnl.py）。"""
+
+    def test_funding_constants_are_pnl_bindings(self):
+        from app.hl import pnl as hl_pnl
+        self.assertIs(hl_funding.ATTR_LOOKBACK_S, hl_pnl.ENTRY_LOOKBACK_S,
+                      "funding 的窗口常量必须 import 自 pnl，不许另写一个数")
+        self.assertIs(hl_funding.ATTR_LOOKAHEAD_S, hl_pnl.EXIT_LOOKAHEAD_S)
+
+    def test_view_sql_uses_same_constants(self):
+        """v_ledger 的毫秒归一阈值与 ±300s 窗口数值与 pnl 同源（f-string 注入）。"""
+        from app.hl import pnl as hl_pnl
+        tmp = tempfile.mkdtemp(prefix="funds_const_")
+        try:
+            db = DB(os.path.join(tmp, "t.db"))
+            sql = db.conn.execute(
+                "SELECT sql FROM sqlite_master WHERE name='v_ledger'").fetchone()[0]
+            self.assertIn(str(int(hl_pnl.TS_MS_THRESHOLD)), sql,
+                          "视图毫秒归一阈值必须来自 pnl.TS_MS_THRESHOLD")
+            self.assertIn(str(int(hl_pnl.ENTRY_LOOKBACK_S)), sql)
+            self.assertIn(str(int(hl_pnl.EXIT_LOOKAHEAD_S)), sql)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class _HookInfo:

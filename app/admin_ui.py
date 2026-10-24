@@ -38,6 +38,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from app import engine, sizing
 from app.hl import dd as hl_dd
 from app.hl import funding as hl_funding
+from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
                         _fee_quoted, _kv, _render_body, _signals_html, normalize_rows,
                         status_payload)
@@ -1175,11 +1176,17 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
         pid = r.get("position_id")
         link = f"#{int(pid)}" if pid is not None else "—"
         # 备注：coin/数量/hash 前 10 位；口径例外如实标注（不许静默）。
+        # M3：fee_missing 按成因分两种文案 —— fee_token 非计价币（如 ARB）时
+        # _fee_quote 按设计返回 None，不是「老数据」，得说明真相。
         notes: List[str] = []
         if r.get("coin"):
             notes.append(str(r["coin"]))
         if r.get("fee_missing"):
-            notes.append("老数据缺手续费")
+            fee_tok = str(r.get("fee_token") or "").strip().upper()
+            if fee_tok and fee_tok not in QUOTE_FEE_TOKENS:
+                notes.append(f"费用未折算（非计价币 {_esc(fee_tok)}）")
+            else:
+                notes.append("老数据缺手续费")
         if pid is None:
             notes.append("无持仓期资金费" if r.get("kind") == "funding" else "未归属")
         ref = str(r.get("ref") or "")

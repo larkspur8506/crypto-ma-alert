@@ -19,6 +19,9 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from app import posfields
+# v_ledger 视图 SQL 用到的同源口径常量（L③/M2：±300s 窗口与毫秒阈值只此一份，
+# pnl.py 是唯一来源；app.hl.__init__ 只有常量、pnl 只用 stdlib，无循环导入）。
+from app.hl.pnl import ENTRY_LOOKBACK_S, EXIT_LOOKAHEAD_S, TS_MS_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -269,9 +272,16 @@ class DB:
         # 三源，**不复制数据**（单一事实来源在各自表里）。视图每次启动 DROP+CREATE：
         # CREATE VIEW IF NOT EXISTS 不会更新已存在视图的定义，代码升级改了口径后
         # 老库会一直用旧视图；视图是纯读的无状态对象，重建零风险（老库直接建新视图，
-        # 无 ALTER 风险）。归集口径见视图内注释（与 app/hl/pnl.py 的 ±300s 窗口一致）。
+        # 无 ALTER 风险）。归集口径见视图内注释（与 app/hl/pnl.py 的 ±300s 窗口一致，
+        # 窗口数值 import 自 pnl.py 同源，M2/L③ 修复：±300s 与毫秒阈值别各写一个数）。
+        # fills 的 ts 统一毫秒→秒归一（M2）：历史导入/手工数据出现过毫秒行（>1e12），
+        # 不归一的话该行排到表尾、永不归集、其后 running balance 全错。归一规则与
+        # pnl._ts_seconds 同源（TS_MS_THRESHOLD），别处不得另立判据。
+        fill_ts = (f"(CASE WHEN COALESCE(l.ts, l.created_at) > {TS_MS_THRESHOLD:.0f}"
+                   f" THEN COALESCE(l.ts, l.created_at) / 1000.0"
+                   f" ELSE COALESCE(l.ts, l.created_at) END)")
         self.conn.execute("DROP VIEW IF EXISTS v_ledger")
-        self.conn.execute("""
+        self.conn.execute(f"""
             CREATE VIEW v_ledger AS
             -- 出入金：amount 落库时已带符号（正=流入），send_in/send_out 等全部照原值
             SELECT f.ts AS ts,
@@ -281,17 +291,20 @@ class DB:
                    '' AS coin,
                    'flow:' || f.id AS ref,
                    0 AS fee_missing,
+                   '' AS fee_token,
                    'flow' AS src
             FROM hl_flows f
             UNION ALL
             -- 成交：金额 = closed_pnl − fee_quote（手续费并入成交净额，已拍板口径）。
             -- fee_quote 为 NULL 的老行按 0 计入金额，但 fee_missing=1 交渲染层如实
-            -- 标注「老数据缺手续费」，不许静默当 0。position 归集：与引擎
-            -- （app/hl/pnl.py window_bounds）同窗口 [opened_at−300, closed_at+300]，
-            -- coin 用 positions.symbol 前缀（BTC_USDT → BTC，与执行器写 hl_fills
+            -- 标注（M3 修复：成因按 fee_token 分两种 —— 非计价币 → 「费用未折算」，
+            -- 真老数据 → 「老数据缺手续费」；fee_token 原样透传给渲染层判断）。
+            -- position 归集：与引擎（app/hl/pnl.py window_bounds）同窗口
+            -- [opened_at−300, closed_at+300]（常量同源 import），coin 用
+            -- positions.symbol 前缀（BTC_USDT → BTC，与执行器写 hl_fills
             -- 的 symbol/coin 对应关系一致）；同 coin 多仓命中取最近开的一仓；
             -- ts 为 NULL 的成交无法定位归属 → position_id 留 NULL。
-            SELECT COALESCE(l.ts, l.created_at) AS ts,
+            SELECT {fill_ts} AS ts,
                    CASE
                      WHEN lower(COALESCE(l.dir, '')) LIKE '%open%' THEN 'fill_open'
                      WHEN lower(COALESCE(l.dir, '')) LIKE '%close%' THEN 'fill_close'
@@ -301,12 +314,13 @@ class DB:
                    (SELECT p.id FROM positions p
                      WHERE l.coin IS NOT NULL AND l.coin <> '' AND l.ts IS NOT NULL
                        AND substr(p.symbol, 1, instr(p.symbol || '_', '_') - 1) = l.coin
-                       AND l.ts >= (p.opened_at - 300)
-                       AND l.ts <= (COALESCE(p.closed_at, 1.0e15) + 300)
+                       AND {fill_ts} >= (p.opened_at - {ENTRY_LOOKBACK_S:.0f})
+                       AND {fill_ts} <= (COALESCE(p.closed_at, 1.0e15) + {EXIT_LOOKAHEAD_S:.0f})
                      ORDER BY p.opened_at DESC LIMIT 1) AS position_id,
                    COALESCE(l.coin, '') AS coin,
                    'fill:' || COALESCE(l.tid, CAST(l.id AS TEXT)) AS ref,
                    CASE WHEN l.fee_quote IS NULL THEN 1 ELSE 0 END AS fee_missing,
+                   COALESCE(l.fee_token, '') AS fee_token,
                    'fill' AS src
             FROM hl_fills l
             UNION ALL
@@ -318,6 +332,7 @@ class DB:
                    g.coin AS coin,
                    'fund:' || g.ref AS ref,
                    0 AS fee_missing,
+                   '' AS fee_token,
                    'funding' AS src
             FROM hl_funding g
         """)

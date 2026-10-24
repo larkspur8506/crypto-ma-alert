@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 import logging
 import os
 import math
@@ -334,6 +335,34 @@ class ExecParams:
         return self.mode == MODE_LIVE
 
 
+# L①：资金费同步失败的 error 事件按 24h 去重（参照 flows.py _FLOW_UNKNOWN_DEDUP_S
+# 先例）：失败会随 30 分钟闸门反复出现，每轮都记会把 hl_events 刷成同一句话的
+# 复读机；24h 内一条 + warning 日志每轮照记，足够喊人又不刷屏。
+_FUNDING_FAIL_DEDUP_S = 24 * 3600.0
+
+
+def _funding_fail_logged(db: Any, now: float) -> bool:
+    """24h 内是否已经记过「资金费同步失败」error 事件（按 data.src 标记识别）。"""
+    try:
+        rows = db.hl_recent_events(200, kind=EV_ERROR) or []
+    except Exception:                                            # noqa: BLE001
+        return False
+    for r in rows:
+        try:
+            created = float(r["created_at"] or 0.0)
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if now - created > _FUNDING_FAIL_DEDUP_S:
+            break                      # 按 id DESC 返回，后面的只会更老
+        try:
+            data = json.loads(r["data"] or "{}")
+        except (TypeError, ValueError):
+            data = {}
+        if str((data or {}).get("src") or "") == "funding_sync":
+            return True
+    return False
+
+
 def _today_start_ts(now: Optional[float] = None) -> float:
     """当日 0 点（**北京时间**，与展示层一致；旧版 UTC 日界会让「今日下单数/
     今日已实现」比用户直觉早/晚 8 小时）。"""
@@ -435,6 +464,10 @@ class Executor:
         # 本轮对账是否已经自动解过 kill（§4.5 中1：同轮 kill 只允许「未触发→触发」
         # 单向；若后面又置 kill，收尾文案要说清「对账已收敛但仍停手」）。
         self._round_autocleared = 0
+        # L②：info 不具备 userFunding 能力的提示只发一次（闸门 30 分钟一轮，
+        # 每轮都 warn 会把日志刷成噪音；首次之后保持安静，换 info 实例也不重发 ——
+        # 能力缺失是配置事实，不是抖动故障）。
+        self._funding_warned = False
 
     # ------------------------------------------------------------ 工具
     def _coin_or_none(self, symbol: str) -> Optional[str]:
@@ -2817,17 +2850,23 @@ class Executor:
         # 负担）：只有这轮真的开了流水闸门，才顺带拉一次 userFunding。失败只记事件
         # + warning、下轮随闸门重试 —— **绝不影响 _flows_fresh**（那是流水自己的可信
         # 标记，回撤/DD Guard 靠它 fail-closed；资金费是纯记账，没资格弄脏它）。
-        # 测试替身（FakeInfo/FakeDB）没有 userFunding 能力 → 静默跳过，不刷错误事件。
-        if (hasattr(self.info, "user_funding_history")
-                and hasattr(self.db, "hl_funding_last_ts")):
+        # 失败事件 24h 去重（L①）：事件是喊人的，复读 48 遍不是喊人是刷屏。
+        if not hasattr(self.info, "user_funding_history"):
+            # 测试替身/降级 info 没有 userFunding 能力 → 跳过，但首次要说一声（L②），
+            # 不再静默——静默跳过会让「资金费为什么一直是空的」无从排查。
+            if not self._funding_warned:
+                self._funding_warned = True
+                logger.warning("[hl-exec] info 不具备 userFunding 能力，资金费同步跳过")
+        elif hasattr(self.db, "hl_funding_last_ts"):
             try:
                 hl_funding.sync_funding(
                     self.info, self.db, address,
                     deadline_ts=time.time() + self.FLOW_SYNC_BUDGET_S)
             except Exception as e:                                   # noqa: BLE001
                 logger.warning("[hl-exec] 拉取资金费失败（下轮随闸门重试）：%s", e)
-                self._event(EV_ERROR, f"资金费同步失败（流水表暂缺资金费行）：{e}"[:300],
-                            data={"error": str(e)[:300]})
+                if not _funding_fail_logged(self.db, time.time()):
+                    self._event(EV_ERROR, f"资金费同步失败（流水表暂缺资金费行）：{e}"[:300],
+                                data={"error": str(e)[:300], "src": "funding_sync"})
         return res["added"]
 
 

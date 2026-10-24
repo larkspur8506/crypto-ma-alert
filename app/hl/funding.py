@@ -13,8 +13,10 @@ userFunding 实测响应形状（2026-10-24 主网，POST /info）
 ------------------------------------------------------------------
 请求：``{"type": "userFunding", "user": addr, "startTime": ms, "endTime": ms}``
 响应：list，**按 time 升序**，startTime / endTime 都是**包含**语义（实测
-startTime 命中的那条会再返回一次）；单页上限未触发（112 条 < 500），分页
-照 ledger_updates 同款「拿满 500 用 last.time+1 续拉」处理。每条：
+startTime 命中的那条会再返回一次）；单页上限未触发（112 条 < 500）。分页
+拿满 500 用 ``last.time`` **含边界**续拉（cursor = last_t，同毫秒重拉由
+ref 幂等吸收）—— 不能用 last.time+1：那会把同毫秒跨币簇的其余成员永久
+跳过（H1 修复，见 fetch_funding docstring）。每条：
 
     {"time": 1791936000000,                       # 毫秒
      "hash": "0x0000...0000",                     # **实测恒为全零**，无区分度
@@ -39,6 +41,10 @@ import logging
 import time
 from typing import Any, Dict, Iterable, List, Optional
 
+# 归集窗口与 pnl 同源（±300s，别各写一个数）；见下方 ATTR_* 注释。
+from app.hl.pnl import ENTRY_LOOKBACK_S as ATTR_LOOKBACK_S
+from app.hl.pnl import EXIT_LOOKAHEAD_S as ATTR_LOOKAHEAD_S
+
 logger = logging.getLogger(__name__)
 
 # userFunding 单页上限（与 userNonFundingLedgerUpdates 同为 500；拿满才续拉）
@@ -49,9 +55,9 @@ ZERO_HASH = "0x" + "0" * 64
 # 与引擎同款归集窗口（app/hl/pnl.py：ENTRY_LOOKBACK_S / EXIT_LOOKAHEAD_S）：
 # opened_at 是「成交确认写库」的时刻，真实入场腿可能早至多 300s；closed_at
 # 同理。资金费落在窗口内 → 归该仓。拍板：两边都用 ±300s 闭区间，与引擎
-# 的窗口口径完全一致（spec 允许「写明选择即可」）。
-ATTR_LOOKBACK_S = 300.0
-ATTR_LOOKAHEAD_S = 300.0
+# 的窗口口径完全一致（spec 允许「写明选择即可」）。数值从 pnl.py import
+# 同源（L③：三处 ±300s 抽同一来源，消除漂移面）。
+#
 # 增量水位重叠：最后一条时间往前多拉 60s，吸收交易所边界抖动（ref 幂等去重）
 OVERLAP_S = 60.0
 
@@ -197,11 +203,14 @@ def fetch_funding(info: Any, address: str, start_ms: int,
                   max_pages: int = FUNDING_MAX_PAGES) -> List[dict]:
     """分页拉 userFunding，返回**原始事件**列表（归一在 record_funding）。
 
-    分页语义与 ledger_updates 同款：拿满 FUNDING_PAGE 用 last.time+1 续拉；
-    `max_pages` 防对端忽略 startTime 的死循环；`deadline_ts` 到点收手，宁可
-    少拉几页（水位 + ref 幂等保证下轮补齐），也不把闸门内这一轮拖死。
-    续拉 last.time+1 会漏同毫秒事件 —— 与 HL 官方 SDK 同款取舍，实测资金费
-    每 (coin, ms) 唯一，不构成实际风险。
+    分页语义（H1 修复后口径）：拿满 FUNDING_PAGE 用 ``last.time`` **含边界**续拉
+    （cursor = last_t，不是 last_t+1）；同一毫秒被重复拉到的行由 ref UNIQUE +
+    INSERT OR IGNORE 幂等吸收。旧口径 ``last_t + 1`` 会永久丢同毫秒跨币事件：
+    HL 多币资金费在同一毫秒成簇（整点/小时边界），页边界落在簇内且簇后有更晚
+    事件抬高水位时，被跳过的行本轮取不到、下轮水位已越过，永不补回且无任何标记。
+    终止条件三重保险，不会死循环：① 页不满（< FUNDING_PAGE）= 拉完了；
+    ② 游标没前进（last_t <= cursor，单毫秒簇 ≥ 500 条才会触发，实测不可能）→
+    告警停页；③ `max_pages` / `deadline_ts` 预算兜底。
     """
     out: List[dict] = []
     cursor = max(0, int(start_ms))
@@ -217,10 +226,10 @@ def fetch_funding(info: Any, address: str, start_ms: int,
         if len(data) < FUNDING_PAGE:
             break
         last_t = _num((data[-1] or {}).get("time"), 0.0)
-        if last_t <= 0 or int(last_t) + 1 <= cursor:      # 游标没前进 → 防死循环
+        if last_t <= 0 or int(last_t) <= cursor:          # 游标没前进 → 防死循环
             logger.warning("[hl-funding] 分页游标未前进（time=%s），停止分页", last_t)
             break
-        cursor = int(last_t) + 1
+        cursor = int(last_t)          # 含边界续拉：同毫秒簇重拉一次，ref 幂等去重
     return out
 
 
