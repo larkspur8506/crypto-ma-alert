@@ -117,6 +117,14 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
      True, "ENABLE_LONG"),
     ("enable_shorts", "允许做空", "关掉后不再发做空信号（已有仓位不受影响，止损照常）",
      True, "ENABLE_SHORTS"),
+    # 空单风险减半（feat/short-risk-half）：与「允许做空」相邻 —— 它们都是「怎么对待
+    # 空单腿」的开关。倍率 0.5 写死在 app/sizing.py:SHORT_HALF_SCALE，这里不给输入框
+    # （可调系数会变成回测里的又一个拟合自由度）。只影响开仓规模，不动止损/离场。
+    ("short_risk_half", "空单风险减半",
+     "开启后做空每笔风险按 0.5 倍计算（风险U、名义、张数一起减半），多单不变；"
+     "只影响开仓，不影响已持仓（止损位、离场规则照旧）。"
+     "关 = 空单与多单一样按「单笔风险」全额下单",
+     False, "SHORT_RISK_HALF"),
     ("agent_expiry_cleanup", "到期前自动清仓（≤3 天）",
      "开 = API 快到期（剩余 3 天以内）时自动撤单平仓，避免到期后想平也平不了；"
      "关 = 只提醒不清仓（需要自己盯）", True, "AGENT_EXPIRY_CLEANUP"),
@@ -1652,6 +1660,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     def admin_switch_strategy(request: Request,
                               enable_long: Optional[str] = Form(None),
                               enable_shorts: Optional[str] = Form(None),
+                              short_risk_half: Optional[str] = Form(None),
                               agent_expiry_cleanup: Optional[str] = Form(None),
                               hl_pnl_from_fills: Optional[str] = Form(None),
                               hl_fill_close: Optional[str] = Form(None),
@@ -1671,12 +1680,16 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         """
         token = _auth(deps, request, k or None)
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
+                    "short_risk_half": short_risk_half,
                     "agent_expiry_cleanup": agent_expiry_cleanup,
                     "hl_pnl_from_fills": hl_pnl_from_fills,
                     "hl_fill_close": hl_fill_close,
                     "hl_close_grace": hl_close_grace,
                     "hl_kill_autoclear": hl_kill_autoclear,
                     "hl_dd_guard": hl_dd_guard}
+        # 空单风险减半的**旧值**（写事件时要「旧→新」，不能只记新值：事后复盘要能
+        # 回答「这笔空单是减半前后哪一档开的」，只有新值答不了）。
+        old_half = bool(getattr(deps.config_fn(), "short_risk_half", False))
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1704,7 +1717,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         deps.log_event("decision",
                        "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s"
                        " · 交易所已平仓自动关账=%s · 证据不足先进宽限=%s · 对账异常可自动恢复=%s"
-                       " · 回撤熔断=%s%s）"
+                       " · 回撤熔断=%s%s%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
@@ -1718,6 +1731,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                           word[vals["hl_kill_autoclear"]]
                           if "hl_kill_autoclear" in vals else "不变",
                           word[vals["hl_dd_guard"]] if "hl_dd_guard" in vals else "不变",
+                          (f" · 空单风险减半={word[1] if old_half else word[0]}→"
+                           f"{word[vals['short_risk_half']]}")
+                          if "short_risk_half" in vals else "",
                           (" · 阈值 " + " / ".join(
                               f"{k.replace('hl_dd_', '').replace('_pct', '')}={vals[k]:g}"
                               for k in ("hl_dd_warn_pct", "hl_dd_kill_pct") if k in vals))

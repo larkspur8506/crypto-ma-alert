@@ -71,6 +71,12 @@ class Config:
     enable_long: bool = _env("ENABLE_LONG", "true").lower() in ("1", "true", "yes")
     enable_shorts: bool = _env("ENABLE_SHORTS", "true").lower() in ("1", "true", "yes")
     short_regime_ma: int = _env_i("SHORT_REGIME_MA", strategy.REGIME_MA)
+    # 空单风险减半（feat/short-risk-half）：开 = 做空腿每一笔的下单风险按 0.5 倍
+    # （风险U、名义、张数全链路减半），多单与止损位完全不变。
+    # 默认**关**：开关关闭时全链路行为与改动前逐字节一致（新功能的唯一正确默认）。
+    # 倍率 0.5 是写死的政策常数（app/sizing.py:SHORT_HALF_SCALE），这里只有布尔位；
+    # 脏值按 apply_db 的布尔分支「识别不了 → 保留原值」，绝不静默翻转。
+    short_risk_half: bool = _env("SHORT_RISK_HALF", "0").lower() in ("1", "true", "yes", "on")
 
     # 资金口径（feat 资金跟随）：follow = 按交易所实时权益算下单基数（带下限、取整到 10U）；
     # fixed = 用固定 equity。加进 OVERRIDABLE 后可从 /admin?tab=params 热改。
@@ -157,7 +163,11 @@ class Config:
                    "hl_agent_valid_until_ms", "hl_pnl_from_fills", "hl_churn_max",
                    "hl_fill_close", "hl_close_grace", "hl_close_grace_s",
                    "hl_kill_autoclear", "hl_flow_sync_s",
-                   "hl_dd_guard", "hl_dd_warn_pct", "hl_dd_kill_pct")
+                   "hl_dd_guard", "hl_dd_warn_pct", "hl_dd_kill_pct",
+                   # 空单风险减半：布尔键，走 apply_db 的 isinstance(cur, bool) 分支
+                   # （truthy 集合内才改写，识别不了保留原值）。**故意不进 _RANGES**：
+                   # 布尔键没有「范围校验」的意义，抄进去只会多一处可能漂移的口径。
+                   "short_risk_half")
 
     # 数值配置的合法范围：apply_db 收敛到这里，超出范围/自相矛盾的组合直接拒收
     # （保留原值）——否则 stop_min>stop_max 会让全部信号静默消失、leverage=0 会让

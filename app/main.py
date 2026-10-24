@@ -123,6 +123,10 @@ def hl_params():
         coin_map=coin_map,
         leverage=cfg.leverage,
         risk_pct=cfg.risk_pct,
+        # 空单风险减半：DB > env > 默认关（Config 已解析好布尔位，缺键/脏值都退回
+        # 「关」= 现状）。与 pnl_from_fills / fill_close 同一种「从面板配置读布尔」
+        # 的装配模式，只是默认方向相反：这是新增的风险政策，默认必须维持原行为。
+        short_risk_half=bool(getattr(cfg, "short_risk_half", False)),
         equity=cfg.equity,
         # 口径 DB > env > 代码默认：Config 已解析好，不要再单独读 env（否则 DB 值会被 env 压掉）
         equity_mode=str(getattr(cfg, "equity_mode", "follow") or "follow"),
@@ -801,12 +805,16 @@ def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLRe
                         f"（{row['stop_dist'] * 100:.2f}%）\n")
     else:
         real_line = ""
+        # 目标风险的百分比必须是**生效后**的比例（空单风险减半开着时 = risk_pct/2），
+        # 否则确认页会拿 2% 去对一个本该 1% 的空单，用户照着加仓就是风险翻倍。
+        _rp = sizing.effective_risk_pct(cfg.risk_pct, row["side"] or 1,
+                                        getattr(cfg, "short_risk_half", False))
         suggest_line = (
             f"建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>"
             f"{stop_hint}（{row['stop_dist'] * 100:.2f}%）<br>\n"
             f"      建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜\n"
-            f"      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =\n"
-            f"      {cfg.equity * cfg.risk_pct:.1f}U）\n")
+            f"      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {_rp * 100:.0f}% =\n"
+            f"      {cfg.equity * _rp:.1f}U）\n")
     body = f"""
     <h1>{title}</h1>
     <div class='card'>
@@ -1015,7 +1023,7 @@ async def confirm_post(pid: int, request: Request):
         _eq_base = posfields.equity_base(row, current_config().equity)
         rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
                                  row["contracts"], entry, stop, qty, source,
-                                 equity=_eq_base)
+                                 equity=_eq_base, side=row["side"])
         src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"
                    if source == "amount" else "按你填的张数")
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"

@@ -34,6 +34,7 @@ from app.hl import dd as hl_dd
 from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
+from app.sizing import effective_risk_pct
 from app import symbol_registry as registry
 
 logger = logging.getLogger(__name__)
@@ -251,6 +252,11 @@ class ExecParams:
     coin_map: Dict[str, str] = field(default_factory=lambda: dict(DEFAULT_COIN_MAP))
     leverage: float = 5.0
     risk_pct: float = 0.02
+    # 空单风险减半（feat/short-risk-half）：开 = 做空腿的单笔风险按 0.5 倍折算
+    # （app/sizing.py:effective_risk_pct 是唯一生效点）。默认**关**。
+    # 只有开仓 sizing 读它：止损价/距离、离场、DD Guard、对账一概不读 —— 它调的是
+    # 「下一笔空单开多大」，不是「已持仓怎么管」。
+    short_risk_half: bool = False
     equity: float = 1000.0
     equity_mode: str = "follow"          # follow = 跟随实时权益（带下限）；fixed = 用上面的固定值
     equity_min: float = 20.0
@@ -1987,8 +1993,13 @@ class Executor:
         # 用**当前 mid** 当入场价重算数量（风险归一），止损仍用信号给的止损价
         stop = float(row["stop_price"])
         eff_equity = self.effective_equity(snap)          # 跟随实时权益（带下限）
+        # 空单风险减半的**执行器侧生效点**：与引擎侧同一个 helper、同一份常数。
+        # 只折算风险比例 —— mid/stop/杠杆/最小名义全部原样，止损距离因此不变。
         plan = hl_sizing.size_order_hl(coin, sz_decimals, mid, stop, eff_equity,
-                                      self.p.risk_pct, self.p.leverage, side=side,
+                                      effective_risk_pct(self.p.risk_pct, side,
+                                                         bool(getattr(self.p, "short_risk_half",
+                                                                      False))),
+                                      self.p.leverage, side=side,
                                       min_notional=self.p.min_notional)
         gates = self._entry_gates(symbol, plan, snap, equity=eff_equity)
         if gates:

@@ -24,6 +24,31 @@ SPECS = {s: spec.as_tuple() for s in registry.known_symbols()
          if (spec := registry.mexc_spec(s)) is not None}
 MAINTENANCE_MARGIN_RATE = 0.005   # 一档维持保证金率近似值（算强平价用）
 
+# ---- 空单风险减半（feat/short-risk-half）----
+# 0.5 **写死在一处**，不做可调参数：它是风险政策常数（「空单腿只承担一半单笔
+# 风险」），不是策略参数。一旦做成可调系数，回测里它就会变成又一个可以往历史
+# 数据上拟合的自由度（参数越多越容易把噪音拟合进来），所以它不进参数页、
+# 不进 Config._RANGES、也不接受任何数值型 env/DB 覆盖。
+SHORT_HALF_SCALE = 0.5
+
+
+def effective_risk_pct(risk_pct: float, side: int, half: bool = False) -> float:
+    """下单风险比例的**唯一生效点**：空单腿在开关打开时按 ``SHORT_HALF_SCALE`` 折算。
+
+    为什么要有这个 helper 而不是在两个 sizing 函数里各写一遍 ``× 0.5``：
+    引擎侧（`app/sizing.py::size_order`，提醒/dry 影子卡）和执行器侧
+    （`app/hl/sizing.py::size_order_hl`，live 真下单）是**两条路径、两处代码**。
+    多一份实现就多一个「改了一处漏了另一处」的口子 —— 那样用户看到的开空卡写着
+    1%，实际下的却是 2%，而且两边都能自圆其说，很难被发现。所以两边都只调这里。
+
+    只折算**风险比例**，不碰止损价/止损距离：名义 = 风险U ÷ 止损距离，风险减半
+    名义自然减半，保证金跟着减半，强平价更远（不需要专门改杠杆）。
+    开关关闭时原值返回（不做 float() 归一），保证与原行为逐字节一致。
+    """
+    if side == -1 and half:
+        return float(risk_pct) * SHORT_HALF_SCALE
+    return risk_pct
+
 
 @dataclass(frozen=True)
 class Order:
@@ -61,6 +86,10 @@ def size_order(symbol: str, entry_price: float, stop_price: float, equity: float
     不再抛 `KeyError` —— 旧行为下 `engine.walk → size_order` 的 KeyError 会被 tick 的
     per-symbol `try/except` 吞成一句「处理异常」，整个标的的信号一个都出不来。调用方
     （engine.format_entry）遇到 None 应照常出信号、把张数段换成「已跳过张数建议」。
+
+    ``risk_pct`` 是**已经折算过**的生效风险比例：空单减半由调用点先过一遍
+    `effective_risk_pct(risk_pct, side, half)`（本函数不自己判开关 —— 判据只允许有
+    一处，见该 helper 的说明）。
     """
     spec = registry.mexc_spec(symbol)
     if spec is None:

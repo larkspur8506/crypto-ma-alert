@@ -24,6 +24,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 from app import market, posfields, strategy
 from app.sizing import SPECS as CONTRACT_SPECS
+from app.sizing import effective_risk_pct
 from app.sizing import metrics as sizing_metrics
 from app.sizing import size_order
 
@@ -150,6 +151,10 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         return format_missed(cfg, sig, executor_managed=executor_managed)
     long = sig.is_long
     stop_note = f"距离 {sig.stop_dist * 100:.2f}%" + ("" if long else "，在价格上方")
+    # 卡片上写的「风险 X%」必须是**生效后**的比例：空单风险减半开着时，开空卡显
+    # 示 risk_pct×0.5，多单不变。开关关着时 effective_risk_pct 原值返回 → 文案
+    # 与改动前逐字符一致。
+    risk_pct = effective_risk_pct(cfg.risk_pct, sig.side, getattr(cfg, "short_risk_half", False))
     lines = [
         f"{cfg.alert_prefix}{sig.symbol} {sig.action}信号（4h 收盘 {fmt_bar_close(sig.bar_open_ms)} {TZ_LABEL}）",
         f"入场：市价（当前 {fmt_money(sig.entry_price)}）",
@@ -175,13 +180,13 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
     ]
     if executor_managed:
         # 权益口径不同（配置 equity vs 实时生效权益）→ 不写具体 U 数。
-        lines.append(f"风险：单笔 {cfg.risk_pct * 100:.2f}% 权益（实际以 HL 开仓回报为准）")
+        lines.append(f"风险：单笔 {risk_pct * 100:.2f}% 权益（实际以 HL 开仓回报为准）")
     elif order is not None:
         lines.append(
             f"风险：{order.risk_u:.1f}U"
-            + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}% = "
-               f"{cfg.equity * cfg.risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
-               else f"（权益 {fmt_money(cfg.equity)}U × {cfg.risk_pct * 100:.0f}%）") + "，"
+            + (f"（⚠️ 已退化到最小张数，超过目标 权益 {fmt_money(cfg.equity)}U × {risk_pct * 100:.0f}% = "
+               f"{cfg.equity * risk_pct:.1f}U）" if getattr(order, "below_minimum", False)
+               else f"（权益 {fmt_money(cfg.equity)}U × {risk_pct * 100:.0f}%）") + "，"
             f"保证金({cfg.leverage:.0f}x) {fmt_money(order.margin)}U")
     if not executor_managed:
         # 离场是 executor.on_exit 的活（自动挂止损/自动平仓 + 成交回报），
@@ -208,7 +213,7 @@ def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
 
 def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: int,
                 entry: float, stop: float, contracts: int, source: str = "contracts",
-                equity: Optional[float] = None) -> dict:
+                equity: Optional[float] = None, side: Optional[int] = None) -> dict:
     """确认开仓后按**真实成交**做一次风险体检（纯计算，不落库）。
 
     为什么需要：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额
@@ -223,11 +228,17 @@ def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: i
 
     `equity`：这行的**下单基数**（positions.equity_at_entry；HL 仓由执行器写回
     实际生效基数，MEXC 行是建行时的配置值）。不传则退回 `cfg.equity`（行为不变）。
+
+    `side`：这行的方向（+1/-1）。传了才会按「空单风险减半」折算目标风险 ——
+    否则体检会把一笔**本来就该只有一半风险**的空单判成「偏离目标 -50%」，还会
+    建议你「要正好 20U 就该开双倍张数」，那正是这个开关要防的事。
+    不传（老脚本/测试）按多单口径 ⇒ 不折算 ⇒ 与改动前完全一致。
     """
     contract_size = CONTRACT_SPECS[symbol][0]
     m = sizing_metrics(symbol, entry, stop, contracts, cfg.leverage)
     base = float(equity) if equity else cfg.equity
-    target = base * cfg.risk_pct
+    target = base * effective_risk_pct(cfg.risk_pct, 1 if side is None else side,
+                                       getattr(cfg, "short_risk_half", False))
     drift = (entry - suggested_entry) / suggested_entry if suggested_entry else 0.0
     notes: List[str] = []
 
@@ -370,8 +381,13 @@ def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
                                           allow_short=cfg.enable_shorts,
                                           short_regime_ma=cfg.short_regime_ma)
             if sig is not None:
+                # 空单风险减半的**引擎侧生效点**（提醒 / dry 影子卡 / 待确认行都用这里算出来的
+                # 张数）：只折算风险比例，止损价与止损距离原样传下去。
+                # getattr 兜底 False：没有该属性的 cfg 替身（老测试/脚本）退回改动前行为。
                 order = size_order(symbol, sig.entry_price, sig.stop_price, cfg.equity,
-                                   cfg.risk_pct, cfg.leverage, side=sig.side)
+                                   effective_risk_pct(cfg.risk_pct, sig.side,
+                                                      getattr(cfg, "short_risk_half", False)),
+                                   cfg.leverage, side=sig.side)
                 # order 为 None = 场所规格缺失（该标的未登记 / 无 MEXC 段）：
                 # **照常产出信号事件**（提醒由 format_entry 降级出文案），只是没有张数建议。
                 events.append(Event(kind=("entry" if is_latest else "entry_missed"), symbol=symbol,
