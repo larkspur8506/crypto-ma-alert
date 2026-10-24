@@ -19,6 +19,9 @@ from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from app import posfields
+# v_ledger 视图 SQL 用到的同源口径常量（L③/M2：±300s 窗口与毫秒阈值只此一份，
+# pnl.py 是唯一来源；app.hl.__init__ 只有常量、pnl 只用 stdlib，无循环导入）。
+from app.hl.pnl import ENTRY_LOOKBACK_S, EXIT_LOOKAHEAD_S, TS_MS_THRESHOLD
 
 logger = logging.getLogger(__name__)
 
@@ -161,8 +164,29 @@ CREATE TABLE IF NOT EXISTS hl_flows (
     created_at REAL NOT NULL,
     UNIQUE(hash, ts)
 );
+-- 资金费流水（feat/funds-ledger）：总资金流水表的三源之一（另两源 hl_flows /
+-- hl_fills，经 v_ledger 视图 union，**不复制数据**）。纯观测/记账表：只给
+-- 「资金流水」区块和单粒度资金费收口读，不参与任何交易决策。
+-- - amount_usd 带符号：HL userFunding delta.usdc 原值，**正 = 收入**（2026-10-24
+--   主网实测：空头收资金费时 usdc 为正，符号口径是「入账视角」，别取反）。
+-- - ref 幂等键：实测 userFunding 事件自带 hash 恒为全零（0x000...0，没有区分度），
+--   所以 ref 优先取「非全零 hash」，否则退回 t(ms)+coin+amount 组合键 —— 组合键在
+--   实测 112 条里无 (coin, ms) 重复（资金费每 coin 每小时最多一条），足够唯一。
+-- - position_id：资金费时刻落在某 HL 仓位时间窗内 → 该 positions.id；否则 NULL
+--   （渲染层如实显示「未归属」），回填/同步时一次定死，之后不改。
+CREATE TABLE IF NOT EXISTS hl_funding (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,            -- 事件时刻 UTC epoch 秒
+    coin TEXT NOT NULL,
+    amount_usd REAL NOT NULL,    -- 有符号：HL userFunding delta.usdc，正=收入（不取反）
+    position_id INTEGER,         -- 归集到的 positions.id，找不到归属为 NULL
+    ref TEXT NOT NULL UNIQUE,    -- 幂等键：非全零 hash 优先，否则 t+coin+amount 组合键
+    raw TEXT,                    -- 原始 JSON 存档
+    created_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_hl_snap_ts ON hl_snapshots(ts);
 CREATE INDEX IF NOT EXISTS idx_hl_flows_ts ON hl_flows(ts);
+CREATE INDEX IF NOT EXISTS idx_hl_funding_ts ON hl_funding(ts);
 CREATE INDEX IF NOT EXISTS idx_hl_events_created ON hl_events(created_at);
 """
 
@@ -244,6 +268,74 @@ class DB:
         if fcols and "oid" not in fcols:
             self.conn.execute("ALTER TABLE hl_fills ADD COLUMN oid INTEGER")
             logger.info("[db] 迁移：hl_fills 新增 oid 列")
+        # 总资金流水视图（feat/funds-ledger）：union hl_flows / hl_fills / hl_funding
+        # 三源，**不复制数据**（单一事实来源在各自表里）。视图每次启动 DROP+CREATE：
+        # CREATE VIEW IF NOT EXISTS 不会更新已存在视图的定义，代码升级改了口径后
+        # 老库会一直用旧视图；视图是纯读的无状态对象，重建零风险（老库直接建新视图，
+        # 无 ALTER 风险）。归集口径见视图内注释（与 app/hl/pnl.py 的 ±300s 窗口一致，
+        # 窗口数值 import 自 pnl.py 同源，M2/L③ 修复：±300s 与毫秒阈值别各写一个数）。
+        # fills 的 ts 统一毫秒→秒归一（M2）：历史导入/手工数据出现过毫秒行（>1e12），
+        # 不归一的话该行排到表尾、永不归集、其后 running balance 全错。归一规则与
+        # pnl._ts_seconds 同源（TS_MS_THRESHOLD），别处不得另立判据。
+        fill_ts = (f"(CASE WHEN COALESCE(l.ts, l.created_at) > {TS_MS_THRESHOLD:.0f}"
+                   f" THEN COALESCE(l.ts, l.created_at) / 1000.0"
+                   f" ELSE COALESCE(l.ts, l.created_at) END)")
+        self.conn.execute("DROP VIEW IF EXISTS v_ledger")
+        self.conn.execute(f"""
+            CREATE VIEW v_ledger AS
+            -- 出入金：amount 落库时已带符号（正=流入），send_in/send_out 等全部照原值
+            SELECT f.ts AS ts,
+                   f.kind AS kind,
+                   f.amount AS amount_usd,
+                   NULL AS position_id,
+                   '' AS coin,
+                   'flow:' || f.id AS ref,
+                   0 AS fee_missing,
+                   '' AS fee_token,
+                   'flow' AS src
+            FROM hl_flows f
+            UNION ALL
+            -- 成交：金额 = closed_pnl − fee_quote（手续费并入成交净额，已拍板口径）。
+            -- fee_quote 为 NULL 的老行按 0 计入金额，但 fee_missing=1 交渲染层如实
+            -- 标注（M3 修复：成因按 fee_token 分两种 —— 非计价币 → 「费用未折算」，
+            -- 真老数据 → 「老数据缺手续费」；fee_token 原样透传给渲染层判断）。
+            -- position 归集：与引擎（app/hl/pnl.py window_bounds）同窗口
+            -- [opened_at−300, closed_at+300]（常量同源 import），coin 用
+            -- positions.symbol 前缀（BTC_USDT → BTC，与执行器写 hl_fills
+            -- 的 symbol/coin 对应关系一致）；同 coin 多仓命中取最近开的一仓；
+            -- ts 为 NULL 的成交无法定位归属 → position_id 留 NULL。
+            SELECT {fill_ts} AS ts,
+                   CASE
+                     WHEN lower(COALESCE(l.dir, '')) LIKE '%open%' THEN 'fill_open'
+                     WHEN lower(COALESCE(l.dir, '')) LIKE '%close%' THEN 'fill_close'
+                     ELSE 'fill'
+                   END AS kind,
+                   (COALESCE(l.closed_pnl, 0) - COALESCE(l.fee_quote, 0)) AS amount_usd,
+                   (SELECT p.id FROM positions p
+                     WHERE l.coin IS NOT NULL AND l.coin <> '' AND l.ts IS NOT NULL
+                       AND substr(p.symbol, 1, instr(p.symbol || '_', '_') - 1) = l.coin
+                       AND {fill_ts} >= (p.opened_at - {ENTRY_LOOKBACK_S:.0f})
+                       AND {fill_ts} <= (COALESCE(p.closed_at, 1.0e15) + {EXIT_LOOKAHEAD_S:.0f})
+                     ORDER BY p.opened_at DESC LIMIT 1) AS position_id,
+                   COALESCE(l.coin, '') AS coin,
+                   'fill:' || COALESCE(l.tid, CAST(l.id AS TEXT)) AS ref,
+                   CASE WHEN l.fee_quote IS NULL THEN 1 ELSE 0 END AS fee_missing,
+                   COALESCE(l.fee_token, '') AS fee_token,
+                   'fill' AS src
+            FROM hl_fills l
+            UNION ALL
+            -- 资金费：amount_usd 原样（正=收入），position_id 已在同步/回填时归集
+            SELECT g.ts AS ts,
+                   'funding' AS kind,
+                   g.amount_usd AS amount_usd,
+                   g.position_id AS position_id,
+                   g.coin AS coin,
+                   'fund:' || g.ref AS ref,
+                   0 AS fee_missing,
+                   '' AS fee_token,
+                   'funding' AS src
+            FROM hl_funding g
+        """)
 
     # ---------------- configuration
     @_locked
@@ -733,6 +825,77 @@ class DB:
         """最后一条流水的交易所时间（秒）。None = 本地一条都没有（→ 首次全量回填）。"""
         r = self.conn.execute("SELECT max(ts) AS t FROM hl_flows").fetchone()
         return float(r["t"]) if r and r["t"] else None
+
+    # ---------------- 资金费流水（feat/funds-ledger，纯观测/记账） ----------------
+    @_locked
+    def hl_add_funding(self, row: Dict[str, Any]) -> bool:
+        """写一条资金费。`INSERT OR IGNORE` + `ref` UNIQUE = 幂等（重复拉取不写两行）。
+
+        返回 True = 真的插了一行。与 hl_add_flow 同款约定：返回值只给同步日志和
+        测试断言用，**不参与任何交易判断**。amount_usd 必须是交易所原值（正=收入），
+        取反的活儿谁都不许干 —— 符号口径只在渲染层解释。
+        """
+        cur = self.conn.execute(
+            "INSERT OR IGNORE INTO hl_funding(ts, coin, amount_usd, position_id, ref, raw, created_at)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (float(row.get("ts") or 0.0), str(row.get("coin") or ""),
+             float(row.get("amount_usd") or 0.0), row.get("position_id"),
+             str(row.get("ref") or ""), row.get("raw"), now()))
+        self.conn.commit()
+        return bool(cur.rowcount)
+
+    @_locked
+    def hl_funding_last_ts(self) -> Optional[float]:
+        """最后一条资金费的交易所时间（秒）。None = 本地一条都没有（→ 全量回填）。"""
+        r = self.conn.execute("SELECT max(ts) AS t FROM hl_funding").fetchone()
+        return float(r["t"]) if r and r["t"] else None
+
+    @_locked
+    def hl_funding_origin_ts(self) -> Optional[float]:
+        """回填起点：账户首张正权益快照 与 最早 hl_flows.ts 取**早者**。
+
+        为什么取早者：两把尺子量的都是「账户从什么时候开始有钱」—— 快照是执行器
+        眼里的（可能有执行器先跑、钱后到的 0 权益期，所以用首张正权益），流水是
+        链上转账眼里的（钱到账即有行）。取更早的那个，宁可多拉一段（ref 幂等会
+        去重），也不能让第一笔资金费掉在起点之前被漏掉。
+        """
+        snap = self.hl_first_positive_snapshot()
+        r = self.conn.execute("SELECT min(ts) AS t FROM hl_flows").fetchone()
+        first_flow = float(r["t"]) if r and r["t"] else None
+        cands: List[float] = []
+        if snap is not None and snap["ts"]:
+            cands.append(float(snap["ts"]))
+        if first_flow is not None:
+            cands.append(first_flow)
+        return min(cands) if cands else None
+
+    @_locked
+    def hl_funding_by_position(self) -> Dict[int, float]:
+        """{position_id: Σ amount_usd}（单粒度资金费收口用；无资金费行的仓不在字典里）。"""
+        out: Dict[int, float] = {}
+        for r in self.conn.execute(
+                "SELECT position_id, sum(amount_usd) AS s FROM hl_funding"
+                " WHERE position_id IS NOT NULL GROUP BY position_id"):
+            out[int(r["position_id"])] = float(r["s"])
+        return out
+
+    # ---------------- 总资金流水（v_ledger 视图，只读） ----------------
+    @_locked
+    def hl_ledger_rows(self) -> List[sqlite3.Row]:
+        """全量总账（v_ledger），时间正序（同刻按 ref 排序保证稳定）。
+
+        running balance 必须**全量正序**算完再由渲染层切片分页 —— 用当前页切片
+        现算余额会把「页首之前的所有历史」漏掉，余额全是错的（spec 明令禁止）。
+        总量是「一生几百条」级别，一次读全表最省事。
+        """
+        return list(self.conn.execute(
+            "SELECT * FROM v_ledger ORDER BY ts ASC, ref ASC"))
+
+    @_locked
+    def hl_ledger_sum(self) -> float:
+        """Σ全部流水（对账行用）。空表 = 0.0。"""
+        r = self.conn.execute("SELECT sum(amount_usd) AS s FROM v_ledger").fetchone()
+        return float(r["s"]) if r and r["s"] is not None else 0.0
 
     @_locked
     def prune_hl_telemetry(self, keep_days: float = 30.0, keep_events: int = 20000,

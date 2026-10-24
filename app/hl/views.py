@@ -607,6 +607,10 @@ def status_payload(deps: DashboardDeps) -> dict:
             "stop_unknown": has_stop is False and not trusted,   # 挂单不可信：显示「无法确认」而非 ❌
             "stop_dist_pct": stop_dist_pct,
             "r_unrealized": r_unrealized,
+            # 单粒度资金费（feat/funds-ledger）：快照的 cumFunding.sinceOpen 是**成本
+            # 视角**（付出为正），与面板「正=收入」口径相反，此处取反 —— 与账户级
+            # funding_total 同一套换算（见下方 funding_total 注释）。
+            "funding_income": -_num(d.get("funding_since_open")),
             "signal_bar_ms": int(row.get("signal_bar_ms")) if row is not None else None,
             "position_id": int(row.get("id")) if row is not None else None,
         })
@@ -688,6 +692,9 @@ def status_payload(deps: DashboardDeps) -> dict:
     # ---------------- 信号 ----------------
     signals: List[dict] = []
     pnl_from_fills = _pnl_from_fills(cfg)      # 净额口径开关（默认关）
+    # 单粒度资金费（feat/funds-ledger）：{position_id: Σ amount_usd}，一次分组查询
+    # 拿全量，循环里只查字典。给「已平仓行」的资金费小字用（持仓中的在仓位卡列）。
+    fund_by_pos = _db_call(deps.db, "hl_funding_by_position") or {}
     for r in db_rows:
         d = _rowd(r)
         entry = d.get("actual_entry")
@@ -730,6 +737,12 @@ def status_payload(deps: DashboardDeps) -> dict:
             # 值为 NULL = 没算过/查不到成交（不知道），不是 0。
             sig["net_pnl"] = _opt_num(d.get("net_pnl"))
             sig["pnl_source"] = d.get("pnl_source")
+        # 单粒度资金费（feat/funds-ledger）：**只挂 HL 仓行**（非 HL 忽略），且该仓
+        # 在 hl_funding 里有归集行；没有资金费记录的仓不带键，渲染层不加小字。
+        if posfields.is_hl(d) and d.get("id") is not None:
+            fs = fund_by_pos.get(int(d["id"]))
+            if fs is not None:
+                sig["funding_sum"] = round(fs, 6)
         signals.append(sig)
 
     # ---------------- 盈亏曲线（已剔除出入金）+ TWR 指数 ----------------
@@ -1564,6 +1577,12 @@ def _signals_html(signals: list) -> str:
                     extra = f" · 剩 {mins} 分钟"
             hl_note = (f"<div class='muted'>{_esc(hl_status_text(hl_st))}"
                        f"{_esc(extra)}</div>")
+        # 单粒度资金费小字（feat/funds-ledger）：HL 持仓/已平仓行在状态下方多一行
+        # 「本单资金费合计 ±X U」（正=收入，与面板全局口径一致）。非 HL 行 / 没有资金费
+        # 记录的仓不带 funding_sum 键 → 不加行，表格结构不变。
+        if sg.get("funding_sum") is not None:
+            fund_txt, _cls = _sign(sg.get("funding_sum"))
+            hl_note += f"<div class='muted'>本单资金费合计 {_esc(fund_txt)}</div>"
         pnl_cell = ""
         if with_pnl:
             # net_pnl 为 NULL 时显示「—」：没算过/查不到成交 ≠ 0 收益
@@ -1772,12 +1791,16 @@ def _render_body(p: dict) -> str:
              "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
              "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num'>杠杆</th>"
              "<th class='num'>保证金</th><th class='num'>强平价</th>"
+             "<th class='num'>本单资金费</th>"
              "</tr></thead><tbody>")
     for pos in (_as_dict(x) for x in positions):
         upnl_txt, upnl_cls = _sign(pos.get("unrealized_pnl"))
         side_txt = "多" if _num(pos.get("side"), 1) >= 0 else "空"
         dist = _opt_num(pos.get("stop_dist_pct"))
         r_txt, r_cls = _sign(pos.get("r_unrealized"), "R")
+        # 本单资金费（正=收入）：交易所 cumFunding.sinceOpen 已在 status_payload
+        # 换算成收入视角；交易所没给（老快照）就如实显示「—」，不猜 0。
+        fund_txt, fund_cls = _sign(pos.get("funding_income"))
         if pos.get("has_stop"):
             stop_cell = f"<span class='pos'>&#10004;&#65039; {_fmt(pos.get('stop_px'))}</span>"
         elif pos.get("stop_unknown"):
@@ -1798,9 +1821,10 @@ def _render_body(p: dict) -> str:
                        + (" <span class='muted'>逐</span>" if pos.get("isolated") else ""), "num")
                  + _td(_fmt(pos.get("margin_used")), "num")
                  + _td(_fmt(pos.get("liq_px")) if _opt_num(pos.get("liq_px")) else "—", "num")
+                 + _td(fund_txt, f"num {fund_cls}".strip())
                  + "</tr>")
     if not positions:
-        o.append(f"<tr><td colspan='12' class='muted'>"
+        o.append(f"<tr><td colspan='13' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
     o.append("</tbody></table></div>")

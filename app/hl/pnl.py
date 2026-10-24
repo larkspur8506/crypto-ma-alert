@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 __all__ = [
-    "ENTRY_LOOKBACK_S", "EXIT_LOOKAHEAD_S", "QUOTE_FEE_TOKENS",
+    "ENTRY_LOOKBACK_S", "EXIT_LOOKAHEAD_S", "QUOTE_FEE_TOKENS", "TS_MS_THRESHOLD",
     "window_bounds", "in_window", "fee_of", "leg_of", "from_exchange",
     "aggregate_fills", "net_size", "pnl_diff",
 ]
@@ -80,13 +80,18 @@ def _is_quote_token(token: Any) -> bool:
     return t == "" or t in QUOTE_FEE_TOKENS
 
 
+# 毫秒/秒判别阈值：epoch 毫秒都在 1e12 以上（1e12 ms ≈ 2001 年），秒级最大约 1e10。
+# 唯一判据，Python 侧（_ts_seconds）与 SQL 侧（v_ledger 归一）必须同源，别各写一个数。
+TS_MS_THRESHOLD = 1e12
+
+
 def _ts_seconds(v: Any) -> Optional[float]:
     """成交时刻统一成秒。库里由 `_sync_fills` 写成秒（ms//1000）；但历史导入/手工
     数据里出现过毫秒（>1e12）—— 不归一的话整行会被判成「窗口外」而静默漏掉。"""
     t = _num(v)
     if t is None:
         return None
-    return t / 1000.0 if t > 1e12 else t
+    return t / 1000.0 if t > TS_MS_THRESHOLD else t
 
 
 def window_bounds(opened_at: Any, closed_at: Any) -> Tuple[Optional[float], Optional[float]]:

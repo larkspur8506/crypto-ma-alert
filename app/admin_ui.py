@@ -37,6 +37,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from app import engine, sizing
 from app.hl import dd as hl_dd
+from app.hl import funding as hl_funding
+from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
                         _fee_quoted, _kv, _render_body, _signals_html, normalize_rows,
                         status_payload)
@@ -1139,9 +1141,82 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
 
 
 # ---------------------------------------------------------------- 记录 Tab
+def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
+    """「资金流水」区块（feat/funds-ledger）：记录页最前面的总资金流水表。
+
+    三源 union 自 v_ledger 视图（不复制数据）；排序**最新在前**（与记录页其它表
+    一致），但「事件后余额」必须先对全量正序算 running balance 再切片 ——
+    用当前页现算余额会把页首之前的历史漏掉（spec 明令禁止，见 funding.running_balances）。
+    行数与底部 10/20/50 选择器联动（同一个 rows cookie，本区块不单设行数入口）。
+    """
+    try:
+        rows = [_rowd(r) for r in (deps.db.hl_ledger_rows() or [])]
+        snap = deps.db.hl_latest_snapshot()
+        total = _num(deps.db.hl_ledger_sum())
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning("[admin] 资金流水读取失败：%s", e)
+        return ("<h2>资金流水</h2><div class='card'>"
+                "<div class='sec'>资金流水</div>"
+                f"<div class='hint bad'>读取失败：{_esc(type(e).__name__)}"
+                "（v_ledger 视图异常，请查日志）</div></div>")
+    # 对账行：Σ全部流水 vs 最新快照权益，残差如实显示（不凑平）。
+    snap_d = dict(snap) if snap is not None else None
+    equity = _num(snap_d.get("equity")) if snap_d else 0.0
+    residual = equity - total
+    # 全量正序 running balance（期初 0），再切「最新 n 条」显示
+    balances = hl_funding.running_balances(rows)
+    page = list(zip(rows[-n:] if n else [], balances[-n:] if n else []))
+    page.reverse()                      # 最新在前
+
+    rows_html = ""
+    for r, bal in page:
+        amt = _opt_num(r.get("amount_usd"))
+        amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
+        kind = hl_funding.kind_text(r.get("kind"))
+        pid = r.get("position_id")
+        link = f"#{int(pid)}" if pid is not None else "—"
+        # 备注：coin/数量/hash 前 10 位；口径例外如实标注（不许静默）。
+        # M3：fee_missing 按成因分两种文案 —— fee_token 非计价币（如 ARB）时
+        # _fee_quote 按设计返回 None，不是「老数据」，得说明真相。
+        notes: List[str] = []
+        if r.get("coin"):
+            notes.append(str(r["coin"]))
+        if r.get("fee_missing"):
+            fee_tok = str(r.get("fee_token") or "").strip().upper()
+            if fee_tok and fee_tok not in QUOTE_FEE_TOKENS:
+                notes.append(f"费用未折算（非计价币 {_esc(fee_tok)}）")
+            else:
+                notes.append("老数据缺手续费")
+        if pid is None:
+            notes.append("无持仓期资金费" if r.get("kind") == "funding" else "未归属")
+        ref = str(r.get("ref") or "")
+        tail = ref[-14:] if ref.startswith("fund:") else ref[:10]
+        if tail and tail != "fund:":
+            notes.append(_esc(tail))
+        rows_html += (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
+                      f"<td>{_esc(kind)}</td>"
+                      f"<td class='num {amt_cls}'>{('—' if amt is None else f'{amt:+,.2f}')}</td>"
+                      f"<td class='num'>{_fmt(bal)}</td>"
+                      f"<td class='num'>{_esc(link)}</td>"
+                      f"<td>{' · '.join(notes) or '—'}</td></tr>")
+
+    equity_txt = "暂无快照" if not snap else f"{_fmt(equity)} U"
+    head = (f"Σ全部流水 = {_fmt(total)} U ｜ 当前账户权益（最新快照）= {equity_txt} ｜ "
+            f"残差 = 权益 − Σ流水 = {_fmt(residual)} U（未实现盈亏 + 口径零头）")
+    return (f"<h2>资金流水</h2>"
+            f"<div class='card'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）</div>"
+            f"<div class='hint'>{_esc(head)}</div>"
+            + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
+                     "<th class='num'>余额</th><th class='num'>关联单</th><th>备注</th>",
+                     rows_html, "暂无流水（等首次同步，或执行器未配置 HL 账户）", 6)
+            + "<div class='legend'>余额 = 自账户 0 起累计（全量正序累加后再取当前页）· "
+              "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入 · 关联单 #N = 归集到的仓位</div>"
+            "</div>")
+
+
 def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                    signals: Optional[List[Dict[str, Any]]] = None) -> str:
-    """记录页五块：下单记录 → 成交 → 信号 → 提醒日志 → 执行器事件。
+    """记录页六块：资金流水 → 下单记录 → 成交 → 信号 → 提醒日志 → 执行器事件。
 
     ``signals`` 来自 ``payload["signals"]``（hl/views.status_payload 构造）；缺省
     None 时按空表渲染「暂无信号」（直接调 render_records 的老调用点不会炸）。
@@ -1149,6 +1224,10 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     """
     n = normalize_rows(rows_n)
     o: List[str] = []
+    # ---- 资金流水（feat/funds-ledger）----
+    # 位置铁律：必须在记录页**任何既有区块之前**（本函数原来第一块是 <h2>记录</h2>，
+    # 资金流水的 <h2> 排在它前面，测试按 h2 顺序断言位置）。
+    o.append(_funds_ledger_html(deps, n))
     o.append("<h2>记录</h2>")
     o.append(f"<div class='hint'>时间均为{engine.TZ_LABEL}；每块最多 {n} 行"
              f"（页脚「每页行数」可切 10/20/50）。</div>")
