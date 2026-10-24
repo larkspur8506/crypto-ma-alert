@@ -1398,6 +1398,21 @@ def _csv_num(v: Any) -> Any:
     return "" if v is None else v
 
 
+# CSV 公式注入防护（OWASP CSV Injection 惯例）：电子表格会把以 = + - @ 开头的
+# 单元格当公式执行。只对「不是数字的文本」加前缀（数值列/负数原样不动）。
+_CSV_FORMULA_PREFIXES = ("=", "+", "-", "@")
+
+
+def _csv_safe(v: Any) -> Any:
+    s = str(v)
+    if s[:1] in _CSV_FORMULA_PREFIXES:
+        try:
+            float(s)
+        except ValueError:
+            return "'" + s
+    return v
+
+
 _CSV_COLS: Dict[str, List[Tuple[str, Callable[[Any], Any]]]] = {
     "orders": [("id", lambda r: r.get("id")), ("时间", lambda r: _csv_ts(r.get("created_at"))),
                ("标的", lambda r: r.get("coin") or ""), ("用途", lambda r: r.get("purpose") or ""),
@@ -1705,8 +1720,10 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
                  if not err_html and (z or not (before_s or after_s)) else "")
 
     # ---- 筛选器（GET 表单，零 JS：提交即重载） ----
+    # 隐藏 n 与翻页链接口径一致：提交筛选不掉回 cookie 行数。
     form: List[str] = [f"<form method='get' action='/admin/list/{slug}' class='inline'>"
-                       f"<input type='hidden' name='k' value='{_esc(token)}'>"]
+                       f"<input type='hidden' name='k' value='{_esc(token)}'>"
+                       f"<input type='hidden' name='n' value='{int(n)}'>"]
     for key, label, kind in cfg["filters"]:
         cur = parsed["raw"].get(key, "")
         if kind == "number":
@@ -1806,7 +1823,7 @@ def _csv_stream(deps: AdminDeps, slug: str, f: Dict[str, Any],
             r["_bal"] = bal
             buf = io.StringIO()
             csv.writer(buf, lineterminator="\n").writerow(
-                [str(fn(r)) for _h, fn in _CSV_COLS[slug]])
+                [str(_csv_safe(fn(r))) for _h, fn in _CSV_COLS[slug]])
             yield buf.getvalue()
         return
     last_id: Optional[int] = None
@@ -1818,7 +1835,7 @@ def _csv_stream(deps: AdminDeps, slug: str, f: Dict[str, Any],
         for r in rows:
             buf = io.StringIO()
             csv.writer(buf, lineterminator="\n").writerow(
-                [str(fn(_rowd(r))) for _h, fn in _CSV_COLS[slug]])
+                [str(_csv_safe(fn(_rowd(r)))) for _h, fn in _CSV_COLS[slug]])
             yield buf.getvalue()
         last_id = _rowd(rows[-1]).get("id")        # DESC 序的最后一行 = 本批最小 id
         if len(rows) < 500:
@@ -2489,6 +2506,10 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页
         target = back if back.startswith("/admin/list/") else \
             f"/admin?tab=records&k={quote(str(token))}"
+        # 深链（无 cookie 只带 k）也要能活过这条 302：请求带 k 而 back 里没有时补上，
+        # 否则跳回去就 401（子页路由不像 /admin/rows 那样顺手写 cma_admin cookie）。
+        if k and "k=" not in target:
+            target += ("&" if "?" in target else "?") + f"k={quote(str(token))}"
         https_ = request.url.scheme == "https" or \
             str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
         resp = RedirectResponse(target, status_code=302)

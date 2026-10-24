@@ -91,12 +91,17 @@ class BaseCase(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     # ---- 造数助手（只走既有写路径 / 测试专用的批量直插，不新增写逻辑） ----
-    def add_orders(self, n, coin_cycle=("BTC", "ETH"), purpose_cycle=("entry", "stop", "exit")):
-        """hl_orders：幂等键 symbol+bar_ms+purpose，bar_ms 逐行递增保证不撞。"""
+    def add_orders(self, n, coin_cycle=("BTC", "ETH"), purpose_cycle=("entry", "stop", "exit"),
+                   bar0=None):
+        """hl_orders：幂等键 symbol+bar_ms+purpose，bar_ms 逐行递增保证不撞。
+
+        多轮插桩必须换 bar0（幂等键 INSERT OR IGNORE，同键静默不插 → 用例空转）。
+        """
         ids = []
         for i in range(n):
             ids.append(self.db.hl_record_intent(
-                "BTC_USDT", coin_cycle[i % len(coin_cycle)], BAR + i,
+                "BTC_USDT", coin_cycle[i % len(coin_cycle)],
+                (bar0 if bar0 is not None else BAR) + i,
                 purpose_cycle[i % len(purpose_cycle)], 1, 1.0, 100.0, status="filled"))
         return ids
 
@@ -204,6 +209,23 @@ class AuthAndRoutes(BaseCase):
                             params={"n": "10", "back": "https://evil.example/x", "k": TOKEN},
                             follow_redirects=False)
         self.assertTrue(r.headers["location"].startswith("/admin?tab=records"))
+        # 筛选 GET 表单补隐藏 n（与翻页链接口径一致）：提交筛选不掉回 cookie 行数
+        page = self.client.get("/admin/list/orders", params={"k": TOKEN, "n": "20"}).text
+        self.assertIn("<input type='hidden' name='n' value='20'>", page,
+                      "筛选表单缺 n 参数，提交后会掉回 cookie 行数")
+
+    def test_rows_switch_deep_link_keeps_k(self):
+        """审查 M3：无 cookie 只带 k 的深链，切行数后 302 必须带回 k，否则 401。"""
+        self.add_orders(2)
+        page = self.client.get("/admin/list/orders", params={"k": TOKEN, "n": "10"}).text
+        m = re.search(r"href='(/admin/list/rows\?[^']*)'", page)
+        self.assertIsNotNone(m, "子页缺行数切换链接")
+        rr = self.client.get(m.group(1), follow_redirects=False)
+        self.assertEqual(rr.status_code, 302)
+        self.assertIn(f"k={TOKEN}", rr.headers["location"],
+                      "行数切换 302 丢了 k，深链会被打回 401")
+        self.assertEqual(self.client.get(rr.headers["location"]).status_code, 200,
+                         "深链 → 切行数 → 回子页全链路应 200")
 
 
 class CursorPagination(BaseCase):
@@ -244,8 +266,13 @@ class CursorPagination(BaseCase):
         older = self.links(r1, "下一页（更旧）")
         page2 = self.client.get(older).text
         before_body = self.tbody(page2)
-        # 中间插入 3 条新订单（id 更大 = 更新方向最外侧）
-        self.add_orders(3)
+        # 中间插入 3 条新订单（id 更大 = 更新方向最外侧）。
+        # bar0 必须换：幂等键 symbol+bar_ms+purpose 是 INSERT OR IGNORE，同键静默
+        # 不插会让下面的稳定性断言变成同内容自比恒真（PR #54 审查 M1）。
+        new_ids = self.add_orders(3, bar0=BAR + 1000)
+        self.assertEqual(len(set(new_ids)), 3, "插桩撞幂等键，返回 id 重复")
+        self.assertEqual(self.db.list_subpage_count("orders"), 38,
+                         "插桩没真插入 3 行（同键 INSERT OR IGNORE 空转）")
         page2_after = self.client.get(older).text
         self.assertEqual(self.tbody(page2_after), before_body,
                          "before 游标页被新插入的行漂移了（OFFSET 行为，禁止）")
@@ -352,6 +379,23 @@ class CsvExport(BaseCase):
                             params={"table": "fills", "k": TOKEN, "df": D2_STR}).text
         self.assertEqual(len(r.lstrip("\ufeff").rstrip("\n").split("\n")) - 1, 1)
 
+    def test_csv_formula_injection_sanitized(self):
+        """审查 M2：以 = + - @ 开头的自由文本单元格加 ' 前缀，数值列原样。"""
+        self.db.hl_record_intent("BTC_USDT", "BTC", BAR, "entry", 1, 1.0, 100.0,
+                                 status="failed", error="=2+5")
+        self.db.hl_log_event("decision", "-1+1|cmd", "BTC_USDT")
+        self.add_flows([-5.0])
+        r = self.client.get("/admin/export", params={"table": "orders", "k": TOKEN})
+        self.assertTrue(r.text.rstrip("\n").endswith("'=2+5"),
+                        "orders.error 以 = 开头未消毒，Excel 会当公式执行")
+        r = self.client.get("/admin/export", params={"table": "events", "k": TOKEN})
+        self.assertTrue(r.text.rstrip("\n").endswith("'-1+1|cmd"),
+                        "events.message 以 - 开头未消毒")
+        # 数值列/负数金额不动
+        r = self.client.get("/admin/export", params={"table": "ledger", "k": TOKEN})
+        self.assertIn("-5.0", r.text)
+        self.assertNotIn("'-5.0", r.text, "数值列被误加前缀")
+
     def test_csv_streaming_large_table(self):
         """规格测试 4：超大表（2000 行）流式导出不炸、行数完整。"""
         # 测试专用批量直插（单事务；走 hl_log_event 会 2000 次 commit，没必要）
@@ -426,7 +470,8 @@ class MainRecordsRegression(BaseCase):
             self.assertIn(f"/admin/rows?n={n}&tab=records", r)
         # 既有文案/断言不回退
         self.assertIn("每页行数", r)
-        self.assertIn("暂无流水", r) if False else None  # 有流水时不出现；占位说明
+        # 成交流水已入库（v_ledger union hl_fills）→ 不应再显示空态
+        self.assertNotIn("暂无流水", r, "有成交时空态文案仍在")
 
     def test_records_page_empty_ok(self):
         """空库时主记录页与六个子页都照常 200（fail-soft 回归）。"""
