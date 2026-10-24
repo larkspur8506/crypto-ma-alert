@@ -22,8 +22,10 @@
 """
 from __future__ import annotations
 
+import csv
 import datetime as dt
 import html
+import io
 import logging
 import math
 import os
@@ -33,15 +35,16 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from fastapi import APIRouter, Form, HTTPException, Request
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
 
-from app import engine, sizing
+from app import engine, posfields, sizing
+from app.db import DB
 from app.hl import dd as hl_dd
 from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
-                        _fee_quoted, _kv, _render_body, _signals_html, normalize_rows,
-                        status_payload)
+                        _ST_TXT, _disp, _fee_quoted, _fmt_sz, _kv, _render_body,
+                        _signals_html, normalize_rows, status_payload)
 from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
 
@@ -1141,6 +1144,49 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
 
 
 # ---------------------------------------------------------------- 记录 Tab
+def _all_link(slug: str, token: str) -> str:
+    """记录页各块的「全部 ›」入口（feat/list-subpages）：跳到该表的独立子页。
+
+    零 JS 的普通链接；k 原样带上（子页与其余 admin 路由同法鉴权）。
+    """
+    q = quote(str(token or ""), safe="")
+    return (f"<a class='alllink' href='/admin/list/{slug}?k={q}' "
+            f"title='查看该表全部记录（可筛选、可导出 CSV）'>全部 ›</a>")
+
+
+def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
+    """资金流水一行（主记录页与 /admin/list/ledger 子页共用同一份渲染，口径不二份）。"""
+    amt = _opt_num(r.get("amount_usd"))
+    amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
+    kind = hl_funding.kind_text(r.get("kind"))
+    pid = r.get("position_id")
+    link = f"#{int(pid)}" if pid is not None else "—"
+    # 备注：coin/数量/hash 前 10 位；口径例外如实标注（不许静默）。
+    # M3：fee_missing 按成因分两种文案 —— fee_token 非计价币（如 ARB）时
+    # _fee_quote 按设计返回 None，不是「老数据」，得说明真相。
+    notes: List[str] = []
+    if r.get("coin"):
+        notes.append(str(r["coin"]))
+    if r.get("fee_missing"):
+        fee_tok = str(r.get("fee_token") or "").strip().upper()
+        if fee_tok and fee_tok not in QUOTE_FEE_TOKENS:
+            notes.append(f"费用未折算（非计价币 {_esc(fee_tok)}）")
+        else:
+            notes.append("老数据缺手续费")
+    if pid is None:
+        notes.append("无持仓期资金费" if r.get("kind") == "funding" else "未归属")
+    ref = str(r.get("ref") or "")
+    tail = ref[-14:] if ref.startswith("fund:") else ref[:10]
+    if tail and tail != "fund:":
+        notes.append(_esc(tail))
+    return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
+            f"<td>{_esc(kind)}</td>"
+            f"<td class='num {amt_cls}'>{('—' if amt is None else f'{amt:+,.2f}')}</td>"
+            f"<td class='num'>{_fmt(bal)}</td>"
+            f"<td class='num'>{_esc(link)}</td>"
+            f"<td>{' · '.join(notes) or '—'}</td></tr>")
+
+
 def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
     """「资金流水」区块（feat/funds-ledger）：记录页最前面的总资金流水表。
 
@@ -1170,41 +1216,14 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
 
     rows_html = ""
     for r, bal in page:
-        amt = _opt_num(r.get("amount_usd"))
-        amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
-        kind = hl_funding.kind_text(r.get("kind"))
-        pid = r.get("position_id")
-        link = f"#{int(pid)}" if pid is not None else "—"
-        # 备注：coin/数量/hash 前 10 位；口径例外如实标注（不许静默）。
-        # M3：fee_missing 按成因分两种文案 —— fee_token 非计价币（如 ARB）时
-        # _fee_quote 按设计返回 None，不是「老数据」，得说明真相。
-        notes: List[str] = []
-        if r.get("coin"):
-            notes.append(str(r["coin"]))
-        if r.get("fee_missing"):
-            fee_tok = str(r.get("fee_token") or "").strip().upper()
-            if fee_tok and fee_tok not in QUOTE_FEE_TOKENS:
-                notes.append(f"费用未折算（非计价币 {_esc(fee_tok)}）")
-            else:
-                notes.append("老数据缺手续费")
-        if pid is None:
-            notes.append("无持仓期资金费" if r.get("kind") == "funding" else "未归属")
-        ref = str(r.get("ref") or "")
-        tail = ref[-14:] if ref.startswith("fund:") else ref[:10]
-        if tail and tail != "fund:":
-            notes.append(_esc(tail))
-        rows_html += (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
-                      f"<td>{_esc(kind)}</td>"
-                      f"<td class='num {amt_cls}'>{('—' if amt is None else f'{amt:+,.2f}')}</td>"
-                      f"<td class='num'>{_fmt(bal)}</td>"
-                      f"<td class='num'>{_esc(link)}</td>"
-                      f"<td>{' · '.join(notes) or '—'}</td></tr>")
+        rows_html += _ledger_row_html(r, bal)
 
     equity_txt = "暂无快照" if not snap else f"{_fmt(equity)} U"
     head = (f"Σ全部流水 = {_fmt(total)} U ｜ 当前账户权益（最新快照）= {equity_txt} ｜ "
             f"残差 = 权益 − Σ流水 = {_fmt(residual)} U（未实现盈亏 + 口径零头）")
     return (f"<h2>资金流水</h2>"
-            f"<div class='card'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）</div>"
+            f"<div class='card'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）"
+            f"{_all_link('ledger', _token_of(deps))}</div>"
             f"<div class='hint'>{_esc(head)}</div>"
             + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
                      "<th class='num'>余额</th><th class='num'>关联单</th><th>备注</th>",
@@ -1233,7 +1252,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
              f"（页脚「每页行数」可切 10/20/50）。</div>")
 
     # ---- 下单记录 ----
-    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）</div>")
+    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
+             f"{_all_link('orders', _token_of(deps))}</div>")
     rows = ""
     _orders_rows = _rows(deps, "hl_recent_orders", n)
     if _orders_rows and _orders_rows[0].get("_error"):
@@ -1256,7 +1276,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     o.append("</div>")
 
     # ---- 成交 ----
-    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）</div>")
+    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
+             f"{_all_link('fills', _token_of(deps))}</div>")
     rows = ""
     for r in _rows(deps, "hl_recent_fills", n):
         cp = _opt_num(r.get("closed_pnl"))
@@ -1284,10 +1305,13 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     # 用 _signals_html 渲染（自带 <h2>信号</h2> + 表格，与总览那一块逐字相同），
     # 外面只套 card 边框、不再加 sec 标题 —— 否则「信号」会出现两次。
     # 切片用 n：以前总览整表渲染，仓位历史一长页面就无限变长（顺手按每页行数收口）。
-    o.append("<div class='card'>" + _signals_html(list(signals or [])[:n]) + "</div>")
+    o.append("<div class='card'>" + _signals_html(list(signals or [])[:n])
+             + f"<div class='foot'><span class='muted'>信号 / 仓位历史（含已平仓）：</span>"
+               f"{_all_link('positions', _token_of(deps))}</div></div>")
 
     # ---- 提醒日志 ----
-    o.append(f"<div class='card'><div class='sec'>提醒日志（alert_logs · 最近 {n} 条）</div>")
+    o.append(f"<div class='card'><div class='sec'>提醒日志（alert_logs · 最近 {n} 条）"
+             f"{_all_link('alerts', _token_of(deps))}</div>")
     _alert_rows = _rows(deps, "recent_alerts", n)
     _backfilled = sum(1 for r in _alert_rows
                       if str(r.get("message") or "").startswith(BACKFILL_PREFIX))
@@ -1311,7 +1335,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     o.append("</div>")
 
     # ---- 执行器事件 ----
-    o.append(f"<div class='card'><div class='sec'>执行器事件（hl_events · 最近 {n} 条）</div>")
+    o.append(f"<div class='card'><div class='sec'>执行器事件（hl_events · 最近 {n} 条）"
+             f"{_all_link('events', _token_of(deps))}</div>")
     rows = ""
     for r in _rows(deps, "hl_recent_events", n):
         kind = str(r.get("kind") or "—")
@@ -1335,6 +1360,471 @@ def _coin(coin: Any, symbol: Any) -> str:
     return s.split("_")[0] if s else "—"
 
 
+# ---------------------------------------------------------------- 列表子页
+# 六个独立子页（/admin/list/<slug>）的展示配置：表名、标题、筛选字段。
+# 筛选字段的白名单与时间列在 app.db.DB.LIST_SUBPAGES（SQL 只认那边）；
+# 这里只管「页面上长什么样」。label_map：值 → 中文（下拉选项按 DB 去重值生成，
+# 用映射出文案，映射没有的值如实显示原值 —— 不编词）；"number" = 数字输入框。
+_LIST_SUBPAGE_CFG: Dict[str, Dict[str, Any]] = {
+    "orders": {"title": "下单记录", "filters": (("coin", "标的", None),
+                                                ("purpose", "用途", _PURPOSE_TXT))},
+    "fills": {"title": "成交", "filters": (("coin", "币种", None),
+                                           ("dir", "买卖", None))},
+    "ledger": {"title": "资金流水", "filters": (("kind", "类型", hl_funding.KIND_TXT),
+                                                ("coin", "币种", None),
+                                                ("position_id", "关联单 #", "number"))},
+    "events": {"title": "执行器事件", "filters": (("kind", "类型", _EV_TXT),)},
+    "alerts": {"title": "提醒日志", "filters": (("kind", "类型", _ALERT_KIND_TXT),)},
+    "positions": {"title": "信号 / 仓位历史", "filters": (("symbol", "标的", None),
+                                                          ("status", "状态", _ST_TXT))},
+}
+
+
+def _csv_ts(v: Any) -> str:
+    """CSV 的时间列：北京时间全格式（页面上是短格式，导出要能当日期用）。"""
+    f = _opt_num(v)
+    if f is None:
+        return ""
+    s = f / 1000.0 if f > 1e12 else f
+    try:
+        return dt.datetime.fromtimestamp(s, engine.DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S")
+    except (OverflowError, OSError, ValueError):
+        return ""
+
+
+# CSV 列规格：slug → [(表头, 取值函数)]。值一律导出 DB 原值（枚举不翻中文）——
+# 导出是给人做表格/对账用的，原值可筛选、可核对；只有时间列按 spec 翻成北京时间。
+def _csv_num(v: Any) -> Any:
+    return "" if v is None else v
+
+
+_CSV_COLS: Dict[str, List[Tuple[str, Callable[[Any], Any]]]] = {
+    "orders": [("id", lambda r: r.get("id")), ("时间", lambda r: _csv_ts(r.get("created_at"))),
+               ("标的", lambda r: r.get("coin") or ""), ("用途", lambda r: r.get("purpose") or ""),
+               ("状态", lambda r: r.get("status") or ""), ("数量", lambda r: _csv_num(r.get("sz"))),
+               ("价格", lambda r: _csv_num(r.get("px"))),
+               ("已成交", lambda r: _csv_num(r.get("filled_sz"))),
+               ("成交均价", lambda r: _csv_num(r.get("avg_px"))),
+               ("错误", lambda r: r.get("error") or "")],
+    "fills": [("id", lambda r: r.get("id")), ("成交时间", lambda r: _csv_ts(r.get("ts"))),
+              ("币种", lambda r: r.get("coin") or ""), ("方向", lambda r: r.get("dir") or ""),
+              ("数量", lambda r: _csv_num(r.get("sz"))), ("价格", lambda r: _csv_num(r.get("px"))),
+              ("手续费U", lambda r: _csv_num(_fee_quoted(r))),
+              ("平仓盈亏U", lambda r: _csv_num(r.get("closed_pnl"))),
+              ("减仓", lambda r: 1 if r.get("reduce_only") else 0)],
+    "ledger": [("时间", lambda r: _csv_ts(r.get("ts"))), ("类型", lambda r: r.get("kind") or ""),
+               ("币种", lambda r: r.get("coin") or ""), ("金额U", lambda r: _csv_num(r.get("amount_usd"))),
+               ("余额U", lambda r: _csv_num(r.get("_bal"))),
+               ("关联单", lambda r: _csv_num(r.get("position_id"))),
+               ("来源", lambda r: r.get("src") or ""), ("引用", lambda r: r.get("ref") or "")],
+    "events": [("id", lambda r: r.get("id")), ("时间", lambda r: _csv_ts(r.get("created_at"))),
+               ("类型", lambda r: r.get("kind") or ""), ("标的", lambda r: r.get("symbol") or ""),
+               ("内容", lambda r: r.get("message") or "")],
+    "alerts": [("id", lambda r: r.get("id")), ("时间", lambda r: _csv_ts(r.get("created_at"))),
+               ("类型", lambda r: r.get("kind") or ""), ("标的", lambda r: r.get("symbol") or ""),
+               ("送达", lambda r: 1 if r.get("sent_successfully") else 0),
+               ("内容", lambda r: r.get("message") or "")],
+    "positions": [("id", lambda r: r.get("id")), ("标的", lambda r: r.get("symbol") or ""),
+                  ("状态", lambda r: r.get("status") or ""),
+                  ("方向", lambda r: "多" if int(_num(r.get("side"), 1)) >= 0 else "空"),
+                  ("入场", lambda r: _csv_num(posfields.entry_px(r))),
+                  ("止损", lambda r: _csv_num(posfields.stop_px(r))),
+                  ("数量", lambda r: _csv_num(posfields.qty(r))),
+                  ("信号bar", lambda r: _csv_ts(r.get("signal_bar_ms")))],
+}
+
+
+def _date_bounds(date_from: str, date_to: str, unit: str) -> Tuple[Optional[float], Optional[float]]:
+    """「YYYY-MM-DD」→ 时间列同单位的 epoch 边界（北京时间口径，含端点）。
+
+    from = 当天 00:00:00.000，to = 当天 23:59:59.999（含当天的最后一秒）。
+    手敲的坏日期按「无该边界」处理（fail-soft）：老书签带着垃圾参数不该 500，
+    也不该悄悄把整表都放进来之外的语义 —— 只是这条边界不生效。
+    """
+    tz = engine.DISPLAY_TZ
+    out: List[Optional[float]] = []
+    for raw, end in ((date_from, False), (date_to, True)):
+        if not str(raw or "").strip():
+            out.append(None)
+            continue
+        try:
+            d = dt.datetime.strptime(str(raw).strip(), "%Y-%m-%d").date()
+        except ValueError:
+            out.append(None)
+            continue
+        if end:
+            t = dt.datetime(d.year, d.month, d.day, 23, 59, 59, 999000, tzinfo=tz).timestamp()
+        else:
+            t = dt.datetime(d.year, d.month, d.day, tzinfo=tz).timestamp()
+        out.append(t * 1000.0 if unit == "ms" else t)
+    return out[0], out[1]
+
+
+def _subpage_parse(deps: AdminDeps, slug: str, params: Any) -> Dict[str, Any]:
+    """把查询参数解析成子页取数输入（字段白名单外的键一律忽略）。
+
+    返回 {filters(db用), raw(回显/拼链接用), tf/tt(时间列单位边界), qs(翻页/导出链接携带的筛选串)}。
+    """
+    spec = DB.LIST_SUBPAGES[slug]
+    cfg = _LIST_SUBPAGE_CFG[slug]
+    raw: Dict[str, str] = {}
+    filters: Dict[str, Any] = {}
+    for key, _label, kind in cfg["filters"]:
+        v = str(params.get(key, "") or "").strip()
+        if not v:
+            continue
+        raw[key] = v
+        if kind == "number":
+            # 关联单 # 是整数：敲坏的非数字按「没筛」处理（与坏日期同一口径）
+            try:
+                filters[key] = int(v)
+            except ValueError:
+                raw.pop(key)
+        else:
+            filters[key] = v
+    tf, tt = _date_bounds(params.get("df", ""), params.get("dt", ""), spec["time_unit"])
+    if tf is not None:
+        raw["df"] = str(params.get("df", "")).strip()
+    if tt is not None:
+        raw["dt"] = str(params.get("dt", "")).strip()
+    qs = "&".join(f"{k}={quote(v, safe='')}" for k, v in raw.items())
+    return {"filters": filters, "raw": raw, "tf": tf, "tt": tt, "qs": qs}
+
+
+def _subpage_url(slug: str, k: str, qs: str, cursor: str = "") -> str:
+    """拼子页链接：k + 筛选串（翻页链接必须把筛选条件原样带上，spec 定案 3）。"""
+    parts = [f"k={quote(str(k or ''), safe='')}"]
+    if qs:
+        parts.append(qs)
+    if cursor:
+        parts.append(cursor)
+    return f"/admin/list/{slug}?" + "&".join(parts)
+
+
+def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
+                       balances: Optional[List[float]] = None) -> str:
+    """子页表体：行渲染与主记录页同口径（资金流水直接复用 _ledger_row_html）。"""
+    out = ""
+    if slug == "ledger":
+        for r, bal in zip(rows, balances or []):
+            out += _ledger_row_html(r, bal)
+        return out
+    if slug == "orders":
+        for r in rows:
+            st = str(r.get("status") or "—")
+            st_cls = "neg" if st == "failed" else ("warn" if st in ("intent", "sent") else "")
+            err = str(r.get("error") or "")[:60]
+            out += (f"<tr><td class='num'>{_ts(r.get('updated_at') or r.get('created_at'))}</td>"
+                    f"<td>{_esc(_coin(r.get('coin'), r.get('symbol')))}</td>"
+                    f"<td>{_esc(_PURPOSE_TXT.get(str(r.get('purpose')), r.get('purpose') or '—'))}</td>"
+                    f"<td><span class='{st_cls}'>{_esc(_ORDER_ST_TXT.get(st, st))}</span></td>"
+                    f"<td class='num'>{_fmt(r['filled_sz'] if r.get('filled_sz') is not None else r.get('sz'), 4)}</td>"
+                    f"<td class='num'>{_fmt(r['avg_px'] if r.get('avg_px') is not None else r.get('px'))}</td>"
+                    f"<td><span class='muted'>{_esc(err or '—')}</span></td></tr>")
+        return out
+    if slug == "fills":
+        for r in rows:
+            cp = _opt_num(r.get("closed_pnl"))
+            cp_cls = "pos" if (cp or 0) > 0 else ("neg" if (cp or 0) < 0 else "")
+            bs = _FILL_BS.get(str(r.get("dir") or ""), "—")
+            fee_txt = _fmt(_fee_quoted({"fee": r.get("fee"), "fee_quote": r.get("fee_quote")}), 4)
+            out += (f"<tr><td class='num'>{_ts(r.get('ts') or r.get('created_at'))}</td>"
+                    f"<td>{_esc(r.get('coin') or _coin('', r.get('symbol')))}</td>"
+                    f"<td>{bs}</td>"
+                    f"<td class='num'>{_fmt(r.get('sz'), 4)}</td>"
+                    f"<td class='num'>{_fmt(r.get('px'))}</td>"
+                    f"<td class='num'>{fee_txt}</td>"
+                    f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
+                    f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
+        return out
+    if slug == "alerts":
+        for r in rows:
+            ok = bool(r.get("sent_successfully"))
+            _kind = str(r.get("kind") or "—")
+            out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
+                    f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
+                    f"<td>{_esc(r.get('symbol') or '—')}</td>"
+                    f"<td><span class='{'pos' if ok else 'neg'}'>"
+                    f"{'已送达' if ok else '失败'}</span></td>"
+                    f"<td>{_msg_cell(str(r.get('message') or ''))}</td></tr>")
+        return out
+    if slug == "events":
+        for r in rows:
+            kind = str(r.get("kind") or "—")
+            out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
+                    f"<td>{_esc(_EV_TXT.get(kind, kind))}</td>"
+                    f"<td>{_esc(r.get('symbol') or '—')}</td>"
+                    f"<td>{_msg_cell(str(r.get('message') or ''))}</td></tr>")
+        return out
+    if slug == "positions":
+        for r in rows:
+            st = str(r.get("status") or "—")
+            st_cls = "pos" if st == "open" else ("warn" if st == "pending" else "")
+            try:
+                side_i = int(r.get("side"))
+            except (TypeError, ValueError):
+                side_i = 1
+            out += (f"<tr><td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
+                    f"<td><span class='{st_cls}'>{_esc(_ST_TXT.get(st, st))}</span></td>"
+                    f"<td>{'多' if side_i >= 0 else '空'}</td>"
+                    f"<td class='num'>{_fmt(posfields.entry_px(r))}</td>"
+                    f"<td class='num'>{_fmt(posfields.stop_px(r))}</td>"
+                    f"<td class='num'>{_fmt_sz(posfields.qty(r))}</td>"
+                    f"<td class='num'>{_ts(r.get('signal_bar_ms'))}</td></tr>")
+        return out
+    return ""
+
+
+_SUBPAGE_HEADS: Dict[str, str] = {
+    "orders": "<th>时间</th><th>标的</th><th>用途</th><th>状态</th>"
+              "<th class='num'>数量</th><th class='num'>均价</th><th>错误</th>",
+    "fills": "<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
+             "<th class='num'>价格</th><th class='num'>手续费</th>"
+             "<th class='num'>平仓盈亏</th><th>减仓</th>",
+    "ledger": "<th>时间</th><th>类型</th><th class='num'>金额</th>"
+              "<th class='num'>余额</th><th class='num'>关联单</th><th>备注</th>",
+    "events": "<th>时间</th><th>类型</th><th>标的</th><th>内容</th>",
+    "alerts": "<th>时间</th><th>类型</th><th>标的</th><th>状态</th><th>内容</th>",
+    "positions": "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
+                 "<th class='num'>止损</th><th class='num'>数量</th><th>信号 bar</th>",
+}
+
+_SUBPAGE_EMPTIES: Dict[str, str] = {
+    "orders": "暂无下单记录", "fills": "暂无成交记录", "ledger": "暂无流水",
+    "events": "暂无执行器事件", "alerts": "暂无提醒日志", "positions": "暂无信号",
+}
+
+
+def _ledger_cursor(r: Dict[str, Any]) -> str:
+    """资金流水的游标：排序键 (ts, ref) 序列化成「ts|ref」。
+
+    不用 OFFSET（会漂移）也不能用行号（新流水追加在正序尾部会把老页行号顶走）；
+    (ts, ref) 是 hl_ledger_rows 的排序键本身，新流水只会出现在键更大的一侧，
+    老页永远稳定。ref 不含「|」（flow:N / fill:N / fund:…）。
+    """
+    return f"{_opt_num(r.get('ts')) or 0.0}|{r.get('ref') or ''}"
+
+
+def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) -> str:
+    """列表子页正文：游标分页 + 筛选器 + CSV 导出入口（零 JS，纯 GET 链接/表单）。"""
+    cfg = _LIST_SUBPAGE_CFG[slug]
+    n = normalize_rows(rows_n)
+    parsed = _subpage_parse(deps, slug, params)
+    f, tf, tt, qs = parsed["filters"], parsed["tf"], parsed["tt"], parsed["qs"]
+    token = _token_of(deps)
+    before_s = str(params.get("before", "") or "").strip()
+    after_s = str(params.get("after", "") or "").strip()
+
+    head_html = (f"<h2>{_esc(cfg['title'])}</h2>"
+                 f"<div class='hint'><a href='/admin?tab=records&amp;k={quote(str(token), safe='')}'>"
+                 "‹ 返回记录页</a></div>")
+
+    # ---- 取数（fail-soft：DB 层坏掉时显示错误行，页面不 500） ----
+    err_html = ""
+    try:
+        if slug == "ledger":
+            all_rows = [_rowd(r) for r in
+                        (deps.db.list_subpage_rows("ledger", filters=f, time_from=tf, time_to=tt)
+                         or [])]
+            # 余额列：全量正序预计算后再切片（复用 PR #53 口径，页间连续）。
+            balances = hl_funding.running_balances(all_rows)
+            z = len(all_rows)
+        else:
+            before_i = int(before_s) if before_s.isdigit() else None
+            after_i = int(after_s) if after_s.isdigit() else None
+            page_rows = [_rowd(r) for r in
+                         (deps.db.list_subpage_rows(slug, limit=n, before=before_i,
+                                                    after=after_i, filters=f,
+                                                    time_from=tf, time_to=tt) or [])]
+            z = int(deps.db.list_subpage_count(slug, filters=f, time_from=tf, time_to=tt))
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning("[admin] 列表子页 %s 读取失败：%s", slug, e)
+        err_html = (f"<div class='card'><div class='hint bad'>读取失败："
+                    f"{_esc(type(e).__name__)}（请查日志）</div></div>")
+        page_rows, all_rows, balances = [], [], []
+
+    nav_links: List[str] = []
+    # 翻页链接要带上当前每页行数（显式 n= 优先于 cookie，与主记录页同口径）：
+    # 否则带着 ?n=10 进来的人点「下一页」会掉回 cookie 的默认行数。
+    nav_qs = (qs + "&" if qs else "") + f"n={n}"
+    x = y = 0
+    if err_html:
+        count_txt = ""
+    elif slug == "ledger":
+        keys = [(_opt_num(r.get("ts")) or 0.0, str(r.get("ref") or "")) for r in all_rows]
+        if before_s or after_s:
+            bound: Optional[Tuple[float, str]] = None
+            try:
+                b_ts, b_ref = (before_s or after_s).split("|", 1)
+                bound = (float(b_ts), b_ref)
+            except (TypeError, ValueError):
+                bound = None
+            if bound is None:                       # 坏游标 → 回到最新一页（fail-soft）
+                sel = list(range(max(0, z - n), z))
+            elif before_s:
+                sel = [i for i, kk in enumerate(keys) if kk < bound][-n:] if n else []
+            else:
+                sel = [i for i, kk in enumerate(keys) if kk > bound][:n] if n else []
+        else:
+            sel = list(range(max(0, z - n), z))
+        disp = [(all_rows[i], balances[i]) for i in sel]
+        disp.reverse()                              # 最新在前（与主记录页同序）
+        x = (z - sel[-1]) if sel else 0             # 最新序号 = 共 Z − 正序下标（1 基）
+        y = (z - sel[0]) if sel else 0
+        if sel and (z - sel[0]) > 1:                # 还有更新的 → 上一页
+            cur_q = quote(_ledger_cursor(all_rows[sel[-1]]), safe="")
+            nav_links.append(f"<a class='btn gray' "
+                             f"href='{_subpage_url(slug, token, nav_qs, 'after=' + cur_q)}'>"
+                             "‹ 上一页（更新）</a>")
+        if sel and sel[0] > 0:                      # 还有更旧的 → 下一页
+            cur_q = quote(_ledger_cursor(all_rows[sel[0]]), safe="")
+            nav_links.append(f"<a class='btn' "
+                             f"href='{_subpage_url(slug, token, nav_qs, 'before=' + cur_q)}'>"
+                             "下一页（更旧）›</a>")
+        page_rows = [r for r, _b in disp]
+        rows_html = _subpage_rows_html(slug, [r for r, _b in disp], [b for _r, b in disp])
+    else:
+        rows_html = _subpage_rows_html(slug, page_rows)
+        if page_rows:
+            # 序号 = 同筛选下 count(id >= 该行 id)：页眉数字与行内容同源，不靠数行数。
+            x = int(deps.db.list_subpage_count(slug, filters=f, time_from=tf, time_to=tt,
+                                               id_gte=page_rows[0].get("id")))
+            y = int(deps.db.list_subpage_count(slug, filters=f, time_from=tf, time_to=tt,
+                                               id_gte=page_rows[-1].get("id")))
+            if y < z:
+                older_id = page_rows[-1].get("id")
+                nav_links.append(f"<a class='btn' href='{_subpage_url(slug, token, nav_qs, f'before={older_id}')}'>"
+                                 "下一页（更旧）›</a>")
+            if x > 1:
+                newer_id = page_rows[0].get("id")
+                nav_links.append(f"<a class='btn gray' href='{_subpage_url(slug, token, nav_qs, f'after={newer_id}')}'>"
+                                 "‹ 上一页（更新）</a>")
+    if (before_s or after_s) and not err_html:
+        nav_links.append(f"<a class='btn gray' href='{_subpage_url(slug, token, nav_qs)}'>回到最新</a>")
+    count_txt = (f"第 {x}–{y} 条 / 共 {z} 条（每页 {n} 行）"
+                 if not err_html and (z or not (before_s or after_s)) else "")
+
+    # ---- 筛选器（GET 表单，零 JS：提交即重载） ----
+    form: List[str] = [f"<form method='get' action='/admin/list/{slug}' class='inline'>"
+                       f"<input type='hidden' name='k' value='{_esc(token)}'>"]
+    for key, label, kind in cfg["filters"]:
+        cur = parsed["raw"].get(key, "")
+        if kind == "number":
+            form.append(f"<label class='chk'>{_esc(label)} "
+                        f"<input type='text' inputmode='numeric' name='{_esc(key)}' "
+                        f"value='{_esc(cur)}' placeholder='全部' style='width:88px'></label>")
+            continue
+        try:
+            opts = list(deps.db.list_subpage_options(slug, key) or [])
+        except Exception:                                             # noqa: BLE001
+            opts = []
+        if cur and cur not in opts:
+            opts.append(cur)                    # 当前筛选值不在去重列表（如刚删的行）也要回显
+        items = "".join(
+            f"<option value='{_esc(v)}'{' selected' if v == cur else ''}>"
+            f"{_esc(kind.get(v, v) if isinstance(kind, dict) else v)}</option>"
+            for v in opts)
+        form.append(f"<label class='chk'>{_esc(label)} <select name='{_esc(key)}'>"
+                    f"<option value=''>全部</option>{items}</select></label>")
+    form.append(f"<label class='chk'>从 <input type='date' name='df' value='{_esc(parsed['raw'].get('df', ''))}'></label>")
+    form.append(f"<label class='chk'>到 <input type='date' name='dt' value='{_esc(parsed['raw'].get('dt', ''))}'></label>")
+    form.append("<button type='submit'>筛选</button></form>"
+                f"<a class='btn gray' href='{_subpage_url(slug, token, '')}'>重置</a>")
+
+    # ---- 每页行数切换（同一个 cma_rows cookie；切完回本子页并带原筛选参数） ----
+    back = quote(f"/admin/list/{slug}" + (f"?{qs}" if qs else ""), safe="")
+    row_links = " ".join(
+        f"<a class='{'btn' if m == n else 'btn gray'}' "
+        f"href='/admin/list/rows?n={m}&back={back}&k={quote(str(token), safe='')}'>{m}</a>"
+        for m in ROW_CHOICES)
+
+    # ---- 导出 CSV（同筛选条件下全量流式，不分页） ----
+    export_qs = ("&" + qs) if qs else ""
+    export_link = (f"<a class='btn' href='/admin/export?table={slug}&k={quote(str(token), safe='')}"
+                   f"{export_qs}'>导出 CSV</a>")
+
+    # 资金流水筛选态的余额口径必须写在**可见文字**里（spec 定案 5）：筛选后的余额
+    # 是「期初 0 + 筛选后全集」累计，不是账户余额，不注明会被误读。
+    ledger_note = ""
+    if slug == "ledger":
+        if parsed["filters"] or tf is not None or tt is not None:
+            ledger_note = ("<div class='hint'>⚠️ 已筛选：<b>余额按当前筛选范围累计</b>"
+                           "（期初 0 起算），不是账户余额；清空筛选后恢复全量口径。</div>")
+
+    thead = _SUBPAGE_HEADS[slug]
+    body = (head_html
+            + f"<div class='card'><div class='sec'>"
+              f"{_esc(cfg['title'])}（{_esc(count_txt)}）{export_link}</div>"
+            + ledger_note
+            + "<div class='foot'>" + "".join(form) + "</div>"
+            + _table(thead, rows_html, _SUBPAGE_EMPTIES[slug], thead.count("<th>"))
+            + (f"<div class='foot'>{(' '.join(nav_links))}</div>" if nav_links else "")
+            + f"<div class='foot'><span class='muted'>每页行数：</span>{row_links}</div>"
+            + "</div>")
+    if slug == "ledger":
+        body += ("<div class='legend'>余额 = 自期初 0 起累计（全量正序累加后再切当前页）· "
+                 "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入</div>")
+    return body
+
+
+def _subpage_page(token: str, slug: str, body_html: str, theme: str = DEFAULT_THEME,
+                  rows_n: int = DEFAULT_ROWS) -> HTMLResponse:
+    """子页外壳：与主面板同一套 head/CSS（不引新依赖），记录 Tab 高亮。"""
+    label = _LIST_SUBPAGE_CFG[slug]["title"]
+    attr = theme_attr(theme)
+    attr_html = f" data-theme='{attr}'" if attr else ""
+    from app.hl.views import THEME_CSS
+    return HTMLResponse(
+        f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
+        f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        f"{ICON_LINKS}"
+        f"<title>crypto-ma-alert · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
+        f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
+        f"{_tabs_html('records', token)}{body_html}"
+        f"{theme_switch_html('records', theme, token)}"
+        f"{rows_switch_html('records', rows_n, token)}"
+        "<div class='foot'><span class='muted'>手机可用 · 无外部资源 · "
+        "面板只读，不持私钥</span></div></div></body></html>")
+
+
+def _csv_stream(deps: AdminDeps, slug: str, f: Dict[str, Any],
+                tf: Optional[float], tt: Optional[float]):
+    """CSV 生成器：同筛选条件**全量**流式写出（不分页；id 游标分批取防大表撑内存）。
+
+    UTF-8 带 BOM（Excel 打开中文不乱码）；首行表头；时间列北京时间全格式。
+    """
+    buf = io.StringIO()
+    w = csv.writer(buf, lineterminator="\n")
+    w.writerow([h for h, _fn in _CSV_COLS[slug]])
+    yield "\ufeff" + buf.getvalue()
+    if slug == "ledger":
+        rows = [_rowd(r) for r in
+                (deps.db.list_subpage_rows("ledger", filters=f, time_from=tf, time_to=tt)
+                 or [])]
+        # 余额列口径与子页/主记录页一致：全量正序预计算（复用 PR #53 实现）
+        for r, bal in zip(rows, hl_funding.running_balances(rows)):
+            r["_bal"] = bal
+            buf = io.StringIO()
+            csv.writer(buf, lineterminator="\n").writerow(
+                [str(fn(r)) for _h, fn in _CSV_COLS[slug]])
+            yield buf.getvalue()
+        return
+    last_id: Optional[int] = None
+    while True:
+        rows = list(deps.db.list_subpage_rows(slug, limit=500, before=last_id,
+                                              filters=f, time_from=tf, time_to=tt) or [])
+        if not rows:
+            return
+        for r in rows:
+            buf = io.StringIO()
+            csv.writer(buf, lineterminator="\n").writerow(
+                [str(fn(_rowd(r))) for _h, fn in _CSV_COLS[slug]])
+            yield buf.getvalue()
+        last_id = _rowd(rows[-1]).get("id")        # DESC 序的最后一行 = 本批最小 id
+        if len(rows) < 500:
+            return
+
+
 # ---------------------------------------------------------------- 页面骨架
 ADMIN_CSS = """<style>
 .tabs{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0 14px}
@@ -1343,6 +1833,7 @@ ADMIN_CSS = """<style>
 .tabs a.on{background:var(--btn);border-color:var(--btn);color:#fff;font-weight:600}
 table{font-size:13px}
 th,td{padding:6px 8px}
+.alllink{float:right;font-size:12px;font-weight:400;color:var(--link)}
 .field{display:flex;flex-wrap:wrap;align-items:center;gap:6px 10px;padding:9px 0;
        border-bottom:1px solid var(--line2)}
 .field:last-child{border-bottom:0}
@@ -1987,6 +2478,57 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
                         secure=https_, samesite="lax")
         return resp
+
+    # ---------------- 列表子页：行数切换（切完回本子页带原筛选参数） ----------------
+    # 必须声明在 /admin/list/{slug} **之前**：否则 "rows" 会被当成 slug 吃掉。
+    @router.get("/admin/list/rows")
+    def admin_list_rows(request: Request, n: str = str(DEFAULT_ROWS), back: str = "",
+                        k: Optional[str] = None):
+        token = _auth(deps, request, k or None)
+        rows_n = normalize_rows(n)
+        # back 只接受本面板的子页路径（防开放跳转）；没有/不像 → 回记录页
+        target = back if back.startswith("/admin/list/") else \
+            f"/admin?tab=records&k={quote(str(token))}"
+        https_ = request.url.scheme == "https" or \
+            str(request.headers.get("x-forwarded-proto", "")).lower() == "https"
+        resp = RedirectResponse(target, status_code=302)
+        resp.set_cookie(ROWS_COOKIE, str(rows_n), max_age=365 * 86400,
+                        secure=https_, samesite="lax")
+        return resp
+
+    # ---------------- 列表子页（记录页每块「全部 ›」的落点） ----------------
+    @router.get("/admin/list/{slug}", response_class=HTMLResponse)
+    def admin_list_subpage(request: Request, slug: str, k: Optional[str] = None):
+        token = _auth(deps, request, k or None)
+        if slug not in _LIST_SUBPAGE_CFG:
+            raise HTTPException(404, "未知列表子页")
+        # ?n= 优先（行数切换链接会用），否则读 cookie，与主记录页同一口径
+        rows_n = normalize_rows(request.query_params.get("n")
+                                or request.cookies.get(ROWS_COOKIE))
+        body = render_list_subpage(deps, slug, rows_n, request.query_params)
+        return _subpage_page(token, slug, body,
+                             theme=normalize_theme(request.cookies.get(THEME_COOKIE)),
+                             rows_n=rows_n)
+
+    # ---------------- 列表子页：CSV 导出（同筛选全量流式） ----------------
+    @router.get("/admin/export")
+    def admin_export(request: Request, table: str = "", k: Optional[str] = None):
+        token = _auth(deps, request, k or None)
+        if table not in _LIST_SUBPAGE_CFG:
+            raise HTTPException(404, "未知导出表")
+        parsed = _subpage_parse(deps, table, request.query_params)
+        # 先探一次 DB（方法缺失/视图坏了在这里给 500 人话，别等流式响应中途断掉）
+        try:
+            deps.db.list_subpage_count(table, filters=parsed["filters"],
+                                       time_from=parsed["tf"], time_to=parsed["tt"])
+        except Exception as e:                                        # noqa: BLE001
+            logger.warning("[admin] CSV 导出 %s 失败：%s", table, e)
+            raise HTTPException(500, "导出失败（数据库读取异常），请稍后重试或查日志")
+        stamp = dt.datetime.now(engine.DISPLAY_TZ).strftime("%Y%m%d-%H%M%S")
+        headers = {"Content-Disposition": f"attachment; filename=cma-{table}-{stamp}.csv"}
+        return StreamingResponse(_csv_stream(deps, table, parsed["filters"],
+                                             parsed["tf"], parsed["tt"]),
+                                 media_type="text/csv; charset=utf-8", headers=headers)
 
     # ---------------- 旧地址兼容（302 到新位置，保持 ?k= 透传） ----------------
     @router.get("/hl", response_class=HTMLResponse)

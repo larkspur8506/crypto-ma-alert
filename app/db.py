@@ -897,6 +897,140 @@ class DB:
         r = self.conn.execute("SELECT sum(amount_usd) AS s FROM v_ledger").fetchone()
         return float(r["s"]) if r and r["s"] is not None else 0.0
 
+    # ---------------- 记录页列表子页（feat/list-subpages，纯只读） ----------------
+    #
+    # 六个列表子页（/admin/list/*）共用一张**白名单注册表**：可筛选字段、时间列、
+    # 排序键都只从这里拼 SQL —— 路由层传上来的键不在这张表里就被忽略（用户输入
+    # 永远走参数绑定，不拼进 SQL）。只读：不碰任何既有表结构与写入路径。
+    LIST_SUBPAGES: Dict[str, Dict[str, Any]] = {
+        # time_unit：时间列的存储单位（日期筛选边界由 admin_ui 按它换算好再传进来）。
+        # - hl_orders / hl_events / alert_logs 用 created_at（db.now()，秒）；
+        # - hl_fills 按「成交时间」筛（与展示列一致）：交易所历史行毫秒/秒混存，
+        #   沿用 v_ledger 同一条归一表达式（TS_MS_THRESHOLD 同源，不另立判据）；
+        # - positions.signal_bar_ms 是毫秒（4h bar 的 bar_open_ms）。
+        "orders": {"table": "hl_orders", "time_expr": "created_at", "time_unit": "s",
+                   "filters": ("coin", "purpose")},
+        "fills": {"table": "hl_fills",
+                  "time_expr": ("(CASE WHEN COALESCE(ts, created_at) > "
+                                f"{TS_MS_THRESHOLD:.0f} THEN COALESCE(ts, created_at) / 1000.0"
+                                " ELSE COALESCE(ts, created_at) END)"),
+                  "time_unit": "s", "filters": ("coin", "dir")},
+        "ledger": {"table": "v_ledger", "time_expr": "ts", "time_unit": "s",
+                   "filters": ("kind", "coin", "position_id")},
+        "events": {"table": "hl_events", "time_expr": "created_at", "time_unit": "s",
+                   "filters": ("kind",)},
+        "alerts": {"table": "alert_logs", "time_expr": "created_at", "time_unit": "s",
+                   "filters": ("kind",)},
+        "positions": {"table": "positions", "time_expr": "signal_bar_ms", "time_unit": "ms",
+                      "filters": ("symbol", "status")},
+    }
+
+    @classmethod
+    def _list_subpage_spec(cls, name: str) -> Dict[str, Any]:
+        spec = cls.LIST_SUBPAGES.get(str(name or ""))
+        if spec is None:
+            raise ValueError(f"未知列表子页：{name!r}")
+        return spec
+
+    @classmethod
+    def _list_subpage_where(cls, spec: Dict[str, Any], filters: Optional[Dict[str, Any]],
+                            time_from: Optional[float], time_to: Optional[float]) -> tuple:
+        """WHERE 子句拼装（字段白名单 + 参数绑定；日期边界已是时间列同单位的 epoch）。"""
+        where: List[str] = []
+        args: List[Any] = []
+        for key in spec["filters"]:
+            val = (filters or {}).get(key)
+            if val in (None, ""):
+                continue
+            where.append(f"{key} = ?")
+            args.append(val)
+        if time_from is not None:
+            where.append(f"{spec['time_expr']} >= ?")
+            args.append(time_from)
+        if time_to is not None:
+            where.append(f"{spec['time_expr']} <= ?")
+            args.append(time_to)
+        return where, args
+
+    @_locked
+    def list_subpage_rows(self, name: str, limit: int = 20, before: Optional[int] = None,
+                          after: Optional[int] = None, filters: Optional[Dict[str, Any]] = None,
+                          time_from: Optional[float] = None,
+                          time_to: Optional[float] = None) -> List[sqlite3.Row]:
+        """列表子页取数：id 游标分页（不 OFFSET），返回**展示序**（最新在前）。
+
+        游标稳定性：``before=<id>`` 取 id 更旧的紧邻一页、``after=<id>`` 取更新的
+        紧邻一页 —— 翻页期间插入新行（id 更大）只会出现在「更新」方向的最外侧，
+        已翻到的页内容不变（OFFSET 会整体漂移，spec 明令禁止）。
+        ``after`` 方向必须先正序取紧邻边界的 limit 行再反转：直接 DESC LIMIT 拿到
+        的是「全表最新的 limit 行」，中间插新行时页内容会跳变。
+
+        ``ledger`` 例外：余额列要**全量正序**预计算后再切片（复用 PR #53 口径，
+        见 app/hl/funding.running_balances），所以不做 SQL 级游标 —— 一次返回该
+        筛选条件下全量正序（ts ASC, ref ASC，与 hl_ledger_rows 同一条排序），
+        v_ledger 是「一生几百条」级别，一次读全表最省事；切片在 admin_ui 按
+        (ts, ref) 边界做，新流水只会追加在正序尾部，老页不受影响。
+        ``time_from`` / ``time_to``：时间列同单位的 epoch 边界（含端点）。
+        """
+        spec = self._list_subpage_spec(name)
+        where, args = self._list_subpage_where(spec, filters, time_from, time_to)
+        if name == "ledger":
+            sql = f"SELECT * FROM {spec['table']}"
+            if where:
+                sql += " WHERE " + " AND ".join(where)
+            sql += " ORDER BY ts ASC, ref ASC"
+            return list(self.conn.execute(sql, args))
+        if after is not None and before is None:
+            where.append("id > ?")
+            args.append(int(after))
+            sql = f"SELECT * FROM {spec['table']} WHERE " + " AND ".join(where)
+            rows = list(self.conn.execute(sql + " ORDER BY id ASC LIMIT ?",
+                                          [*args, int(limit)]))
+            rows.reverse()
+            return rows
+        if before is not None:
+            where.append("id < ?")
+            args.append(int(before))
+        sql = f"SELECT * FROM {spec['table']}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY id DESC LIMIT ?"
+        return list(self.conn.execute(sql, [*args, int(limit)]))
+
+    @_locked
+    def list_subpage_count(self, name: str, filters: Optional[Dict[str, Any]] = None,
+                           time_from: Optional[float] = None, time_to: Optional[float] = None,
+                           id_gte: Optional[int] = None, id_lte: Optional[int] = None) -> int:
+        """同筛选条件下 COUNT（页眉「共 Z 条」与「第 X–Y 条」的序号都用它）。
+
+        ``id_gte`` / ``id_lte``：算「某行在筛选结果里的最新序号」用 —— 序号 =
+        count(id >= 该行 id)，这样页眉数字与行内容永远同源（不靠 Python 数行数）。
+        """
+        spec = self._list_subpage_spec(name)
+        where, args = self._list_subpage_where(spec, filters, time_from, time_to)
+        if id_gte is not None:
+            where.append("id >= ?")
+            args.append(int(id_gte))
+        if id_lte is not None:
+            where.append("id <= ?")
+            args.append(int(id_lte))
+        sql = f"SELECT count(*) AS c FROM {spec['table']}"
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        r = self.conn.execute(sql, args).fetchone()
+        return int(r["c"]) if r else 0
+
+    @_locked
+    def list_subpage_options(self, name: str, key: str) -> List[str]:
+        """筛选下拉框的选项：该列的去重非空值（升序）。key 必须在该表白名单里。"""
+        spec = self._list_subpage_spec(name)
+        if key not in spec["filters"]:
+            raise ValueError(f"{name} 不支持筛选字段：{key!r}")
+        rows = self.conn.execute(
+            f"SELECT DISTINCT {key} AS v FROM {spec['table']} "
+            f"WHERE {key} IS NOT NULL AND {key} <> '' ORDER BY {key}").fetchall()
+        return [str(r["v"]) for r in rows]
+
     @_locked
     def prune_hl_telemetry(self, keep_days: float = 30.0, keep_events: int = 20000,
                            keep_snapshots: int = 20000) -> None:
