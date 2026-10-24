@@ -117,6 +117,14 @@ STRATEGY_KEYS: Tuple[Tuple[str, str, str, bool, str], ...] = (
      True, "ENABLE_LONG"),
     ("enable_shorts", "允许做空", "关掉后不再发做空信号（已有仓位不受影响，止损照常）",
      True, "ENABLE_SHORTS"),
+    # 空单风险减半（feat/short-risk-half）：与「允许做空」相邻 —— 它们都是「怎么对待
+    # 空单腿」的开关。倍率 0.5 写死在 app/sizing.py:SHORT_HALF_SCALE，这里不给输入框
+    # （可调系数会变成回测里的又一个拟合自由度）。只影响开仓规模，不动止损/离场。
+    ("short_risk_half", "空单风险减半",
+     "开启后做空每笔风险按 0.5 倍计算（风险U、名义、张数一起减半），多单不变；"
+     "只影响开仓，不影响已持仓（止损位、离场规则照旧）。"
+     "关 = 空单与多单一样按「单笔风险」全额下单",
+     False, "SHORT_RISK_HALF"),
     ("agent_expiry_cleanup", "到期前自动清仓（≤3 天）",
      "开 = API 快到期（剩余 3 天以内）时自动撤单平仓，避免到期后想平也平不了；"
      "关 = 只提醒不清仓（需要自己盯）", True, "AGENT_EXPIRY_CLEANUP"),
@@ -409,6 +417,21 @@ def effective_base(deps: AdminDeps, cfg: Any, payload: dict) -> Tuple[float, flo
     return live, eff, "跟随实时权益"
 
 
+def _risk_pair(equity: float, rp: float, half: bool) -> Tuple[float, float]:
+    """(多单风险U, 空单风险U)。开关关闭时两者相同 —— 唯一的折算入口是 sizing。"""
+    return equity * rp, equity * sizing.effective_risk_pct(rp, -1, half)
+
+
+def _risk_phrase(risk_u: float, risk_u_short: float, half: bool) -> str:
+    """「单笔风险」的白话：开关打开时**必须**区分多空，否则面板在骗人。
+
+    关闭时保持原来的一句话（逐字不变）；打开时两个数各写一次，不重复。
+    """
+    if half:
+        return f"单笔风险 多单 {risk_u:,.2f}U · 空单 {risk_u_short:,.2f}U"
+    return f"单笔风险 {risk_u:,.2f}U"
+
+
 def impact(cfg: Any, price: float, base: Optional[float] = None,
            *, equity: Optional[float] = None, risk_pct: Optional[float] = None,
            leverage: Optional[float] = None, stop_dist: Optional[float] = None
@@ -423,11 +446,19 @@ def impact(cfg: Any, price: float, base: Optional[float] = None,
     sd = stop_dist if stop_dist is not None else _num(getattr(cfg, "stop_min", 0.0))
     if price <= 0 or eq <= 0 or rp <= 0 or sd <= 0 or lev <= 0:
         return None
-    risk_u = eq * rp
+    # 空单风险减半（short_risk_half）开着时，空单的单笔风险只有一半 —— 预览行
+    # 必须把两个方向分开写，否则面板会告诉用户「单笔风险 20U」，而他真去开空
+    # 只有 10U（或反过来照着 20U 加仓 = 风险翻倍）。
+    short_half = bool(getattr(cfg, "short_risk_half", False))
+    risk_u, risk_u_short = _risk_pair(eq, rp, short_half)
     notional = risk_u / sd
+    notional_short = (risk_u_short / sd) if risk_u_short > 0 else 0.0
     return {"price": price, "equity": eq, "risk_pct": rp, "leverage": lev,
             "stop_dist": sd, "risk_u": risk_u, "notional": notional,
             "margin": notional / lev, "liq": sizing.liq_price(price, lev, 1),
+            # 空单口径（开关关闭时与多单完全相同）
+            "short_half": short_half, "risk_u_short": risk_u_short,
+            "notional_short": notional_short, "margin_short": notional_short / lev,
             # 做空参考（同参数镜像）：预览页给出两个方向的强平价，防误读
             "liq_short": sizing.liq_price(price, lev, -1)}
 
@@ -435,7 +466,15 @@ def impact(cfg: Any, price: float, base: Optional[float] = None,
 def _impact_line(d: Optional[dict]) -> str:
     if not d:
         return "影响预览：无法取价（等只读接口恢复后再算）"
-    return (f"按 BTC 现价 {d['price']:,.0f}：单笔风险 {d['risk_u']:.2f}U · "
+    if d.get("short_half"):
+        # 多空分开写：风险/名义/保证金各自一组，同一数字不重复
+        return (f"按 BTC 现价 {d['price']:,.0f}："
+                f"{_risk_phrase(d['risk_u'], d['risk_u_short'], True)} · "
+                f"名义 多 {d['notional']:,.0f}U/空 {d['notional_short']:,.0f}U · "
+                f"保证金 多 {d['margin']:,.0f}U/空 {d['margin_short']:,.0f}U · "
+                f"强平 多{d['liq']:,.0f}/空{d['liq_short']:,.0f}")
+    return (f"按 BTC 现价 {d['price']:,.0f}："
+            f"{_risk_phrase(d['risk_u'], d['risk_u_short'], False)} · "
             f"名义 {d['notional']:,.0f}U · 保证金 {d['margin']:,.0f}U · "
             f"强平 多{d['liq']:,.0f}/空{d['liq_short']:,.0f}")
 
@@ -505,8 +544,11 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
                   imp: Optional[dict], imp_max: Optional[dict]) -> str:
     """每项旁的一行小字：这个字段改动能带来什么变化（按当前值实算，不靠猜）。"""
     if key == "equity":
-        return f"仅「固定基数」模式用：基数 {_num(getattr(cfg, 'equity', 0)):,.0f}U → 单笔风险 " \
-               f"{_num(getattr(cfg, 'equity', 0)) * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
+        eq_v = _num(getattr(cfg, "equity", 0))
+        return f"仅「固定基数」模式用：基数 {eq_v:,.0f}U → " + _risk_phrase(
+            *_risk_pair(eq_v, _num(getattr(cfg, "risk_pct", 0)),
+                        bool(getattr(cfg, "short_risk_half", False))),
+            bool(getattr(cfg, "short_risk_half", False)))
     if key == "equity_mode":
         mode = str(getattr(cfg, "equity_mode", "follow") or "follow")
         if mode == "fixed":
@@ -517,8 +559,10 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
     if key == "equity_min":
         return f"仅「跟随实时权益」模式用：基数不低于 {_num(getattr(cfg, 'equity_min', 0)):,.0f}U"
     if key == "risk_pct":
-        return f"{_num(getattr(cfg, 'risk_pct', 0)) * 100:.2f}% × 基数 {base:,.0f}U = 单笔风险 " \
-               f"{base * _num(getattr(cfg, 'risk_pct', 0)):,.2f}U"
+        rp_v = _num(getattr(cfg, "risk_pct", 0))
+        half = bool(getattr(cfg, "short_risk_half", False))
+        return f"{rp_v * 100:.2f}% × 基数 {base:,.0f}U = " + \
+            _risk_phrase(*_risk_pair(base, rp_v, half), half)
     if key == "leverage":
         lev = _num(getattr(cfg, 'leverage', 5))
         if imp:
@@ -1652,6 +1696,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
     def admin_switch_strategy(request: Request,
                               enable_long: Optional[str] = Form(None),
                               enable_shorts: Optional[str] = Form(None),
+                              short_risk_half: Optional[str] = Form(None),
                               agent_expiry_cleanup: Optional[str] = Form(None),
                               hl_pnl_from_fills: Optional[str] = Form(None),
                               hl_fill_close: Optional[str] = Form(None),
@@ -1671,12 +1716,16 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         """
         token = _auth(deps, request, k or None)
         raw_vals = {"enable_long": enable_long, "enable_shorts": enable_shorts,
+                    "short_risk_half": short_risk_half,
                     "agent_expiry_cleanup": agent_expiry_cleanup,
                     "hl_pnl_from_fills": hl_pnl_from_fills,
                     "hl_fill_close": hl_fill_close,
                     "hl_close_grace": hl_close_grace,
                     "hl_kill_autoclear": hl_kill_autoclear,
                     "hl_dd_guard": hl_dd_guard}
+        # 空单风险减半的**旧值**（写事件时要「旧→新」，不能只记新值：事后复盘要能
+        # 回答「这笔空单是减半前后哪一档开的」，只有新值答不了）。
+        old_half = bool(getattr(deps.config_fn(), "short_risk_half", False))
         # 到期自动清仓沿用旧 _cleanup_on 的 **fail-open**（识别不了的值按「开」）：
         # 漏清仓的代价是到期后仓位想平也平不了，误开只是可能提前平一笔。方向开关
         # 没有这种不对称，走普通 _flag（严格 1/true/yes/on/y/t 才是开）。
@@ -1704,7 +1753,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         deps.log_event("decision",
                        "面板修改策略与保护（做多=%s · 做空=%s · 到期自动清仓=%s · 净额流水口径=%s"
                        " · 交易所已平仓自动关账=%s · 证据不足先进宽限=%s · 对账异常可自动恢复=%s"
-                       " · 回撤熔断=%s%s）"
+                       " · 回撤熔断=%s%s%s）"
                        % (word[vals["enable_long"]] if "enable_long" in vals else "不变",
                           word[vals["enable_shorts"]] if "enable_shorts" in vals else "不变",
                           word[vals["agent_expiry_cleanup"]]
@@ -1718,6 +1767,9 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                           word[vals["hl_kill_autoclear"]]
                           if "hl_kill_autoclear" in vals else "不变",
                           word[vals["hl_dd_guard"]] if "hl_dd_guard" in vals else "不变",
+                          (f" · 空单风险减半={word[1] if old_half else word[0]}→"
+                           f"{word[vals['short_risk_half']]}")
+                          if "short_risk_half" in vals else "",
                           (" · 阈值 " + " / ".join(
                               f"{k.replace('hl_dd_', '').replace('_pct', '')}={vals[k]:g}"
                               for k in ("hl_dd_warn_pct", "hl_dd_kill_pct") if k in vals))

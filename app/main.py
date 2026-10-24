@@ -123,6 +123,10 @@ def hl_params():
         coin_map=coin_map,
         leverage=cfg.leverage,
         risk_pct=cfg.risk_pct,
+        # 空单风险减半：DB > env > 默认关（Config 已解析好布尔位，缺键/脏值都退回
+        # 「关」= 现状）。与 pnl_from_fills / fill_close 同一种「从面板配置读布尔」
+        # 的装配模式，只是默认方向相反：这是新增的风险政策，默认必须维持原行为。
+        short_risk_half=bool(getattr(cfg, "short_risk_half", False)),
         equity=cfg.equity,
         # 口径 DB > env > 代码默认：Config 已解析好，不要再单独读 env（否则 DB 值会被 env 压掉）
         equity_mode=str(getattr(cfg, "equity_mode", "follow") or "follow"),
@@ -776,6 +780,10 @@ def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLRe
                 f"张数 {(row['actual_contracts'] if row['actual_contracts'] is not None else row['contracts']):g}）。</p>")
     cur_entry = posfields.entry_px(row) if editing else row["entry_price"]
     cur_stop = posfields.stop_px(row) if editing else row["stop_price"]
+    # 双口径判定（app/posfields.py）：**一行一判**，下面五处（张数回退、金额换算
+    # 禁用、币量标签、提示语）都依赖它。缺了这行 = 任何 pending 行/修改页直接
+    # NameError 500（2026-10-24 审查 B1 实锤：这行在 c950bdc 收敛时被顺手删了）。
+    _is_hl = posfields.is_hl(row)
     cur_qty = posfields.qty(row) if editing else (posfields.contracts_raw(row)
                                                   if not _is_hl else posfields.qty(row))
     edit_flag = "<input type='hidden' name='edit' value='1'>" if editing else ""
@@ -801,12 +809,16 @@ def _entry_form(row, pid: int, editing: bool, request: Request = None) -> HTMLRe
                         f"（{row['stop_dist'] * 100:.2f}%）\n")
     else:
         real_line = ""
+        # 目标风险的百分比必须是**生效后**的比例（空单风险减半开着时 = risk_pct/2），
+        # 否则确认页会拿 2% 去对一个本该 1% 的空单，用户照着加仓就是风险翻倍。
+        _rp = sizing.effective_risk_pct(cfg.risk_pct, row["side"] or 1,
+                                        getattr(cfg, "short_risk_half", False))
         suggest_line = (
             f"建议入场：<b>{row['entry_price']:,.2f}</b>｜止损：<b>{row['stop_price']:,.2f}</b>"
             f"{stop_hint}（{row['stop_dist'] * 100:.2f}%）<br>\n"
             f"      建议张数：<b>{row['contracts']}</b> 张｜名义 <b>{row['notional']:,.0f} USDT</b>｜\n"
-            f"      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {cfg.risk_pct * 100:.0f}% =\n"
-            f"      {cfg.equity * cfg.risk_pct:.1f}U）\n")
+            f"      风险 {row['risk_u']:.1f}U（目标 {cfg.equity:,.0f}U × {_rp * 100:.0f}% =\n"
+            f"      {cfg.equity * _rp:.1f}U）\n")
     body = f"""
     <h1>{title}</h1>
     <div class='card'>
@@ -1013,9 +1025,13 @@ async def confirm_post(pid: int, request: Request):
         # MEXC 行是建行时的配置 equity），不再拿当前配置值硬套 —— 否则 HL 仓
         # 真实基数 100U 会被按配置 1000U 读成 0.2%。
         _eq_base = posfields.equity_base(row, current_config().equity)
+        # 目标风险用**这行建行时**的计划风险（row["risk_u"]），不用当前 cfg × 当前开关
+        # 现算：开关在建行与确认之间可能被切换，现算会把一笔按旧政策下的单判成
+        # 「偏离 +102% / -50%」并反向建议（开双倍 / 砍一半）—— 见 review_fill 文档。
         rev = engine.review_fill(current_config(), row["symbol"], row["entry_price"],
                                  row["contracts"], entry, stop, qty, source,
-                                 equity=_eq_base)
+                                 equity=_eq_base, side=row["side"],
+                                 target_risk_u=row["risk_u"])
         src_txt = (f"按成交金额 {float(raw_amount):,.2f}U ÷ ({entry:,.2f} × 面值) 换算"
                    if source == "amount" else "按你填的张数")
         warn = "" if placed else "<p class='bad'>⚠️ 未挂止损单，这笔的风险不受保护</p>"
