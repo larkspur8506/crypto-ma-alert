@@ -72,6 +72,10 @@ def overview_payload(**over) -> dict:
         "network": {"base_url": "https://api.hyperliquid.xyz", "testnet": False,
                     "latency_ms": 12.0, "reachable": True},
         "positions": [], "orders_open": [], "fills": [], "signals": [],
+        # P2：三标的卡也承载「数据源健康/已处理到」内容（fail-closed 脚注在卡图例里），
+        # 给一行 symbol_state 让该卡渲染出来
+        "symbol_state": [{"symbol": "BTC_USDT", "coin": "BTC", "price": 100.0,
+                          "updated_at": NOW}],
         "curve": {},
     }
     p.update(over)
@@ -95,15 +99,14 @@ class TestOverviewLegends(unittest.TestCase):
     def test_system_legend_visible(self):
         frag = f'<div class="legend">{LEGEND_SYSTEM}</div>'
         self.assertIn(frag, self.html)
-        # 在系统卡内、数据源健康之前
+        # 在系统卡内（P2：「数据源健康」表已合并进三标的卡，不存在于本页）
         self.assertLess(self.html.index("<h2>系统</h2>"), self.html.index(frag))
-        self.assertLess(self.html.index(frag), self.html.index("数据源健康"))
+        self.assertNotIn("数据源健康", self.html)
 
     def test_feed_legend_visible(self):
-        frag = f'<div class="legend">{LEGEND_FEED}</div>'
-        self.assertIn(frag, self.html)
-        # 在数据源健康表之后（表头 title 仍在，作桌面增强）
-        self.assertLess(self.html.index("数据源健康"), self.html.index(frag))
+        # P2 合并：fail-closed 口径脚注随数据源小字行搬进「三标的动态」卡图例
+        self.assertIn(LEGEND_FEED, self.html)
+        self.assertLess(self.html.index("三标的动态"), self.html.index(LEGEND_FEED))
 
     def test_margin_legacy_term_not_in_visible_text(self):
         """豁免：剥掉所有 title 后，「已用保证金」不得出现在可见文本里。"""

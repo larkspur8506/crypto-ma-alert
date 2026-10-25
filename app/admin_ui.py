@@ -1333,8 +1333,10 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
 
     # ---- 提醒日志 ----
     # P1 降噪：先过滤后取数（铁律 8——标题行数必须等于实际渲染行数）。心跳类占比高，
-    # 直接取 n 条再滤会「最近 20 条渲染 3 行」；这里取 6 倍大池过滤后再切 n。
-    _alert_pool = _rows(deps, "recent_alerts", max(n * 6, 60))
+    # 直接取 n 条再滤会「最近 20 条渲染 3 行」。P2 把池扩到 max(n*6, 2000)：
+    # 例行行 24 条/小时滚 120 条只盖约 5 小时，真实事件（decision/告警/下单）几乎
+    # 永远在池外、主页恒空态；SQLite 本地读 2000 行开销可忽略。
+    _alert_pool = _rows(deps, "recent_alerts", max(n * 6, 2000))
     _alert_raw_n = len(_alert_pool)
     _alert_rows = [r for r in _alert_pool
                    if str(r.get("kind") or "") not in _ALERT_NOISE_KINDS][:n]
@@ -1373,8 +1375,10 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
 
     # ---- 执行器事件 ----
     # P1 降噪：主页隐藏「心跳」与「对账一致」两类例行行（对账异常/升级照常显示）；
-    # 子页不过滤。同样是先过滤后取数（铁律 8）。
-    _event_pool = _rows(deps, "hl_recent_events", max(n * 6, 60))
+    # 子页不过滤。同样是先过滤后取数（铁律 8）。P2 池扩到 max(n*6, 2000)，
+    # 与提醒日志同一修法（hl_events 例行行 24 条/小时，120 只盖约 5 小时；
+    # 30 天 prune 后量级约 1.7 万行，2000 取的是最近约 3.5 天）。
+    _event_pool = _rows(deps, "hl_recent_events", max(n * 6, 2000))
     _event_raw_n = len(_event_pool)
     _event_rows = [r for r in _event_pool
                    if not (str(r.get("kind") or "") == "heartbeat"

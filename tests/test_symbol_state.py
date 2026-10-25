@@ -184,7 +184,9 @@ class TestRenderBlock(unittest.TestCase):
         if os.environ.get("DISPLAY_TZ_OFFSET", "8").strip() in ("8", "8.0", ""):
             self.assertIn("行情 16:53 ·", html)   # 1760000000 = 2025-10-09 08:53:20 UTC = 北京 16:53
         # 位置：总览页最顶部 —— tabs 之后第一个区块，在「账户」卡片之前
-        self.assertLess(html.index("三标的动态"), html.index("账户"))
+        # （P2 起 <style> 的注释里也有「账户」二字，锚点必须钉在卡片 sec 头上）
+        self.assertLess(html.index("三标的动态"),
+                        html.index("<div class='sec'>账户</div>"))
         self.assertLess(html.index("<h1>Hyperliquid 执行器监控</h1>"), html.index("三标的动态"))
         self.assertLess(html.index("三标的动态"), html.index("<h2>仓位</h2>"))
         self.assertLess(html.index("三标的动态"), html.index("<h2>交易所挂单</h2>"))
@@ -262,12 +264,14 @@ class TestRenderBlock(unittest.TestCase):
         # 手机（iOS Safari 无 title 悬停）唯一能看到 ①②③ 口径的地方 → 必须是可见文字
         # 注意：CSS 里也有 .sym-legend（在 <head>），所以用 div 标签定位，别用裸类名
         html = self.render([self.row()])
-        # 面板合并后只剩一条脚注：原「为什么没开仓」的「信号 / 闸门」口径并进同一句
+        # 面板合并后只剩一条脚注：原「为什么没开仓」的「信号 / 闸门」口径并进同一句；
+        # P2 再并入原「数据源健康」的 fail-closed 口径（随数据源小字行搬进本卡图例）
         legend = ('<div class="sym-legend">① 离场按 4h 收盘判定 · '
                   '② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空 · '
                   '信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）· '
                   '闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），'
-                  '只影响「什么时候动手」，不改变信号本身；闸门正常时不显示</div>')
+                  '只影响「什么时候动手」，不改变信号本身；闸门正常时不显示 · '
+                  '信号源固定 hl-candle（fail-closed：源失败即跳过本轮，不换源）</div>')
         self.assertIn(legend, html)
         # 图例在 grid 之后、区块 card 收尾之前（即仍在「三标的动态」区块内）
         mark = '<div class="sym-legend">'

@@ -765,9 +765,10 @@ class TestWithdrawableDisplay(BaseCase):
                      "equity_total": 100.471124})
         self.info._snap = snap
         html = self._html()
-        # 精简后的口径：标签短、手续费后缀、口径细节在 title 悬停
+        # 精简后的口径：标签短、手续费后缀、口径细节在 title 悬停（P2 后顶层三数之一）
         self.assertIn("可提余额", html)
-        self.assertIn("100.47 U（提现收 1U 手续费）", html)
+        self.assertIn("100.47 U", html)
+        self.assertIn("（提现收 1U 手续费）", html)
         self.assertIn("统一账户下的实际可提", html)
         # 2026-10-15：一行说清「资金分布（统一账户）」，去掉看不懂的「永续口径」，
         # 且合约侧占用与「已用保证金」合并（不再重复一列）

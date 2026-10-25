@@ -32,7 +32,6 @@ except ImportError:                       # pragma: no cover - CI 里必然已�
 
 FIXED_NOW = 1760000000.0          # 2025-10-09 15:33:20 UTC
 
-FEED_TITLE = "信号源固定 hl-candle（fail-closed）"
 CLOSED_PNL_TITLE = "交易所 closedPnl 口径，未扣手续费与资金费"
 STUCK_TITLE = "持续 3 分钟未推进才计入"
 
@@ -113,11 +112,16 @@ class PanelFieldsBase(unittest.TestCase):
 # ---------------------------------------------------------------- 1. 资金费符号
 class TestFundingSign(PanelFieldsBase):
     def test_short_receiving_renders_positive(self):
-        """空头收钱（sinceOpen=-0.02）在面板上必须显示 +0.02（收入），不是支出。"""
+        """空头收钱（sinceOpen=-0.02）在面板上必须显示 +0.02（收入），不是支出。
+
+        P2 消重后账户卡的「资金费」聚合行已删除，收付视角由仓位表
+        「本单资金费」列唯一承载（每仓一份，不再同屏第二遍）。
+        """
         html = self.html()
-        self.assertIn("资金费（持仓期内，正=收入）", html)
+        self.assertIn("本单资金费", html)          # 列还在（仓位表唯一承载）
         self.assertIn(">+0.02 U<", html)
         self.assertNotIn(">-0.02 U<", html)
+        self.assertNotIn("资金费（持仓期内", html)  # 账户卡聚合行已删（P2 消重）
 
     def test_paying_funding_renders_negative(self):
         """付出资金费（sinceOpen=+0.03）→ 面板显示 -0.03。"""
@@ -155,12 +159,15 @@ class TestFeeLabel(PanelFieldsBase):
 
 # ---------------------------------------------------------------- 3/4. 表头
 class TestTableHeaders(PanelFieldsBase):
-    def test_feed_table_header_is_status_with_title(self):
-        self.db.mark_feed("BTC_USDT", "hl-candle", True)
+    def test_feed_status_merged_into_symbol_card(self):
+        """P2 合并：数据源健康表已删，每标的的数据源行进「三标的动态」卡。"""
+        self.db.mark_feed("BTC_USDT", "binance", True)
+        self.db.set_symbol_state("BTC_USDT", price=100.0)   # 让三标的卡渲染出该标的
         html = self.html()
-        self.assertIn(f"<th title='{FEED_TITLE}'>状态</th>", html)
-        self.assertNotIn("<th>来源</th>", html)
-        self.assertIn("正常", html)               # 格子里仍是 正常/失败
+        self.assertIn("数据源 binance 正常", html)
+        # 旧表整块删除（不是折叠）：两个区块标题整页 0 处
+        self.assertNotIn("数据源健康", html)
+        self.assertNotIn("<div class='sec'>已处理到</div>", html)
 
     def test_orders_table_last_header_is_time(self):
         html = self.html()
@@ -192,8 +199,9 @@ class TestCaliberTitles(PanelFieldsBase):
         html = self.html()
         self.assertEqual(html.count(f"title='{CLOSED_PNL_TITLE}'"), 2)   # 今日 + 累计
         self.assertIn(f"title='{STUCK_TITLE}'", html)
-        self.assertIn(">今日已实现<", html)
-        self.assertIn(">累计已实现<", html)
+        # P2 分层后「今日/累计已实现」仍是账户卡的可见词面（今日在次级行、累计在顶层）
+        self.assertIn("今日已实现", html)
+        self.assertIn("累计已实现", html)
         self.assertIn("卡在 intent/sent 的下单", html)
 
 
