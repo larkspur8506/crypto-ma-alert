@@ -558,13 +558,19 @@ class TestPanelRender(BaseDb):
     def test_four_numbers_visible(self):
         meta = self.payload["curve"]["meta"]
         self.assertAlmostEqual(meta["pnl_total"], -15.28, places=2)
+        # P1：span=all 时摘要行四个数字与 curve.meta 的全期口径逐字一致
+        # （曲线首点 pnl=0、指数=100，窗口差值 == 全期值，同一事实一种写法）。
+        html = self.client.get("/hl?span=all").text
         line = (f"累计盈亏 {meta['pnl_total']:+,.2f}U · 净入金 {meta['net_deposit']:,.2f}U · "
-                f"最大回撤 {meta['max_dd_pnl']:,.2f}U · 收益指数 "
-                f"{meta['twr_total_pct']:+.2f}%（起点 100）")
-        self.assertIn(line, self.html)
+                f"最大回撤 {meta['max_dd_pnl']:,.2f}U · 收益指数（区间） "
+                f"{meta['twr_total_pct']:+.2f}%")
+        self.assertIn(line, html)
+        self.assertIn("全部口径：" + line, html)
         # 关键数字本身也在（防止格式串写错后「看着有、其实没有」）
-        self.assertIn("累计盈亏 -15.28U", self.html)
-        self.assertIn("净入金 1,002.59U", self.html)
+        self.assertIn("累计盈亏 -15.28U", html)
+        self.assertIn("净入金 1,002.59U", html)
+        # 「全部」受快照保留期限制，图例必须写明（P1 规格铁律 5）
+        self.assertIn("快照保留约 30 天，更早数据已清理", html)
 
     def test_svg_has_pnl_and_twr_polylines_and_right_axis(self):
         self.assertIn("<polyline", self.html)

@@ -163,7 +163,8 @@ class TestEventsNotOnOverview(BaseCase):
         self.assertNotIn("执行器事件", ov, "总览不该再有执行器事件（与记录页重复）")
         self.assertNotIn("人工切换执行器模式", ov)
         rec = self.body(tab="records")
-        self.assertIn("执行器事件（hl_events · 最近 20 条）", rec)
+        # P1 降噪后标题行数 = 实际渲染行数（铁律 8）：只有 1 条非常规事件就写 1。
+        self.assertIn("执行器事件（hl_events · 最近 1 条）", rec)
         self.assertIn("人工切换执行器模式", rec)
 
 
@@ -174,10 +175,16 @@ class TestAlertKindLabels(BaseCase):
         self.db.log_alert("BTC_USDT", BAR, "exit", "BTC_USDT 离场成交", True)
         html = self.body(tab="records")
         self.assertIn("执行器成交回报", html)
-        self.assertIn("心跳（静默）", html)
+        # P1 降噪：心跳类在记录页主页隐藏（显示中文「心跳（静默）」的行不再出现），
+        # 全部记录（含心跳）在 /admin/list/alerts 子页仍可见。
+        self.assertNotIn("心跳（静默）", html)
         self.assertIn("离场提醒", html)
         self.assertNotIn("exec_alert_fills", html)
-        self.assertNotIn("heartbeat_local", html)
+        sub = self.client.get("/admin/list/alerts", params={"k": TOKEN}).text
+        self.assertIn("心跳（静默）", sub, "子页必须保留心跳行（降噪只作用于主页）")
+        self.assertIn("离场提醒", sub)
+        # 子页的类型筛选下拉会带原始 kind 值（option value），状态单元格不能是原文
+        self.assertNotIn("<td>heartbeat_local<", sub)
 
     def test_unknown_kind_falls_back_to_raw(self):
         self.db.log_alert(None, None, "brand_new_kind", "新类型", True)

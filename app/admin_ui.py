@@ -75,6 +75,15 @@ _ALERT_KIND_TXT = {
     "agent_expiry_cleanup": "API 到期自动清仓（旧）",
 }
 
+# 记录页「主页」要隐藏的例行行（P1 降噪，用户要求：主页只看真实提醒/异常）。
+# 心跳两类（每小时推送 + 本地静默）会淹没真实提醒；子页 /admin/list/alerts 不过滤
+# （全部可看），所以这里只影响 render_records 的取数切片，不碰 DB 层。
+_ALERT_NOISE_KINDS = ("heartbeat", "heartbeat_local")
+
+# 执行器事件里同样属例行行的：心跳；「对账一致」是每小时一次的正常回执（reconcile
+# kind 下其余消息都是异常/升级/观察期，必须照常显示），只按消息原文精确匹配。
+_RECONCILE_OK_MSG = "对账一致"
+
 # 回填标记：2026-10-15 之前执行器推送不落 alert_logs，历史推送由 hl_events 回填，
 # message 一律以此前缀开头（面板据此提示口径，也便于一键回滚）。
 BACKFILL_PREFIX = "[回填] "
@@ -1177,6 +1186,18 @@ def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
         notes.append("无持仓期资金费" if r.get("kind") == "funding" else "未归属")
     ref = str(r.get("ref") or "")
     tail = ref[-14:] if ref.startswith("fund:") else ref[:10]
+    # 币名去重（P1 词面修复）：fund 组合键 ref 形如 "t(ms)|BTC|+0.009152"，截尾后
+    # 备注会渲染成 "BTC · |BTC|+0.009152" —— 币名已在备注开头，把尾部的 "|币名"
+    # 段剥掉，只留数量。hash 类 ref 不含 "|币名|"，原样保留。
+    _coin_txt = str(r.get("coin") or "").strip()
+    if tail and _coin_txt:
+        if tail.startswith(f"|{_coin_txt}|"):
+            tail = tail[len(_coin_txt) + 2:]
+        elif tail.startswith(f"{_coin_txt}|"):
+            tail = tail[len(_coin_txt) + 1:]
+        elif f"|{_coin_txt}|" in tail:
+            # 截尾落在组合键中段（带了一截时间戳）时同样剥掉前段，只留数量。
+            tail = tail.split(f"|{_coin_txt}|", 1)[1]
     if tail and tail != "fund:":
         notes.append(_esc(tail))
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
@@ -1310,9 +1331,21 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                f"{_all_link('positions', _token_of(deps))}</div></div>")
 
     # ---- 提醒日志 ----
-    o.append(f"<div class='card'><div class='sec'>提醒日志（alert_logs · 最近 {n} 条）"
+    # P1 降噪：先过滤后取数（铁律 8——标题行数必须等于实际渲染行数）。心跳类占比高，
+    # 直接取 n 条再滤会「最近 20 条渲染 3 行」；这里取 6 倍大池过滤后再切 n。
+    _alert_pool = _rows(deps, "recent_alerts", max(n * 6, 60))
+    _alert_raw_n = len(_alert_pool)
+    _alert_rows = [r for r in _alert_pool
+                   if str(r.get("kind") or "") not in _ALERT_NOISE_KINDS][:n]
+    _shown_n = len(_alert_rows)
+    _alert_title = (f"提醒日志（alert_logs · 最近 {_shown_n} 条）" if _shown_n
+                    else "提醒日志（alert_logs）")
+    o.append(f"<div class='card'><div class='sec'>{_alert_title}"
              f"{_all_link('alerts', _token_of(deps))}</div>")
-    _alert_rows = _rows(deps, "recent_alerts", n)
+    # 口径落可见文字：主页滤掉了什么、去哪看全部，必须写出来而不是让人猜少了行。
+    # （措辞避开「全部 ›」字面 —— 那是 _all_link 的专属词，测试按出现次数数链接。）
+    o.append("<div class='hint'>主页已隐藏心跳类例行行（推送/静默）；"
+             "全部记录（含心跳）见「全部」子页。</div>")
     _backfilled = sum(1 for r in _alert_rows
                       if str(r.get("message") or "").startswith(BACKFILL_PREFIX))
     if _backfilled:
@@ -1330,23 +1363,42 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                  f"<td><span class='{'pos' if ok else 'neg'}'>"
                  f"{'已送达' if ok else '失败'}</span></td>"
                  f"<td>{_msg_cell(msg)}</td></tr>")
+    # 空表文案区分「真没有」和「被滤光了」：不让人误以为系统没在跑。
+    _alert_empty = ("暂无提醒日志" if _alert_raw_n == 0
+                    else "该时间窗内只有心跳类例行记录")
     o.append(_table("<th>时间</th><th>类型</th><th>标的</th><th>状态</th><th>内容</th>",
-                    rows, "暂无提醒日志", 5))
+                    rows, _alert_empty, 5))
     o.append("</div>")
 
     # ---- 执行器事件 ----
-    o.append(f"<div class='card'><div class='sec'>执行器事件（hl_events · 最近 {n} 条）"
+    # P1 降噪：主页隐藏「心跳」与「对账一致」两类例行行（对账异常/升级照常显示）；
+    # 子页不过滤。同样是先过滤后取数（铁律 8）。
+    _event_pool = _rows(deps, "hl_recent_events", max(n * 6, 60))
+    _event_raw_n = len(_event_pool)
+    _event_rows = [r for r in _event_pool
+                   if not (str(r.get("kind") or "") == "heartbeat"
+                           or (str(r.get("kind") or "") == "reconcile"
+                               and str(r.get("message") or "").strip() == _RECONCILE_OK_MSG))][:n]
+    _shown_n = len(_event_rows)
+    _event_title = (f"执行器事件（hl_events · 最近 {_shown_n} 条）" if _shown_n
+                    else "执行器事件（hl_events）")
+    o.append(f"<div class='card'><div class='sec'>{_event_title}"
              f"{_all_link('events', _token_of(deps))}</div>")
+    o.append("<div class='hint'>主页已隐藏「心跳」与「对账一致」例行行；"
+             "异常 / 决策 / 下单照常显示，全部事件见「全部」子页。</div>")
     rows = ""
-    for r in _rows(deps, "hl_recent_events", n):
+    for r in _event_rows:
         kind = str(r.get("kind") or "—")
         msg = str(r.get("message") or "")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_EV_TXT.get(kind, kind))}</td>"
                  f"<td>{_esc(r.get('symbol') or '—')}</td>"
                  f"<td>{_msg_cell(msg)}</td></tr>")
+    # 空表文案区分「真没有」和「被滤光了」。
+    _event_empty = ("暂无执行器事件" if _event_raw_n == 0
+                    else "该时间窗内只有心跳 / 对账一致例行行")
     o.append(_table("<th>时间</th><th>类型</th><th>标的</th><th>内容</th>",
-                    rows, "暂无执行器事件", 4))
+                    rows, _event_empty, 4))
     o.append("</div>")
     return "".join(o)
 
