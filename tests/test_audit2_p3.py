@@ -90,7 +90,8 @@ class TestViewsDisplay(unittest.TestCase):
     def test_withdrawable_copy(self):
         from app.hl import views
         src = open(views.__file__, encoding="utf-8").read()
-        self.assertIn("可提余额\", f\"{_fmt(avail)} U（提现收 1U 手续费）\"", src)
+        # P2 分层后「可提余额」进顶层三数；口径与后缀逐字保留（统一账户路径）
+        self.assertIn("wd_html = f\"{_fmt(avail)} U<span class='muted'>（提现收 1U 手续费）</span>\"", src)
         self.assertNotIn("可提余额（现货口径，已扣占用，提现固定扣 1U）", src)
         # 2026-10-15 用户反馈：口径名「永续口径」是黑话、且与「已用保证金」重复 →
         # 改成一行「资金分布（统一账户）现货 X · 合约占用 Y」，统一账户下不再单列保证金
