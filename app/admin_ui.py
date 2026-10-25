@@ -44,6 +44,7 @@ from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
                         _ST_TXT, _disp, _fee_quoted, _fmt_sz, _kv, _render_body,
+                        normalize_span,
                         _signals_html, normalize_rows, status_payload)
 from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
                           theme_attr, theme_switch_html)
@@ -2221,6 +2222,11 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
         rows_n = normalize_rows(request.query_params.get("n")
                                 or request.cookies.get(ROWS_COOKIE))
         payload = get_payload(deps)
+        # 盈亏曲线时间窗（P1）：总览复用 views._render_body，它从 payload 读
+        # curve_span / admin_k —— 不在这里注入的话 span 参数被静默忽略（恒 7 天）、
+        # 切换链接缺 k（无 cookie 深链 401，PR #54 同款）。
+        payload["curve_span"] = normalize_span(request.query_params.get("span"))
+        payload["admin_k"] = str(k or "")
         # 注：payload["rows"] 已删除（2026-10-18）—— 总览不再有长表切片，唯一消费者
         # views._render_body 的两张表搬到了记录页，记录页直接用 rows_n 走 DB 取数。
         strip = _status_strip(payload)

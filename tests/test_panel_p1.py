@@ -238,10 +238,21 @@ class TestCurveSpan(BaseCase):
         html = self.hl(span="30", k="sek", refresh=10)
         self.assertNotIn("<script", html.lower(), "时间切换必须是纯链接（零 JS）")
         for val in ("7", "30", "all"):
-            self.assertIn(f"href='/hl?span={val}&refresh=10&k=sek'", html,
-                          "链接必须带回 k 与 refresh（PR #54 教训）")
+            self.assertIn(f"href='/admin?tab=overview&span={val}&refresh=10&k=sek'", html,
+                          "链接必须指向面板单一入口并带回 k 与 refresh（PR #54 教训）")
         self.assertIn("✅ 近 30 天", html, "当前项要标 ✅")
         self.assertNotIn("✅ 近 7 天", html)
+
+    def test_admin_overview_honors_span_and_links(self):
+        # 主线程复核补的集成用例：总览在 /admin 渲染，span 必须由 /admin 路由注入。
+        # 缺这个的话 ?span= 被静默忽略（恒 7 天）、链接还会跳出面板落到 /hl 旧页。
+        self.assertIn("近 6 天（4 个快照）", self.admin(tab="overview"), "缺参回落 7 天窗")
+        html30 = self.admin(tab="overview", span="30")
+        self.assertIn("近 18 天（5 个快照）", html30, "span=30 在 /admin 上必须生效")
+        self.assertIn("净入金 1,002.59U", html30, "摘要行随窗口重算")
+        # 链接留在面板内并带回 k（无 cookie 深链也不 401）。
+        self.assertIn("href='/admin?tab=overview&span=all&k=", html30)
+        self.assertIn("✅ 近 30 天", html30)
 
     def test_dd_line_unchanged_by_span(self):
         # 「策略回撤」行是 hl_dd_state 峰值口径，不随 span 变（规格明令不动）。

@@ -1712,13 +1712,14 @@ def _span_links(cur: str, k: str = "", refresh: int = 0) -> str:
     """盈亏曲线时间窗切换链接（P1 功能二，零 JS 纯 <a>）。
 
     当前项标 ✅ 并用高亮 btn；k 与 refresh 原样带回 —— PR #54 的教训：深链路由
-    丢 k 会 401，这里所有链接都必须带全参数。
+    丢 k 会 401，这里所有链接都必须带全参数。链接统一指向 /admin?tab=overview：
+    面板已合并为单一入口，在 /hl 旧页点上也会回到面板，不再各自为政。
     """
     cur = normalize_span(cur)
     q = quote(str(k or ""), safe="")
     parts: List[str] = []
     for val, label in SPAN_CHOICES:
-        href = f"/hl?span={val}"
+        href = f"/admin?tab=overview&span={val}"
         if refresh:
             href += f"&refresh={int(refresh)}"
         if q:
