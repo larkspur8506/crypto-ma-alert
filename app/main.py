@@ -321,7 +321,10 @@ def _retry_failed_alerts(max_age_h: float = 24.0, limit: int = 5) -> None:
         rows = db.failed_alerts_since(_time.time() - max_age_h * 3600)
         retry = [r for r in rows if (r["kind"] or "") not in ("heartbeat", "heartbeat_local",
                                                               "weekly", "weekly_local",
-                                                              "exec_alert_fills")]
+                                                              "exec_alert_fills",
+                                                              # 观察中的数据源告警：故意不发，
+                                                              # 不是发送失败，不得补推
+                                                              "data_error_pending")]
         # bar_ms=NULL 的行不受 UNIQUE 约束（NULL 互不相等），同一故障可能累积多条
         # 失败行 —— 按 (symbol, kind) 只补推最新一条，避免同一告警被连发 N 次。
         _seen: set = set()
