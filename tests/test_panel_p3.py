@@ -12,6 +12,8 @@
 4. 账户卡 acct-sub 收进 <details>「资金明细」。
 5. 收益主从：「累计已实现」整页唯一出处=绩效卡 U 对照行；R/U 主从图例。
 6. 记录页锚点导航：六个零 JS 跳转链接，href 与 id 一一配对、无重复 id。
+   （P4 收尾轮已整行删除 —— 断言反向钉死：锚点词面渲染层 0 处，见
+   TestRecordAnchorsRemoved 与 tests/test_panel_p4.py。）
 
 全部离线：临时 sqlite + 假 info，不触网。
 """
@@ -19,7 +21,6 @@ from __future__ import annotations
 
 import json
 import os
-import re
 import shutil
 import sys
 import tempfile
@@ -314,25 +315,21 @@ class TestRealizedSingleSource(BaseCase):
                           "——两者口径不同，不直接换算", html)
 
 
-# ---------------------------------------------------------------- 功能六：记录页锚点
-class TestRecordAnchors(BaseCase):
+# ---------------------------------------------- 功能一（P4 反向）：锚点导航已删
+class TestRecordAnchorsRemoved(BaseCase):
+    """P4 把 P3 R6 的锚点导航整行删除（用户拍板「手机上多余」）。
 
-    def test_anchor_links_paired_with_ids(self):
-        html = self.admin(tab="records")
-        hrefs = re.findall(r"href='#(cma-[a-z]+)'", html)
-        ids = re.findall(r"id='(cma-[a-z]+)'", html)
-        self.assertEqual(len(hrefs), 6, "六个锚点链接")
-        self.assertEqual(hrefs, ids, "href 与 id 一一配对且顺序一致")
-        self.assertEqual(len(set(ids)), len(ids), "锚点 id 不重复（渲染前查重）")
-        for label in ("资金流水", "下单", "成交", "信号", "提醒", "事件"):
-            self.assertIn(f">{label}</a>", html)
-        # 导航行在页面最前（第一个锚点链接早于第一个锚点容器）
-        self.assertLess(html.index("href='#cma-ledger'"), html.index("id='cma-ledger'"))
+    原正向用例（href 与 id 一一配对等）随口径删除；这里反向钉死：记录页
+    href='#cma- 与 id='cma- 都是 0 处，不留死链接也不留死 id。
+    """
 
-    def test_anchor_ids_unique_across_page(self):
+    def test_records_page_has_no_anchor_navigation(self):
         html = self.admin(tab="records")
-        all_ids = re.findall(r"id='([^']+)'", html)
-        self.assertEqual(len(all_ids), len(set(all_ids)), "整页 id 无冲突")
+        self.assertEqual(html.count("href='#cma-"), 0, "锚点链接应 0 处")
+        self.assertEqual(html.count("id='cma-"), 0, "区块容器 id 应 0 处")
+        self.assertNotIn("<a href='#", html, "记录页不应残留任何页内跳转链接")
+        # 页顶直接是「资金流水」卡（资金流水 <h2> 仍在 <h2>记录</h2> 之前）
+        self.assertLess(html.index("资金流水"), html.index("<h2>记录</h2>"))
 
 
 # ---------------------------------------------------------------- 冒烟：总览块序
