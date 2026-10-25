@@ -106,6 +106,12 @@ class Config:
     # 宽限秒数：默认 900（15 分钟 ≈ 3 个 tick）。允许范围 300–3600，越界保留原值
     # （apply_db 语义；不静默关掉宽限功能）。
     hl_close_grace_s: float = _env_f("HL_CLOSE_GRACE_S", 900.0)
+    # 数据源告警「持续未恢复才推」（feat/feed-alert-defer）：feed 失败先落库观察
+    # （kind=data_error_pending，不推送），持续未恢复超过该秒数才转正为 data_error
+    # 推送；期间恢复就就地标记「已恢复」，永不推送。背景：HL 每周例行维护（5–30
+    # 分钟）会让三标的同刻 502，旧行为立刻推 3 条卡 = 每周固定假警报；观察期
+    # 30 分钟把这类分钟级抖动滤掉。0 = 立即推（完全旧行为，走 _emit 原路径）。
+    feed_alert_delay_s: float = _env_f("FEED_ALERT_DELAY_S", 1800.0)
     # `hl_kill_autoclear`：**只对 origin=reconcile 的 kill** 生效 —— 连续 2 轮干净
     # （对账一致、无未知、本地无 open/pending/closing、无挂单）才自动解除。
     # 人工/熔断/数量/到期拉起的 kill 永不自动解除。
@@ -164,6 +170,8 @@ class Config:
                    "hl_fill_close", "hl_close_grace", "hl_close_grace_s",
                    "hl_kill_autoclear", "hl_flow_sync_s",
                    "hl_dd_guard", "hl_dd_warn_pct", "hl_dd_kill_pct",
+                   # 数据源告警观察期（秒）：数值参数，可从 /admin?tab=params 热改
+                   "feed_alert_delay_s",
                    # 空单风险减半：布尔键，走 apply_db 的 isinstance(cur, bool) 分支
                    # （truthy 集合内才改写，识别不了保留原值）。**故意不进 _RANGES**：
                    # 布尔键没有「范围校验」的意义，抄进去只会多一处可能漂移的口径。
@@ -193,6 +201,9 @@ class Config:
         # 没有宽限（第一轮没证据立刻 kill）；上界 3600 = 一小时，再长就是「忘了这回事」，
         # 期间该标的还禁止开新仓。越界保留原值（不静默关功能）。
         "hl_close_grace_s": (300.0, 3600.0),
+        # 数据源告警观察期（秒）：0 = 立即推（旧行为）是合法显式值；上限 7200（2 小时）
+        # ——比一个维护窗口长太多的「观察」等于永远不报。越界拒收（保留原值）。
+        "feed_alert_delay_s": (0.0, 7200.0),
     }
 
     # 字符串配置允许「显式清空」的键。

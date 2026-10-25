@@ -537,6 +537,65 @@ class DB:
         return list(self.conn.execute(
             "SELECT * FROM alert_logs ORDER BY id DESC LIMIT ?", (limit,)))
 
+    # ---------------- 数据源告警观察期（feat/feed-alert-defer）
+    # 生命周期：首次失败 → log_alert(kind='data_error_pending', success=False) 落库
+    # 不推送；恢复 → resolve_pending_feed_errors 就地标记（sent_successfully=1，
+    # 永不推送）；持续未恢复 ≥ 阈值 → promote_feed_error 转正为 data_error 推送。
+    @_locked
+    def pending_feed_error(self, symbol: str) -> Optional[sqlite3.Row]:
+        """该标的当前「观察中」的数据源告警行（没有则 None）。
+
+        已恢复的行 sent_successfully=1（恢复 = 这行永远不需要推送了，按「已了结」
+        记账，这样补推/心跳失败计数/看守脚本这些按 sent=0 捞行的消费者天然跳过
+        它）；已转正的行 kind 已改成 data_error —— 两类都匹配不上，返回非 None
+        即「观察中且未推送」。
+        """
+        return self.conn.execute(
+            "SELECT * FROM alert_logs WHERE symbol=? AND kind='data_error_pending'"
+            " AND sent_successfully=0 ORDER BY id DESC LIMIT 1", (symbol,)).fetchone()
+
+    @_locked
+    def feed_error_alerted_since(self, symbol: str, since: float) -> bool:
+        """本故障窗口内（since = 该标的最近一次 feed 成功时刻）是否已有 data_error 行。
+
+        「同一故障事件只推一次」的锚点：pending 转正后行不再是 pending，若不查
+        这个，下一轮失败 tick 会另开一条 pending → 又过 30 分钟二次推送。恢复过
+        的窗口 last_ok_at 会越过旧行的 created_at，所以新故障窗口能正常另开。
+        """
+        r = self.conn.execute(
+            "SELECT 1 FROM alert_logs WHERE symbol=? AND kind='data_error'"
+            " AND created_at>? LIMIT 1", (symbol, since)).fetchone()
+        return bool(r)
+
+    @_locked
+    def promote_feed_error(self, pending_id: int, message: str, success: bool) -> None:
+        """pending 行转正：kind 改 data_error（message 由调用方剥掉观察后缀）。
+
+        推送失败也照转（sent_successfully=0）——交给既有 24h 补推通道重试，而
+        不是退回 pending（故障已经持续超过阈值了，再等一个观察期没有意义）。
+        """
+        self.conn.execute(
+            "UPDATE alert_logs SET kind='data_error', message=?, sent_successfully=?,"
+            " sent_at=? WHERE id=?",
+            (message, 1 if success else 0, now() if success else None, pending_id))
+        self.conn.commit()
+
+    @_locked
+    def resolve_pending_feed_errors(self, symbol: str, note: str) -> int:
+        """feed 恢复成功：该标的未推送的 pending 行就地追加恢复标记（永不推送）。
+
+        返回标记的行数（0 = 没有观察中的行）。sent_successfully 置 1 =「该行已
+        了结、无需任何后续推送动作」，不是「推送成功」——message 里的
+        「已恢复（未推送）」是给人看的真话。
+        """
+        cur = self.conn.execute(
+            "UPDATE alert_logs SET message=message||?, sent_successfully=1, sent_at=?"
+            " WHERE symbol=? AND kind='data_error_pending' AND sent_successfully=0",
+            (note, now(), symbol))
+        self.conn.commit()
+        return cur.rowcount
+
+
     @_locked
     def failed_alerts_since(self, since: float) -> List[sqlite3.Row]:
         return list(self.conn.execute(

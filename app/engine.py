@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import logging
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -367,6 +368,88 @@ def format_data_error(cfg, symbol: str, err: str) -> str:
     ])
 
 
+# ---------------- 数据源告警观察期（feat/feed-alert-defer） ----------------
+# 背景：HL 每周例行维护（约每周一次、实际 5–30 分钟自愈）会让三标的同刻 502，
+# 旧行为立刻推 3 条卡 = 每周固定假警报。新口径（feed_alert_delay_s>0）：失败先
+# 落库观察（kind=data_error_pending，不推送），持续未恢复超过阈值才转正推送；
+# 期间恢复就就地标记「已恢复」，永不推送。
+
+def feed_pending_suffix(delay_s: float) -> str:
+    """pending 行 message 的观察后缀（告知用户「现在只是记录、还没推你」）。"""
+    mins = max(1, round(delay_s / 60))
+    return f"\n（持续未恢复超过 {mins} 分钟将提醒；若恢复则本条不推送）"
+
+
+# 转正时剥后缀的锚点：用正则而不是按当前配置重拼 —— 观察期内用户改了阈值，
+# 落库时的后缀数字已经变了，按当前配置拼串会剥不掉。
+_FEED_PENDING_SUFFIX_RE = re.compile(r"\n?（持续未恢复超过.*?将提醒；若恢复则本条不推送）$")
+
+
+def _recovered_note() -> str:
+    """恢复标记（追加在 pending 行 message 末尾）：该行就此终结、永不推送。"""
+    return f"—— 已于 {dt.datetime.now(DISPLAY_TZ).strftime('%H:%M')} 恢复（未推送）"
+
+
+def _feed_delay_s(cfg) -> float:
+    """观察期阈值（秒）。缺属性/脏值按 0 = 旧行为立即推（老测试替身不受影响）。"""
+    try:
+        return float(getattr(cfg, "feed_alert_delay_s", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _feed_error_alert(db, notifier, cfg, symbol: str, err: str, sent: List[str]) -> None:
+    """数据源失败 → 告警（含观察期逻辑；tick 的 FeedError 分支专用）。
+
+    feed_alert_delay_s=0：完全旧行为 —— 直接走 _emit 原路径（含 2h 窗口重复提醒）。
+    >0：见模块顶注释。转正推送不走 _emit：pending 行已经落库，再 log_alert 会
+    凭空多出第二行（NULL 幂等键互不冲突），所以转正 = 就地 UPDATE + 手动推送。
+    """
+    delay = _feed_delay_s(cfg)
+    if delay <= 0:
+        _emit(db, notifier, cfg, Alert("data_error", symbol, None,
+                                       format_data_error(cfg, symbol, err)), sent)
+        return
+    p = db.pending_feed_error(symbol)
+    if p is None:
+        # 没有观察中的行：要么本窗口首次失败，要么 pending 已转正。
+        # 已转正 → 本窗口已推过，不再另开 pending（同一故障事件只推一次）；
+        # 窗口起点 = 该标的最近一次 feed 成功时刻（恢复过的窗口 last_ok_at 会
+        # 越过旧行，新故障能正常另开观察行）。
+        last_ok = 0.0
+        for r in db.feed_status():
+            if r["symbol"] == symbol:
+                last_ok = float(r["last_ok_at"] or 0.0)
+        if db.feed_error_alerted_since(symbol, last_ok):
+            return
+        text = format_data_error(cfg, symbol, err) + feed_pending_suffix(delay)
+        if getattr(cfg, "dry_run", False):
+            print(f"\n----- DRY-RUN data_error_pending {symbol} -----")
+            print(text)
+            sent.append(text)
+            return
+        # 只落库、不推送（success=False → sent_successfully=0，但不进补推：见 main）
+        db.log_alert(symbol, None, "data_error_pending", text, False)
+        logger.info("[feed] %s 数据源失败进入观察期（%g 秒内不推送）", symbol, delay)
+        return
+    # 观察期内：继续只记不推（同一行，不重复落库）
+    if time.time() - float(p["created_at"]) < delay:
+        return
+    # 到点转正：剥掉观察后缀（推出去的文案与旧 data_error 一致），走既有推送通道
+    text = _FEED_PENDING_SUFFIX_RE.sub("", str(p["message"] or ""))
+    if getattr(cfg, "dry_run", False):
+        print(f"\n----- DRY-RUN data_error {symbol}（观察期到点转正）-----")
+        print(text)
+        sent.append(text)
+        return
+    ok = bool(notifier and notifier.send_message(text))
+    db.promote_feed_error(int(p["id"]), text, ok)
+    if ok:
+        sent.append(text)
+    else:
+        logger.error("[alert] 数据源告警转正推送失败（交给 24h 补推）: %s", symbol)
+
+
 # ---------------------------------------------------------------- 纯状态机
 
 def walk(cfg, symbol: str, bars: Sequence[strategy.Bar],
@@ -522,8 +605,7 @@ def tick(db, cfg, notifier, now_ms: Optional[int] = None, executor=None) -> List
             _tick_symbol(db, cfg, notifier, symbol, now_ms, executor, sent)
         except market.FeedError as e:
             db.mark_feed(symbol, "", False, str(e))
-            _emit(db, notifier, cfg, Alert("data_error", symbol, None,
-                                           format_data_error(cfg, symbol, str(e))), sent)
+            _feed_error_alert(db, notifier, cfg, symbol, str(e), sent)
         except Exception as e:                                   # noqa: BLE001
             # 单个标的的任何异常（未知 symbol、非法配置、DB 故障…）都不能
             # 打断其余标的 —— 旧版一个 KeyError 就让所有标的的 tick 静默停摆。
@@ -584,6 +666,9 @@ def _tick_symbol(db, cfg, notifier, symbol: str, now_ms, executor, sent: List[st
         # 成功路径也写 feed_health：心跳/面板的「数据源健康」靠 last_ok_at 判断，
         # 只记失败的话 last_ok_at 永远停在首次成功之前（P1 回归，已修）。
         db.mark_feed(symbol, feed.source, True)
+        # feed 恢复成功 → 就地标记观察中的 pending 行「已恢复」（永不推送）。
+        # 只在本成功路径做：恢复的唯一入口就是 feed 重新取到数。
+        db.resolve_pending_feed_errors(symbol, _recovered_note())
         bars = feed.bars
         ind = strategy.compute_indicators(bars)
         sq = strategy.squeeze_flags(ind["band"], cfg.band_window, cfg.band_quantile,
@@ -757,7 +842,10 @@ def heartbeat_text(db, cfg) -> str:
         lines.append("当前无持仓")
     recent = db.recent_alerts(limit=200)
     day = [a for a in recent if a["created_at"] > __import__("time").time() - 86400]
-    failed = [a for a in day if not a["sent_successfully"]]
+    # 观察中的 data_error_pending 行（sent=0）不是「推送失败」——它是故意不发的，
+    # 算进失败数会把每周维护的观察行报成事故。
+    failed = [a for a in day if not a["sent_successfully"]
+              and a["kind"] != "data_error_pending"]
     lines.append(f"近 24h 提醒 {len(day)} 条，其中失败 {len(failed)} 条")
     return "\n".join(lines)
 

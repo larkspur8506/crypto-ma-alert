@@ -247,7 +247,11 @@ class TestFeedHealth(unittest.TestCase):
 
 
 class TestDataErrorDedupWindow(unittest.TestCase):
-    """data_error 的 NULL 幂等键：2h 窗口外会再报。"""
+    """data_error 的 NULL 幂等键：2h 窗口外会再报。
+
+    feat/feed-alert-defer 之后默认有 30 分钟观察期；这里测的是**旧行为路径**
+    （feed_alert_delay_s=0 = 完全旧行为），所以每处 cfg 都显式归零。
+    """
 
     def test_was_alerted_null_window(self):
         db = _tmp_db()
@@ -276,6 +280,7 @@ class TestDataErrorDedupWindow(unittest.TestCase):
         db = _tmp_db()
         cfg = Config(); cfg.dry_run = False; cfg.alert_prefix = ""
         cfg.symbols = ["BTC_USDT"]
+        cfg.feed_alert_delay_s = 0        # 本组测旧行为（立即推）路径
 
         def boom(symbol, now_ms=None, allow_fallback=False):
             raise market.FeedError("模拟主源失败")

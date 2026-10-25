@@ -58,6 +58,7 @@ _ALERT_KIND_TXT = {
     "entry": "开仓提醒",
     "exit": "离场提醒",
     "data_error": "数据源异常",
+    "data_error_pending": "数据源异常（观察中）",
     "heartbeat": "心跳（推送）",
     "heartbeat_local": "心跳（静默）",
     "weekly": "周报（推送）",
@@ -528,6 +529,10 @@ PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
     # 免得「15」被当成 15 秒填进去（那样等于关掉宽限）。范围 300–3600。
     ("hl_close_grace_s", "执行与推送", "平仓证据宽限时长（秒，300–3600，默认 900 = 15 分钟）",
      "HL_CLOSE_GRACE_S", 900.0, "float"),
+    # 数据源告警观察期（feat/feed-alert-defer）：失败先落库观察、持续未恢复才推送。
+    # 数值参数 → 归参数页（与 hl_churn_max 同类），0 = 立即推（旧行为）是合法值。
+    ("feed_alert_delay_s", "执行与推送", "数据源异常提醒延迟（秒，0=立即）",
+     "FEED_ALERT_DELAY_S", 1800.0, "float"),
     ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "mode"),
     ("equity", "资金", "账户权益基数 U（固定模式用）", "ACCOUNT_EQUITY", 1000.0, "float"),
     ("equity_min", "资金", "资金下限 U（跟随模式用）", "", 20.0, "float"),
@@ -616,6 +621,16 @@ def _preview_hint(key: str, cfg: Any, base: float, live: float,
         return (f"{sec:.0f} 秒 ≈ {sec / 60:.0f} 分钟：交易所已平仓但拿不到成交证据时，"
                 f"最多等这么久才判对账异常并停手（期间该标的禁止开新仓）。"
                 f"调小 = 更快交人，调大 = 更多自动消化")
+    if key == "feed_alert_delay_s":
+        try:
+            sec = float(getattr(cfg, "feed_alert_delay_s", 1800.0) or 0.0)
+        except (TypeError, ValueError):
+            sec = 1800.0
+        if sec <= 0:
+            return "0 = 立即推送（旧行为）：数据源一失败就发提醒"
+        return (f"{sec:.0f} 秒 ≈ {sec / 60:.0f} 分钟：数据源失败先只记录不发提醒，"
+                f"持续未恢复超过这么久才推送（滤掉交易所例行维护这类分钟级抖动）；"
+                f"期间自己恢复就永远不打扰。填 0 恢复立即推")
     return ""
 
 
@@ -912,6 +927,24 @@ def _parse_params(form: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
                                 f"（{lo / 60:.0f}~{hi / 60:.0f} 分钟）")
                 else:
                     out["hl_close_grace_s"] = gs_v
+
+    # 数据源告警观察期（秒）：与上面同语义 —— 缺字段/空 = 保持原值（老书签/curl
+    # 不带这个键时不能把它刷成别的值）；显式 0 = 立即推（旧行为），是合法值。
+    fd_raw = form.get("feed_alert_delay_s")
+    if fd_raw is not None:
+        fd_txt = str(fd_raw or "").strip()
+        if fd_txt:
+            try:
+                fd_v = float(fd_txt.replace(",", ""))
+            except ValueError:
+                errs.append("数据源异常提醒延迟不是数字")
+                fd_v = None
+            if fd_v is not None:
+                lo, hi = _R["feed_alert_delay_s"]
+                if not (lo <= fd_v <= hi):
+                    errs.append(f"数据源异常提醒延迟必须在 {lo:g}~{hi:g} 秒之间（0=立即推送）")
+                else:
+                    out["feed_alert_delay_s"] = fd_v
 
     # 做空均线：必须是整数
     sraw = str(form.get("short_regime_ma") or "").strip()
@@ -2308,6 +2341,7 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
                      equity_min: Optional[str] = Form(None),
                      hl_churn_max: Optional[str] = Form(None),
                      hl_close_grace_s: Optional[str] = Form(None),
+                     feed_alert_delay_s: Optional[str] = Form(None),
                      hl_agent_valid_until_ms: str = Form(""),
                      hl_dd_warn_pct: Optional[str] = Form(None),
                      hl_dd_kill_pct: Optional[str] = Form(None),
@@ -2322,6 +2356,8 @@ def build_admin_router(deps: AdminDeps) -> APIRouter:
             "hl_churn_max": hl_churn_max,
             # 宽限期（对账失败自动消化）：同样缺字段 = 保持原值
             "hl_close_grace_s": hl_close_grace_s,
+            # 数据源告警观察期（秒）：缺字段 = 保持原值，显式 0 = 立即推
+            "feed_alert_delay_s": feed_alert_delay_s,
             "hl_agent_valid_until_ms": hl_agent_valid_until_ms,
         })
         if errs:
