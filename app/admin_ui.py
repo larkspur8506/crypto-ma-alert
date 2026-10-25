@@ -5,12 +5,14 @@
 
 - ``overview`` 总览 —— 直接复用 :func:`app.hl.views._render_body`（不重写仓位/盈亏曲线区块）；
   末尾接「API 有效期」状态卡（地址/到期日/剩余/状态 + 到期前自动清仓开关状态）
-- ``params``   参数 —— 策略 / 执行与推送 / 资金 / API 有效期 四组，显示来源（DB·env·默认）与影响预览；
-  末尾另有「更新 API（续期）」折叠表单（粘新私钥，POST /admin/hl/agent/renew）
-- ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）、策略与保护（做多/做空/到期自动清仓）、
-  推送开关、kill switch
+- ``params``   参数 —— 策略 / 执行与推送 / 风控阈值 / 资金 四组，显示来源（DB·env·默认）与影响预览；
+  「保存全部参数」之后是 <details>「API 续期与兜底（低频）」（P4）：「更新 API（续期）」
+  私钥表单（POST /admin/hl/agent/renew）+「API 有效期」手工兜底字段与清除按钮
+- ``switch``   开关 —— 执行模式三选一（切实盘二次确认 + 校验凭据）→ 推送开关 → 策略与保护
+  （做多/做空/到期自动清仓）→「应急操作」（kill switch + 重置回撤基线，红框独立卡，P4）
 - ``records``  记录 —— hl_orders / hl_fills / signals / alert_logs / hl_events 五块
-  （「信号」2026-10-18 从总览迁入，复用 hl/views._signals_html）
+  （「信号」2026-10-18 从总览迁入，复用 hl/views._signals_html；P4 删了页顶锚点导航
+  行与六个区块容器的 id —— 手机上用不到，跳转靠滚动）
 
 兼容（见 docs/ADMIN_MERGE_PLAN.md 第 2 节「保留」）：
 - ``/hl``、``/admin/rules``、``/admin/logs`` 三个旧 GET → 302 到新位置（书签/已发消息里的链接不断）
@@ -536,6 +538,9 @@ PARAM_FIELDS: Tuple[Tuple[str, str, str, str, Any, str], ...] = (
     ("equity_mode", "资金", "资金口径", "HL_EQUITY_MODE", "follow", "mode"),
     ("equity", "资金", "账户权益基数 U（固定模式用）", "ACCOUNT_EQUITY", 1000.0, "float"),
     ("equity_min", "资金", "资金下限 U（跟随模式用）", "", 20.0, "float"),
+    # hl_agent_valid_until_ms 2026-10-25（P4）撤出 _GROUPS 循环：低频运维项，与
+    # 「更新 API（续期）」一起收进「API 续期与兜底（低频）」<details>（见 render_params）。
+    # 仍留在 PARAM_FIELDS（parse/影响预览共用的数据源），渲染挪到 details 里单独写。
     ("hl_agent_valid_until_ms", "API 有效期", "手工兜底的有效期（毫秒时间戳，可留空）",
      "HL_AGENT_VALID_UNTIL_MS", "", "text"),
 )
@@ -548,7 +553,8 @@ _GROUPS: Tuple[Tuple[str, str], ...] = (
     # 30/40、3% 档 40/50），改「单笔风险」时两条线自动跟着走 —— 属于「参数」的心智。
     ("风控阈值", "回撤熔断线等保护阈值；留空 = 按「单笔风险」档位自动"),
     ("资金", "下单基数怎么算"),
-    ("API 有效期", "接口查不到有效期时的手工兜底；到期前要不要自动清仓在「开关」页"),
+    # 「API 有效期」组 2026-10-25（P4）从主表单的四组里撤出，整体移进页尾
+    # 「API 续期与兜底（低频）」<details>（低频运维动作，不为常用改参添堵）。
 )
 
 
@@ -750,6 +756,28 @@ def _equity_mode_js() -> str:
         "for(var j=0;j<g.length;j++){g[j].addEventListener('change',f);}f();})();</script>")
 
 
+def _hint_multi_line(text: str) -> bool:
+    """说明文字在手机上是否会折成多于一行（P4 折叠判据）。
+
+    手机竖屏（≤640px 视口、13px 字号）一行大约放得下 24 个汉字宽；说明渲染宽度
+    超过它就必然折成多行 → 收进 <details>；≤ 一行的短说明保留可见（不为折叠而
+    折叠）。CJK/全角按 1 个字宽、ASCII 按 0.5 近似 —— 开关说明以中文为主。
+    """
+    return sum(1.0 if ord(ch) > 0x2E7F else 0.5 for ch in text) > 24.0
+
+
+def _sw_help_html(hint: str, pad: str = "") -> str:
+    """开关行说明的两种落点：>1 行收进 details（可展开，原文一字不少），≤1 行可见。
+
+    ``pad`` 只拼进输出（沿用推送说明原有的缩进空格），**不参与**行宽判据 ——
+    不可见的 &nbsp; 不该把一条一行短说明挤成「两行」。
+    """
+    if _hint_multi_line(hint):
+        return (f"<details class='sw-help'><summary>说明</summary>"
+                f"<div class='hint'>{pad}{hint}</div></details>")
+    return f"<div class='hint'>{pad}{hint}</div>"
+
+
 def _bool_field(key: str, label: str, on: bool, hint: str, src: str) -> str:
     """复选框 + **hidden 兜底**（H3）。
 
@@ -762,12 +790,15 @@ def _bool_field(key: str, label: str, on: bool, hint: str, src: str) -> str:
       - 勾选   → 先提交 0 再提交 1 → 后端取**最后一个**值 = 1 → 开
     （浏览器按文档顺序提交；FastAPI/Starlette 的 Form 取值也是「后出现的覆盖」，
     见 tests/test_agent_expiry.py 的同名多值用例。）
+
+    P4：>1 行的说明收进行内 <details class='sw-help'>（hidden/checkbox 双字段结构
+    原样保留 —— 折叠只动说明文字的落点，不动表单语义）。
     """
     return (f"<div class='field'><div class='lbl'>{_esc(label)}"
             f"<span class='src'>&nbsp;来源 {src} · 当前 {'开' if on else '关'}</span></div>"
             f"<input type='hidden' name='{_esc(key)}' value='0'>"
             f"<label class='chk'><input type='checkbox' name='{_esc(key)}' value='1' "
-            f"{'checked' if on else ''}></label><div class='hint'>{hint}</div></div>")
+            f"{'checked' if on else ''}></label>{_sw_help_html(hint)}</div>")
 
 
 def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str:
@@ -778,9 +809,10 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
 
     o: List[str] = []
     o.append("<h2>参数</h2>")
-    # 表单必须包住所有输入控件：控件在 form 外的话浏览器只提交 form 内的
+    # form 必须包住所有输入控件：控件在 form 外的话浏览器只提交 form 内的
     # 元素 → POST 空 body → 必 400（自面板合并起就坏，用户从没在面板改过参数）。
-    o.append("<form method='post' action='/admin/params'>")
+    # id 给「API 续期与兜底」details 里的兜底字段用 form 属性反挂（P4，见下）。
+    o.append("<form method='post' action='/admin/params' id='params-form'>")
     o.append("<div class='card'><div class='sec'>改动影响预览</div>"
              f"<div class='hint big'>{_impact_line(imp)}</div>"
              f"<div class='hint'>下单基数：<b>{base:,.0f} U</b>（{_esc(base_txt)}；"
@@ -822,15 +854,14 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
         o.append("</div>")
 
     o.append("<button type='submit'>保存全部参数</button></form>")
-    # 手工兜底现在「留空 = 不改动」（M3），所以清空必须有独立按钮（不能嵌在上面的
-    # form 里 —— HTML 不允许表单嵌套）。只在填了值时才显示，避免噪音。
-    cur_until = str(_cur_val(cfg, "hl_agent_valid_until_ms", "", "text") or "").strip()
-    if cur_until:
-        o.append("<form method='post' action='/admin/hl/agent/fallback/clear' class='inline'>"
-                 f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
-                 f"<span class='hint'>手工兜底有效期当前为 {_esc(cur_until)}（毫秒）。"
-                 "留空保存 = 保持原值。</span>"
-                 "<button class='gray' type='submit'>清除兜底</button></form>")
+    # ---- P4：低频运维动作收进一个 <details>（零 JS）----
+    # 「更新 API（续期）」整块 +「API 有效期」组（手工兜底字段 + 清除兜底按钮）都搬进
+    # 同一个 details，放在「保存全部参数」之后（续期表单原位置）。主 form 已在上面
+    # 闭合（HTML 不允许嵌套 form），兜底字段用 **form 属性**（form='params-form'）
+    # 继续归属「保存全部参数」那张表单：字段名（hl_agent_valid_until_ms）与提交语义
+    # 都不变 —— 浏览器把 form 归属控件随表单一起提交，details 折叠着也一样（关闭的
+    # details 只是不可见，控件仍在 DOM 里照常提交）。
+    o.append("<details class='lowfreq'><summary>API 续期与兜底（低频）</summary>")
     # 「更新 API（续期）」表单 2026-10-19 从总览状态卡里拆出来单独放这里：
     # 状态（到期日/剩余/状态词）是「当下」，回总览末尾；写私钥是运维设置，留参数页。
     # 区块自己兜底，渲染失败不弄挂参数页。
@@ -838,6 +869,26 @@ def render_params(deps: AdminDeps, cfg: Any, payload: dict, price: float) -> str
         o.append(render_agent_renew_block(deps))
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[admin] 更新 API 区块渲染失败：%s", e)
+    o.append("<div class='card'><div class='sec'>API 有效期</div>"
+             "<div class='hint'>接口查不到有效期时的手工兜底；到期前要不要自动清仓在「开关」页</div>")
+    src = _source(raw, "hl_agent_valid_until_ms", "HL_AGENT_VALID_UNTIL_MS")
+    hint = _preview_hint("hl_agent_valid_until_ms", cfg, base, live, imp, imp_max)
+    cur_until = str(_cur_val(cfg, "hl_agent_valid_until_ms", "", "text") or "").strip()
+    o.append(f"<div class='field'><div class='lbl'>手工兜底的有效期（毫秒时间戳，可留空）"
+             f"<span class='src'>&nbsp;来源 {src} · 当前 {_esc(cur_until or '空')}</span></div>"
+             f"<input form='params-form' type='text' inputmode='numeric' "
+             f"name='hl_agent_valid_until_ms' value='{_esc(cur_until)}'>"
+             f"<div class='hint'>{hint}<br>保存走上面的「保存全部参数」按钮"
+             "（details 折叠着也会一起提交；留空 = 保持原值）。</div></div>")
+    # 手工兜底现在「留空 = 不改动」（M3），所以清空必须有独立按钮（显式操作）。
+    # 只在填了值时才显示，避免噪音。
+    if cur_until:
+        o.append("<form method='post' action='/admin/hl/agent/fallback/clear' class='inline'>"
+                 f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+                 f"<span class='hint'>手工兜底有效期当前为 {_esc(cur_until)}（毫秒）。"
+                 "留空保存 = 保持原值。</span>"
+                 "<button class='gray' type='submit'>清除兜底</button></form>")
+    o.append("</div></details>")
     # 资金口径显隐脚本（原生 JS，无框架、无外部资源）；必须在字段之后执行。
     o.append(_equity_mode_js())
     return "".join(o)
@@ -1133,12 +1184,32 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
              "我已确认：切实盘会真下单</label>")
     o.append("<button type='submit'>切换模式</button></form>")
 
-    o.append(f"<div class='hint'>钱包地址："
-             f"{'已配置（' + _esc(addr[:6]) + '&hellip;' + _esc(addr[-4:]) + '）' if addr else '未配置'}"
-             f"｜私钥：{'已配置' if has_key else '未配置'}"
-             f"｜地址/私钥来自 env，面板只读不改。</div></div>")
+    # 说明段（P4）：>1 行收进 <details class='sw-help'>。同卡的警告 banner 与
+    # 「我已确认」确认流程是安全文案，**不折叠** —— 那两行永远可见。
+    o.append(_sw_help_html(
+        f"钱包地址："
+        f"{'已配置（' + _esc(addr[:6]) + '&hellip;' + _esc(addr[-4:]) + '）' if addr else '未配置'}"
+        f"｜私钥：{'已配置' if has_key else '未配置'}"
+        f"｜地址/私钥来自 env，面板只读不改。") + "</div>")
 
-    # ---- 策略与保护（2026-10-19 从参数页迁入） ----
+    # ---- 推送开关（P4 提前：常用度高于策略与保护） ----
+    # 行结构（P4）：checkbox + 名称 + 当前状态词；说明 >1 行收进行内
+    # <details class='sw-help'>，≤1 行保留可见。注意这里**没有** hidden 兜底 ——
+    # POST 语义是「缺字段 = 保持原值」，加 hidden 0 会把「没提交」变成「提交 0 = 关」，
+    # 语义就变了（PR #29 的教训反过来也成立：不是所有开关都该有 hidden）。
+    o.append("<div class='card'><div class='sec'>推送开关</div>"
+             "<form method='post' action='/admin/switch/notify'>")
+    for key, label, desc, dflt in NOTIFY_KEYS:
+        on = _b(raw.get(key, dflt))
+        src = "DB" if key in raw else "默认"
+        o.append(f"<div class='field'><div class='lbl'><b>{_esc(label)}</b>"
+                 f"<span class='src'>&nbsp;来源 {src} · 当前 {'开' if on else '关'}</span></div>"
+                 f"<label class='rad'><input type='checkbox' name='{_esc(key)}' value='1' "
+                 f"{'checked' if on else ''}></label>"
+                 + _sw_help_html(_esc(desc), pad="&nbsp;&nbsp;") + "</div>")
+    o.append("<button type='submit'>保存推送开关</button></form></div>")
+
+    # ---- 策略与保护（2026-10-19 从参数页迁入；P4 挪到推送开关之后） ----
     # 这三个键以前在参数页的「保存全部参数」那张大表单里：未勾选 = 提交 0，
     # 一次「保存全部参数」就能把线上方向开关静默关掉（2026-10-18/19 出过事故）。
     # 现在独立成一张小卡 + 独立 POST，且用 hidden+checkbox 双字段：
@@ -1161,19 +1232,14 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
     # 连带结果，不是分类上的选择。
     o.append("<button type='submit'>保存策略与保护</button></form></div>")
 
-    # ---- 推送开关 ----
-    o.append("<div class='card'><div class='sec'>推送开关</div>"
-             "<form method='post' action='/admin/switch/notify'>")
-    for key, label, desc, dflt in NOTIFY_KEYS:
-        on = _b(raw.get(key, dflt))
-        o.append(f"<label class='rad'><input type='checkbox' name='{_esc(key)}' value='1' "
-                 f"{'checked' if on else ''}> <b>{_esc(label)}</b></label>")
-        o.append(f"<div class='hint'>&nbsp;&nbsp;{_esc(desc)}"
-                 f"<span class='src'>&nbsp;来源 {'DB' if key in raw else '默认'}</span></div>")
-    o.append("<button type='submit'>保存推送开关</button></form></div>")
-
-    # ---- kill switch ----
-    o.append("<div class='card'><div class='sec'>kill switch</div>")
+    # ---- 应急操作（P4）：kill switch + 「重置回撤基线」合并成页尾独立卡 ----
+    # 与日常开关物理隔开：红框（.card.danger）+ 一句话警示，日常滑到页尾也不会
+    # 顺手碰到。两个 POST 路由（/admin/switch/kill、/admin/switch/dd_reset）、字段
+    # （on=1/0）与按钮文案原样保留 —— 本轮只挪位置换壳，不碰提交语义。
+    # 【v2·高2】两个动作仍各自独立：dd_reset 只重置基线不解除 kill；「解除 DD 熔断」
+    # 顺带重置基线的路径在 /admin/switch/kill 的 POST 里（见下），不在这里合并。
+    o.append("<div class='card danger'><div class='sec'>应急操作</div>")
+    o.append("<div class='hint'><b>两个动作都会直接影响交易，慎点。</b></div>")
     if kill:
         o.append("<div class='banner'>&#9888;&#65039; <b>已触发</b>：执行器暂停开新仓"
                  "（仍允许人工平仓/撤单）。</div>")
@@ -1184,10 +1250,6 @@ def render_switch(deps: AdminDeps, cfg: Any) -> str:
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
              "解除（恢复正常）</button></form>")
-    # 【v2·高2】「重置回撤基线」独立入口：只把 peak_index 归到当前 index（回撤从此刻
-    # 重新计量），**不**解除 kill。为什么要单开一个按钮：用户可能只想重新起算、或者
-    # kill 已经因为别的原因停着（对账/当日亏损），这时不该被迫先解 kill 再重置。
-    # 反过来「解除 DD 熔断」会顺带重置基线（§4.6），那条路径在 POST 里做。
     o.append("<form method='post' action='/admin/switch/dd_reset'>"
              f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
              "<button class='gray' type='submit'>重置回撤基线</button>"
@@ -1289,7 +1351,7 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
     head = (f"Σ全部流水 = {_fmt(total)} U ｜ 当前账户权益（最新快照）= {equity_txt} ｜ "
             f"残差 = 权益 − Σ流水 = {_fmt(residual)} U（未实现盈亏 + 口径零头）")
     return (f"<h2>资金流水</h2>"
-            f"<div class='card' id='cma-ledger'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）"
+            f"<div class='card'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）"
             f"{_all_link('ledger', _token_of(deps))}</div>"
             f"<div class='hint'>{_esc(head)}</div>"
             + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
@@ -1300,12 +1362,6 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
             "</div>")
 
 
-# 记录页锚点导航（P3 R6）：slug 即各区块容器的 id（加 cma- 前缀做命名空间）。
-# 六个 slug 互不相同 —— 渲染前的「查重」就在这份表上：同一 id 出现两次会跳错块。
-_RECORD_ANCHORS = (("资金流水", "cma-ledger"), ("下单", "cma-orders"), ("成交", "cma-fills"),
-                   ("信号", "cma-signals"), ("提醒", "cma-alerts"), ("事件", "cma-events"))
-
-
 def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                    signals: Optional[List[Dict[str, Any]]] = None) -> str:
     """记录页六块：资金流水 → 下单记录 → 成交 → 信号 → 提醒日志 → 执行器事件。
@@ -1314,15 +1370,11 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     None 时按空表渲染「暂无信号」（直接调 render_records 的老调用点不会炸）。
     信号块与总览原来是同一份渲染代码 —— 这里直接复用 ``views._signals_html``。
 
-    P3 R6：页顶一行零 JS 锚点导航（六个 <a href='#cma-…'>），各区块容器带对应 id；
-    id 前缀 cma- 是命名空间 —— 渲染前查重（_RECORD_ANCHORS 六个 slug 互不相同），
-    不与页面既有 id 冲突。
+    P4：P3 R6 的页顶锚点导航行与六个区块容器的 ``id='cma-…'`` 整体删除（用户拍板
+    「手机上多余」）—— 页面顶部直接是「资金流水」卡，跳转靠滚动，无消费者不留死 id。
     """
     n = normalize_rows(rows_n)
     o: List[str] = []
-    # ---- 锚点导航（P3 R6）：小屏自然换行，样式复用 tabs 行，零 JS ----
-    o.append("<div class='tabs'>" + "".join(
-        f"<a href='#{sid}'>{label}</a>" for label, sid in _RECORD_ANCHORS) + "</div>")
     # ---- 资金流水（feat/funds-ledger）----
     # 位置铁律：必须在记录页**任何既有区块之前**（本函数原来第一块是 <h2>记录</h2>，
     # 资金流水的 <h2> 排在它前面，测试按 h2 顺序断言位置）。
@@ -1332,7 +1384,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
              f"（页脚「每页行数」可切 10/20/50）。</div>")
 
     # ---- 下单记录 ----
-    o.append(f"<div class='card' id='cma-orders'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
+    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
              f"{_all_link('orders', _token_of(deps))}</div>")
     rows = ""
     _orders_rows = _rows(deps, "hl_recent_orders", n)
@@ -1356,7 +1408,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     o.append("</div>")
 
     # ---- 成交 ----
-    o.append(f"<div class='card' id='cma-fills'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
+    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
              f"{_all_link('fills', _token_of(deps))}</div>")
     rows = ""
     for r in _rows(deps, "hl_recent_fills", n):
@@ -1385,7 +1437,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     # 用 _signals_html 渲染（自带 <h2>信号</h2> + 表格，与总览那一块逐字相同），
     # 外面只套 card 边框、不再加 sec 标题 —— 否则「信号」会出现两次。
     # 切片用 n：以前总览整表渲染，仓位历史一长页面就无限变长（顺手按每页行数收口）。
-    o.append("<div class='card' id='cma-signals'>" + _signals_html(list(signals or [])[:n])
+    o.append("<div class='card'>" + _signals_html(list(signals or [])[:n])
              + f"<div class='foot'><span class='muted'>信号 / 仓位历史（含已平仓）：</span>"
                f"{_all_link('positions', _token_of(deps))}</div></div>")
 
@@ -1401,7 +1453,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     _shown_n = len(_alert_rows)
     _alert_title = (f"提醒日志（alert_logs · 最近 {_shown_n} 条）" if _shown_n
                     else "提醒日志（alert_logs）")
-    o.append(f"<div class='card' id='cma-alerts'><div class='sec'>{_alert_title}"
+    o.append(f"<div class='card'><div class='sec'>{_alert_title}"
              f"{_all_link('alerts', _token_of(deps))}</div>")
     # 口径落可见文字：主页滤掉了什么、去哪看全部，必须写出来而不是让人猜少了行。
     # （措辞避开「全部 ›」字面 —— 那是 _all_link 的专属词，测试按出现次数数链接。）
@@ -1445,7 +1497,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     _shown_n = len(_event_rows)
     _event_title = (f"执行器事件（hl_events · 最近 {_shown_n} 条）" if _shown_n
                     else "执行器事件（hl_events）")
-    o.append(f"<div class='card' id='cma-events'><div class='sec'>{_event_title}"
+    o.append(f"<div class='card'><div class='sec'>{_event_title}"
              f"{_all_link('events', _token_of(deps))}</div>")
     o.append("<div class='hint'>主页已隐藏「心跳」与「对账一致」例行行；"
              "异常 / 决策 / 下单照常显示，全部事件见「全部」子页。</div>")
@@ -1983,6 +2035,10 @@ th,td{padding:6px 8px}
 .chk input,.rad input{width:17px;height:17px;accent-color:var(--btn)}
 .banner.warn{border-color:var(--wb-line);background:var(--wb-bg);color:var(--wb-fg)}
 .banner.ok{border-color:var(--okb-line);background:var(--okb-bg);color:var(--okb-fg)}
+.card.danger{border:2px solid #b91c1c}
+details.sw-help{width:100%;margin:2px 0 4px}
+details.sw-help summary{cursor:pointer;color:var(--muted);font-size:12.5px}
+details.lowfreq summary{cursor:pointer;font-size:13.5px;font-weight:600;margin:4px 0 10px}
 button{display:inline-block;background:var(--btn);color:#fff;border:0;border-radius:6px;
        padding:9px 15px;font-size:13.5px;cursor:pointer;margin:6px 8px 0 0}
 button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}

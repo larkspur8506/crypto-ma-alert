@@ -177,9 +177,13 @@ class TestPlacement(Base):
         self.assertLess(html.index("风控阈值"), html.index("资金"))
 
     def test_params_form_posts_dd_fields_to_params_endpoint(self):
-        """两个输入框必须在参数页那张 form 里（form 外的控件浏览器不提交）。"""
+        """两个输入框必须在参数页那张 form 里（form 外的控件浏览器不提交）。
+
+        form 标签 2026-10-25（P4）带上 id='params-form'：「API 续期与兜底」details
+        里的兜底字段用 form 属性反挂这张表单。
+        """
         html = self.body(tab="params")
-        form_at = html.index("<form method='post' action='/admin/params'>")
+        form_at = html.index("<form method='post' action='/admin/params' id='params-form'>")
         end_at = html.index("</form>", form_at)
         seg = html[form_at:end_at]
         self.assertIn("name='hl_dd_warn_pct'", seg)

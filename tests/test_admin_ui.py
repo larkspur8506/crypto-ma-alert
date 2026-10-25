@@ -434,7 +434,8 @@ class TestParamsTab(BaseCase):
 class TestSwitchTab(BaseCase):
     def test_switch_200_with_key_blocks(self):
         html = self.body(tab="switch")
-        for s in ("只通知", "影子", "实盘", "kill switch", "推送开关",
+        # P4：kill switch 卡并入页尾「应急操作」卡（词面随口径更新）
+        for s in ("只通知", "影子", "实盘", "应急操作", "推送开关",
                   "切到实盘会用真钱下单", "我已确认"):
             self.assertIn(s, html)
 
@@ -1009,9 +1010,9 @@ class TestStrategyCard(BaseCase):
         self.assertRegex(html, r"name='enable_shorts' value='1' checked")
         self.assertRegex(html, r"name='agent_expiry_cleanup' value='1' checked")
         self.assertIn("当前 关", html)
-        # 卡片在「执行模式」之后、「推送开关」之前
-        self.assertLess(html.index("执行模式"), html.index("策略与保护"))
-        self.assertLess(html.index("策略与保护"), html.index("推送开关"))
+        # P4 顺序：执行模式 → 推送开关 → 策略与保护（常用在前）
+        self.assertLess(html.index("执行模式"), html.index("推送开关"))
+        self.assertLess(html.index("推送开关"), html.index("策略与保护"))
 
     def test_unchecked_hidden_zero_really_turns_off_and_back_on(self):
         """未勾选（浏览器只发 hidden=0）→ 关；勾选（0 再 1）→ 开。"""

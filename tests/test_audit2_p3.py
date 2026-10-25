@@ -32,7 +32,7 @@ class TestParamsFormWrapsInputs(unittest.TestCase):
         src = open(A.__file__, encoding="utf-8").read()
         body = src[src.index("def render_params"):]
         body = body[:body.index("\ndef ")]
-        form_open = body.index("<form method='post' action='/admin/params'>")
+        form_open = body.index("<form method='post' action='/admin/params' id='params-form'>")
         first_field = body.index("_num_field(")
         form_close = body.index("</form>")
         self.assertLess(form_open, first_field,
