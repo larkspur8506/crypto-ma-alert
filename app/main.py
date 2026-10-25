@@ -27,7 +27,7 @@ from app.db import DB
 from app.hl import pnl as hl_pnl
 from app.hl import funding as hl_funding
 from app.notify import get_notifier
-from app.ui_theme import THEME_CSS, normalize_theme, page_shell
+from app.ui_theme import (THEME_CSS, normalize_theme, page_shell, PRODUCT_NAME)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("cma")
@@ -953,7 +953,8 @@ def _summary(row, pid: int, request: Request = None) -> HTMLResponse:
     body = (f"<h1>{_status_label(row)} #{pid}</h1>"
             f"<div class='card'>{'<br>'.join(lines)}</div>"
             f"<div class='card'>{' '.join(btns) or '<span class=muted>无可操作项</span>'}</div>")
-    return page(f"{_status_label(row)} #{pid}", body, request=request)
+    # P3 命名同步：确认页 <title> 也用「双均线交易台」（正文 h1 保持「状态 #id」不动）。
+    return page(f"{PRODUCT_NAME} · {_status_label(row)} #{pid}", body, request=request)
 
 
 def _close_form(row, request: Request = None) -> HTMLResponse:

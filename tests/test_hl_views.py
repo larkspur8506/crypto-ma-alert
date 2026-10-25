@@ -129,7 +129,7 @@ class TestHtmlPage(BaseCase):
     def test_hl_page_200_with_chinese_title(self):
         r = self.client.get("/hl")
         self.assertEqual(r.status_code, 200)
-        self.assertIn("Hyperliquid 执行器监控", r.text)
+        self.assertIn("双均线交易台", r.text)
         self.assertIn("<!doctype html>", r.text.lower())
         self.assertEqual(r.headers["content-type"].split(";")[0], "text/html")
 
@@ -140,8 +140,10 @@ class TestHtmlPage(BaseCase):
         self.db.mark_feed("BTC_USDT", "binance", True)
         r = self.client.get("/hl")
         self.assertEqual(r.status_code, 200)
-        for text in ("账户", "盈亏曲线（已剔除出入金）", "仓位", "交易所挂单", "系统"):
+        # P3 R1：正常态（1 仓 + 1 条 reduce-only 触发单）挂单表整块不渲染（止损由仓位表表达）
+        for text in ("账户", "盈亏曲线（已剔除出入金）", "仓位", "执行器"):
             self.assertIn(text, r.text, f"缺少区块：{text}")
+        self.assertNotIn("交易所挂单", r.text, "正常态挂单表不该渲染（P3 R1）")
         # 2026-10-18：下单记录 / 最近成交 / 信号 三张历史表已从总览（含 /hl 这张
         # 独立页，同一份 _render_body）迁到 /admin?tab=records → 这里断言"不再出现"。
         # 用 <h2> 锚点：「信号源固定 hl-candle」这类正文里也有「信号」二字
@@ -208,7 +210,7 @@ class TestHtmlPage(BaseCase):
         self.assertEqual(r.status_code, 200)
         self.assertIn("未配置 / 读取失败", r.text)
         self.assertIn("boom: network down", r.text)
-        self.assertIn("Hyperliquid 执行器监控", r.text)
+        self.assertIn("双均线交易台", r.text)
 
     def test_hl_page_unconfigured_info_and_address(self):
         from app.hl.views import DashboardDeps, build_router
@@ -610,7 +612,7 @@ class TestFailureModes(BaseCase):
                     {"system": {"mismatch": "nope"}}, {"positions": [{"coin": None}]}):
             out = render_dashboard(bad)
             self.assertIsInstance(out, str)
-            self.assertIn("Hyperliquid 执行器监控", out)
+            self.assertIn("双均线交易台", out)
             self.assertNotIn("http://cdn", out)
 
 
@@ -672,7 +674,7 @@ class TestRenderOnly(BaseCase):
     def test_render_dashboard_contains_chinese_titles(self):
         from app.hl.views import render_dashboard
         html = render_dashboard(self.payload())
-        for text in ("Hyperliquid 执行器监控", "账户", "仓位", "盈亏曲线（已剔除出入金）", "系统"):
+        for text in ("双均线交易台", "账户", "仓位", "盈亏曲线（已剔除出入金）", "执行器"):
             self.assertIn(text, html)
 
     def test_render_dashboard_stop_marks(self):

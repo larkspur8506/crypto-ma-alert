@@ -187,9 +187,8 @@ class TestRenderBlock(unittest.TestCase):
         # （P2 起 <style> 的注释里也有「账户」二字，锚点必须钉在卡片 sec 头上）
         self.assertLess(html.index("三标的动态"),
                         html.index("<div class='sec'>账户</div>"))
-        self.assertLess(html.index("<h1>Hyperliquid 执行器监控</h1>"), html.index("三标的动态"))
+        self.assertLess(html.index("<h1>双均线交易台</h1>"), html.index("三标的动态"))
         self.assertLess(html.index("三标的动态"), html.index("<h2>仓位</h2>"))
-        self.assertLess(html.index("三标的动态"), html.index("<h2>交易所挂单</h2>"))
 
     def test_head_time_takes_newest_of_three(self):
         html = self.render([self.row(symbol="A_USDT", coin="A", updated_at=1760000000.0),
@@ -276,7 +275,7 @@ class TestRenderBlock(unittest.TestCase):
         # 图例在 grid 之后、区块 card 收尾之前（即仍在「三标的动态」区块内）
         mark = '<div class="sym-legend">'
         self.assertLess(html.index("三标的动态"), html.index(mark))
-        self.assertLess(html.index(mark), html.index("<h2>交易所挂单</h2>"))
+        self.assertLess(html.index(mark), html.index("<h2>仓位</h2>"))
         # 三段口径逐条可见
         for frag in ("① 离场按 4h 收盘判定", "② 破线+密集满 6 根开多",
                      "③ 破线+MA200 下方才开空", "闸门 = 执行器动作前的附加保护"):

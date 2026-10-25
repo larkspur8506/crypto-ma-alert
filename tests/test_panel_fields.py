@@ -170,7 +170,15 @@ class TestTableHeaders(PanelFieldsBase):
         self.assertNotIn("<div class='sec'>已处理到</div>", html)
 
     def test_orders_table_last_header_is_time(self):
+        # P3 R1：挂单表只在异常态渲染 —— 加一条孤儿挂单把 fixture 推进异常态再钉表头
+        snap = fake_snapshot()
+        snap["open_orders"].append({"coin": "ETH", "oid": 8, "is_buy": True, "sz": 0.5,
+                                    "limit_px": 0.0, "reduce_only": False,
+                                    "trigger_px": 0.0, "is_trigger": False,
+                                    "timestamp": int(FIXED_NOW * 1000)})
+        self.info._snap = snap
         html = self.html()
+        self.assertIn("<h2>交易所挂单</h2>", html)
         self.assertIn("<th class='num'>时间</th>", html)
         self.assertNotIn("触发时间", html)
         self.assertIn("<th class='num'>限价</th><th class='num'>触发价</th>", html)
@@ -197,12 +205,14 @@ class TestAlertKindTxt(PanelFieldsBase):
 class TestCaliberTitles(PanelFieldsBase):
     def test_closed_pnl_and_stuck_titles(self):
         html = self.html()
-        self.assertEqual(html.count(f"title='{CLOSED_PNL_TITLE}'"), 2)   # 今日 + 累计
-        self.assertIn(f"title='{STUCK_TITLE}'", html)
-        # P2 分层后「今日/累计已实现」仍是账户卡的可见词面（今日在次级行、累计在顶层）
+        # P3 R5：「累计已实现」移入绩效卡 U 对照行，其 title 只剩「今日已实现」一处
+        self.assertEqual(html.count(f"title='{CLOSED_PNL_TITLE}'"), 1)   # 今日
+        # P3 R2：卡单移状态条徽章（只在 >0 时出现）—— 默认 fixture 无卡单 → 词面 0 处
+        self.assertNotIn(f"title='{STUCK_TITLE}'", html)
+        # P2 分层后「今日已实现」仍是账户卡次级的可见词面；「累计已实现」唯一出处=绩效卡
         self.assertIn("今日已实现", html)
         self.assertIn("累计已实现", html)
-        self.assertIn("卡在 intent/sent 的下单", html)
+        self.assertNotIn("卡在 intent/sent 的下单", html)
 
 
 if __name__ == "__main__":       # pragma: no cover
