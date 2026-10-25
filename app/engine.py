@@ -841,11 +841,11 @@ def heartbeat_text(db, cfg) -> str:
     if not any(db.open_position(s) for s in cfg.symbols):
         lines.append("当前无持仓")
     recent = db.recent_alerts(limit=200)
-    day = [a for a in recent if a["created_at"] > __import__("time").time() - 86400]
-    # 观察中的 data_error_pending 行（sent=0）不是「推送失败」——它是故意不发的，
-    # 算进失败数会把每周维护的观察行报成事故。
-    failed = [a for a in day if not a["sent_successfully"]
-              and a["kind"] != "data_error_pending"]
+    # 观察期相关行（data_error_pending，含观察中与「已恢复（未推送）」）不计入
+    # 提醒数 —— 它们从未推送给用户，算进 N 会把每周维护报成发过提醒。
+    day = [a for a in recent if a["created_at"] > __import__("time").time() - 86400
+           and a["kind"] != "data_error_pending"]
+    failed = [a for a in day if not a["sent_successfully"]]
     lines.append(f"近 24h 提醒 {len(day)} 条，其中失败 {len(failed)} 条")
     return "\n".join(lines)
 

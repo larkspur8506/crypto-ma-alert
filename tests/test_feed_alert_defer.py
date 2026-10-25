@@ -262,3 +262,20 @@ class TestParamsPageRendering(BaseCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestHeartbeatExcludesPending(_Base):
+    """主线程复核补的口径修复：心跳「近 24h 提醒 N 条」不应计入从未推送的行。
+
+    data_error_pending（含观察中与「已恢复（未推送）」）从未到达用户，算进 N 会
+    把每周维护的观察行报成「发过提醒」；转正后的 data_error 行照常计入。
+    """
+
+    def test_heartbeat_count_excludes_pending_and_recovered(self):
+        self.db.log_alert(SYM, None, "data_error_pending", "观察中", False)
+        self.db.resolve_pending_feed_errors(SYM, "—— 已于 12:00 恢复（未推送）")
+        self.db.log_alert(SYM, None, "data_error_pending", "还在观察", False)
+        self.db.log_alert(SYM, None, "entry", "开仓提醒", True)      # 真推送：计入
+        self.db.log_alert(SYM, None, "data_error", "转正推送", True)  # 转正：计入
+        text = engine.heartbeat_text(self.db, _cfg())
+        self.assertIn("近 24h 提醒 2 条，其中失败 0 条", text)
