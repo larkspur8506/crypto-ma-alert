@@ -36,6 +36,7 @@ from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import HTMLResponse
+from urllib.parse import quote
 
 from app import posfields
 from app.hl import flows as hl_flows
@@ -70,7 +71,10 @@ _ST_TXT = {"pending": "待确认", "open": "持仓中", "closed": "已平仓", "
 
 # hl_status（执行器侧的账实状态）→ 中文。只在「不是 open」时才显示在状态列第二行 ——
 # open 就是「持仓中」，再写一遍纯噪音。未知值兜底原文（不编一个看着像结论的词）。
-_HL_ST_TXT = {"closing": "平仓待核对", "mismatch": "账实不符", "aborted": "开仓中止"}
+_HL_ST_TXT = {"closing": "平仓待核对", "mismatch": "账实不符", "aborted": "开仓中止",
+              # 执行器平仓后会把 hl_status 写成 closed（executor 关账路径），不映射的话
+              # 状态列会出现「已平仓 + closed」两种写法同现（原始英文值漏到界面上）。
+              "closed": "已平仓"}
 # 宽限期（hl_close_grace_s）：与 Config/Executor 同一默认与范围（面板不 import main，
 # 也不 import executor —— 这里只要一个「读配置 + 兜底」的小工具）。
 _GRACE_DEFAULT_S = 900.0
@@ -509,6 +513,45 @@ def _symbol_state_rows(deps: DashboardDeps, db_rows: List[Any],
     return out
 
 
+def _perf_stats(rows: List[Any]) -> Dict[str, Any]:
+    """「策略绩效（上线以来）」的只读聚合：positions 表 status='closed' 行 → 统计量。
+
+    过滤口径（血泪防坑，见规格 P1）：
+    - 库里混有 2026-10-14 彩排/演练的**合成行**：其 signal_bar_ms 不在 4h 网格上
+      （4h = 14_400_000 ms，UTC 对齐），不对齐的一律不计入 —— 宁可少算一笔真实交易，
+      也不让排练数据污染均R/胜率。
+    - ``r_multiple`` 为 NULL 的行不计入笔数（没算过 R ≠ R 为 0）。
+    - side 约定 1=多 / -1=空（与 positions 表 DDL 及既有展示层一致，历史上映射写反过，
+      这里只按 DDL 口径分组，不做任何「聪明」的纠偏）。
+    """
+    bar_ms = 4 * 3600 * 1000                     # 4h 信号网格（UTC 对齐）
+    n = long = short = wins = 0
+    r_sum = 0.0
+    for r in rows or []:
+        d = _rowd(r)
+        bar = _opt_num(d.get("signal_bar_ms"))
+        if bar is None or bar <= 0 or int(bar) % bar_ms != 0:
+            continue                             # 合成行/脏行：不计入
+        r = _opt_num(d.get("r_multiple"))
+        if r is None:
+            continue                             # 没算过 R：不计入笔数
+        n += 1
+        if int(_num(d.get("side"), 1)) < 0:
+            short += 1
+        else:
+            long += 1
+        r_sum += r
+        if r > 0:
+            wins += 1
+    if n <= 0:
+        return {"n": 0, "long": 0, "short": 0, "wins": 0, "avg_r": None,
+                "win_rate": None, "total_r": None}
+    return {"n": n, "long": long, "short": short, "wins": wins,
+            "avg_r": round(r_sum / n, 4),
+            "win_rate": round(wins / n, 4),
+            "total_r": round(r_sum, 4)}
+
+
 def status_payload(deps: DashboardDeps) -> dict:
     """组装监控 JSON（schema_version=1）。任何字段缺失/接口失败都不抛异常。"""
     now = _num(_call(deps.now_fn), time.time())
@@ -745,6 +788,16 @@ def status_payload(deps: DashboardDeps) -> dict:
                 sig["funding_sum"] = round(fs, 6)
         signals.append(sig)
 
+    # ---------------- 策略绩效（上线以来，只读聚合，零行情调用）----------------
+    # 纯读库（positions closed 行）；口径与过滤见 _perf_stats。放在 payload 里而非
+    # 渲染层现查：/api/hl/status 的调用方（看守/巡检）也能拿到同一份数字。
+    perf = {"n": 0, "long": 0, "short": 0, "wins": 0, "avg_r": None,
+            "win_rate": None, "total_r": None}
+    try:
+        perf = _perf_stats(_db_call(deps.db, "closed_positions", 0.0) or [])
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 策略绩效聚合失败（按空数据处理）：%s", e)
+
     # ---------------- 盈亏曲线（已剔除出入金）+ TWR 指数 ----------------
     # 旧版这里直接画 hl_snapshots.equity —— 出入金会把曲线顶出一个台阶（本账户
     # 2026-10-14 +100.79、10-21 +901.80 两笔转入），看着像暴赚。现在主曲线是
@@ -765,6 +818,21 @@ def status_payload(deps: DashboardDeps) -> dict:
     # （§10.5 要求 curve meta 里出现 DD 字段）。**只读**执行器持久化的状态。
     if isinstance(curve.get("meta"), dict):
         curve["meta"].update(_dd_meta(deps, cfg, flows_ok))
+        # 各时间窗的净入金（span 切换时摘要行要跟着窗口走，见 _render_body）。
+        # 「全部」就是 net_deposit 本身，不重复存（同一事实只存一份）。
+        try:
+            dep_7 = dep_30 = 0.0
+            for f in flows:
+                d = _rowd(f)
+                ts, amt = _num(d.get("ts")), _num(d.get("amount"))
+                if ts >= now - 7 * _DAY:
+                    dep_7 += amt
+                if ts >= now - 30 * _DAY:
+                    dep_30 += amt
+            curve["meta"]["net_deposit_span"] = {
+                "7": round(dep_7, 6), "30": round(dep_30, 6)}
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[hl-views] 分窗净入金计算失败（渲染层回退全期口径）：%s", e)
 
     # ---------------- 事件 / 系统 ----------------
     events: List[dict] = []
@@ -857,6 +925,8 @@ def status_payload(deps: DashboardDeps) -> dict:
         # 盈亏曲线（已剔除出入金）+ TWR 指数。旧键 equity_curve（原始权益曲线）已按
         # 用户要求**整个删掉**，不是开关 —— 全仓只有这一个图表源。
         "curve": curve,
+        # 策略绩效（上线以来）：总览卡片数据源（只读聚合，见 _perf_stats）。
+        "perf": perf,
         "events": events,
     }
 
@@ -876,16 +946,41 @@ def _curve_points(v: Any) -> List[List[float]]:
     return out
 
 
-def _curve_window(pnl: List[List[float]], twr: List[List[float]]) -> tuple:
-    """展示窗口：优先近 7 天（≥2 点），否则整个 30 天；(pnl, twr, 标签)。"""
-    if len(pnl) < 2:
-        return [], [], "近 7 天"
-    cut = pnl[-1][0] - 7 * _DAY
-    sel_p = [p for p in pnl if p[0] >= cut]
-    if len(sel_p) >= 2:
-        sel_t = [p for p in twr if p[0] >= cut]
-        return sel_p, sel_t, "近 7 天"
-    return pnl, twr, "近 30 天"
+SPAN_CHOICES = (("7", "近 7 天"), ("30", "近 30 天"), ("all", "全部"))
+# 盈亏曲线时间窗（P1）：GET span ∈ 7/30/all，缺参/非法值回落 7。「全部」受快照
+# 滚动清理（hl_snapshots 约 30 天）限制，图例里必须写明，不能让人以为有历史全量。
+_SNAPSHOT_RETENTION_NOTE = "快照保留约 30 天，更早数据已清理"
+
+
+def normalize_span(v: Any) -> str:
+    """span 参数白名单：只认 7/30/all，其余（含缺参）一律回落 7。"""
+    s = str(v or "").strip().lower()
+    return s if s in ("7", "30", "all") else "7"
+
+
+def _curve_window(pnl: List[List[float]], twr: List[List[float]],
+                  span: str = "7") -> tuple:
+    """按所选时间窗切展示点列，返回 (pnl, twr, 标题, 实际天数)。
+
+    - 标题按**实际首尾**换算（快照不足所选窗口时如实标注，不编「近 7 天」）；
+      「全部」固定标「全部」。
+    - 窗口内不足 2 个点画不成线 → 回落用实际可得的全序列（旧「近 7 天不足回 30 天」
+      行为的推广：宁多画不空屏，但标题按真实跨度写）。
+    """
+    span = normalize_span(span)
+    if not pnl:
+        return [], [], "近 7 天", 0.0
+    if span == "all":
+        sel_p, sel_t = pnl, twr
+    else:
+        days = int(span)
+        cut = pnl[-1][0] - days * _DAY
+        sel_p = [p for p in pnl if p[0] >= cut]
+        sel_t = [q for q in twr if q[0] >= cut]
+        if len(sel_p) < 2:
+            sel_p, sel_t = pnl, twr
+    title = "全部" if span == "all" else f"近 {max(1, int((sel_p[-1][0] - sel_p[0][0]) / _DAY + 0.5))} 天"
+    return sel_p, sel_t, title, (sel_p[-1][0] - sel_p[0][0]) / _DAY if len(sel_p) >= 2 else 0.0
 
 
 def _downsample(n: int, cap: int) -> List[int]:
@@ -1566,7 +1661,10 @@ def _signals_html(signals: list) -> str:
         st_cls = {"open": "pos", "pending": "warn"}.get(st, "")
         hl_st = str(sg.get("hl_status") or "")
         hl_note = ""
-        if hl_st:
+        hl_txt = hl_status_text(hl_st) if hl_st else ""
+        # hl_status 与主状态同词时不显示第二行（曾出现「已平仓」+ 原始值 closed 两种
+        # 写法同现；现在 closed 已映射成中文，但同词再显示一遍仍是噪音）。
+        if hl_txt and hl_txt != _ST_TXT.get(st, st):
             # 第二行：执行器侧的账实状态（closing/mismatch/...）。宽限期额外给剩余时间，
             # 「超时前不留空白」—— 剩 0 分钟也要写出来（那正是「马上要升级成异常」）。
             extra = ""
@@ -1575,7 +1673,7 @@ def _signals_html(signals: list) -> str:
                 if left is not None:
                     mins = max(0, int(math.ceil(max(0.0, left) / 60.0)))
                     extra = f" · 剩 {mins} 分钟"
-            hl_note = (f"<div class='muted'>{_esc(hl_status_text(hl_st))}"
+            hl_note = (f"<div class='muted'>{_esc(hl_txt)}"
                        f"{_esc(extra)}</div>")
         # 单粒度资金费小字（feat/funds-ledger）：HL 持仓/已平仓行在状态下方多一行
         # 「本单资金费合计 ±X U」（正=收入，与面板全局口径一致）。非 HL 行 / 没有资金费
@@ -1608,6 +1706,55 @@ def _pct_txt(v: Any, dash: str = "—") -> str:
     """阈值 → 人话百分比（0.25 → 25%）。面板上只讲「25%」，不暴露内部小数。"""
     f = _opt_num(v)
     return dash if f is None else f"{f * 100:g}%"
+
+
+def _span_links(cur: str, k: str = "", refresh: int = 0) -> str:
+    """盈亏曲线时间窗切换链接（P1 功能二，零 JS 纯 <a>）。
+
+    当前项标 ✅ 并用高亮 btn；k 与 refresh 原样带回 —— PR #54 的教训：深链路由
+    丢 k 会 401，这里所有链接都必须带全参数。链接统一指向 /admin?tab=overview：
+    面板已合并为单一入口，在 /hl 旧页点上也会回到面板，不再各自为政。
+    """
+    cur = normalize_span(cur)
+    q = quote(str(k or ""), safe="")
+    parts: List[str] = []
+    for val, label in SPAN_CHOICES:
+        href = f"/admin?tab=overview&span={val}"
+        if refresh:
+            href += f"&refresh={int(refresh)}"
+        if q:
+            href += f"&k={q}"
+        if val == cur:
+            parts.append(f"<a class='btn' href='{href}'>✅ {label}</a>")
+        else:
+            parts.append(f"<a class='btn gray' href='{href}'>{label}</a>")
+    return " ".join(parts)
+
+
+def _perf_card_html(p: dict) -> str:
+    """「策略绩效（上线以来）」小卡（P1 功能一）。纯渲染：数字全部来自 payload.perf
+    （_perf_stats 只读聚合），本函数不做 I/O；payload 缺键/坏键一律回落「暂无」。"""
+    perf = _as_dict(p.get("perf"))
+    n = int(_num(perf.get("n")))
+    o: List[str] = ["<div class='card'><div class='sec'>策略绩效（上线以来）</div>"]
+    avg_r = _opt_num(perf.get("avg_r"))
+    if n <= 0 or avg_r is None:
+        # N=0 不除零：没有已平仓记录就是没有，不渲染 0.00% 这种编出来的数。
+        o.append("<div>暂无已平仓记录</div>")
+    else:
+        total_r = _num(perf.get("total_r"))
+        wins = int(_num(perf.get("wins")))
+        win_rate = _num(perf.get("win_rate"))
+        o.append(f"<div>已平仓 <b>{n}</b> 笔"
+                 f"（多 {int(_num(perf.get('long')))} · 空 {int(_num(perf.get('short')))}） · "
+                 f"均R <b class=\"{'pos' if avg_r >= 0 else 'neg'}\">{avg_r:+.2f}</b> · "
+                 f"胜率 {win_rate * 100:.0f}%（赢 {wins} 笔） · "
+                 f"累计 R <b class=\"{'pos' if total_r >= 0 else 'neg'}\">{total_r:+.1f}</b></div>")
+    # 口径落可见文字（iOS 无悬停，铁律 5）。
+    o.append('<div class="legend">口径：按已平仓记录 · R = 盈亏 ÷ 开仓时计划风险 · '
+             '不含未平仓</div>')
+    o.append("</div>")
+    return "".join(o)
 
 
 def _dd_line_html(meta: Dict[str, Any]) -> str:
@@ -1661,7 +1808,9 @@ def _render_body(p: dict) -> str:
     stuck = _opt_num(system.get("stuck_orders"))
     pnl_all = _curve_points(curve.get("pnl"))
     twr_all = _curve_points(curve.get("twr"))
-    shown_pnl, shown_twr, curve_span = _curve_window(pnl_all, twr_all)
+    # 时间窗（P1）：GET span ∈ 7/30/all，缺参/非法值回落 7（normalize_span 白名单）。
+    span = normalize_span(p.get("curve_span"))
+    shown_pnl, shown_twr, curve_span, _actual_days = _curve_window(pnl_all, twr_all, span)
 
     o: List[str] = []
     o.append("<h1>Hyperliquid 执行器监控</h1>")
@@ -1750,6 +1899,13 @@ def _render_body(p: dict) -> str:
              '可提 = 现货 − 仓位/挂单占用</div>')
     o.append("</div>")
 
+    # ---------------- 策略绩效（上线以来）----------------
+    # 位置由规格钉死：账户卡之后、盈亏曲线之前（P1 功能一）。渲染失败不弄挂总览页。
+    try:
+        o.append(_perf_card_html(p))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 策略绩效卡渲染失败：%s", e)
+
     # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
     # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
     # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
@@ -1763,19 +1919,35 @@ def _render_body(p: dict) -> str:
                    or "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
         o.append(f"<div class=\"legend\">{_esc(note)}</div>")
     elif len(shown_pnl) >= 2:
-        pnl_total = _opt_num(curve_meta.get("pnl_total")) or 0.0
-        net_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
-        max_dd = _opt_num(curve_meta.get("max_dd_pnl")) or 0.0
-        twr_pct = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
+        # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，
+        # 不另起炉灶 —— span=all 时与 curve.meta 的全期数字逐字相同（首点 pnl=0、
+        # 指数=100），两种口径不会打架。
+        w_pnl = shown_pnl[-1][1] - shown_pnl[0][1]
+        # 峰谷回撤复用 flows 的同一份实现（同一事实一种写法，不复制第二份逻辑）。
+        w_dd = hl_flows._max_drawdown([v for _, v in shown_pnl])
+        dep_span = _as_dict(curve_meta.get("net_deposit_span"))
+        w_dep = (_opt_num(dep_span.get(span)) if span in ("7", "30") else None)
+        if w_dep is None:
+            w_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
+        if len(shown_twr) >= 2 and shown_twr[0][1] > 0:
+            # 区间链式收益：指数末点 ÷ 首点 − 1（窗口内任意一点都是链式乘积，直接相除）。
+            w_twr = (shown_twr[-1][1] / shown_twr[0][1] - 1.0) * 100.0
+            twr_label = "收益指数（区间）"
+        else:
+            w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
+            twr_label = "收益指数"
         # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
         o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
-                 f"<span>累计盈亏 <b class='{'pos' if pnl_total >= 0 else 'neg'}'>"
-                 f"{pnl_total:+,.2f} U</b></span></div>")
-        o.append(f"<div class=\"legend\">累计盈亏 {pnl_total:+,.2f}U · 净入金 {net_dep:,.2f}U · "
-                 f"最大回撤 {max_dd:,.2f}U · 收益指数 {twr_pct:+.2f}%（起点 100）</div>")
+                 f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
+                 f"{w_pnl:+,.2f} U</b></span>"
+                 f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
+        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {w_pnl:+,.2f}U · "
+                 f"净入金 {w_dep:,.2f}U · 最大回撤 {w_dd:,.2f}U · "
+                 f"{twr_label} {w_twr:+.2f}%</div>")
         o.append(_pnl_svg(shown_pnl, shown_twr))
+        tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
         o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
-                 '虚线=收益指数（起点 100，右轴）</div>')
+                 f'虚线=收益指数（起点 100，右轴）{tail}</div>')
     else:
         o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
         o.append(_pnl_svg([], []))
@@ -1978,11 +2150,13 @@ def build_router(deps: DashboardDeps) -> Any:
     router = APIRouter(tags=["hl"])
 
     @router.get("/hl", response_class=HTMLResponse)
-    def hl_page(request: Request, refresh: int = 0, k: str = ""):
+    def hl_page(request: Request, refresh: int = 0, k: str = "", span: str = "7"):
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
         payload = dict(status_payload(deps))
         payload["refresh"] = refresh if refresh in (10, 30, 60) else 0
+        # 盈亏曲线时间窗（P1）：白名单外（含缺参）回落 7，见 normalize_span。
+        payload["curve_span"] = normalize_span(span)
         payload["theme"] = normalize_theme(request.cookies.get("cma_theme"))
         payload["admin_k"] = str(k or "")
         return HTMLResponse(render_dashboard(payload))
