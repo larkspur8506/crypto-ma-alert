@@ -123,7 +123,7 @@ class BaseCase(unittest.TestCase):
 
 # ---------------------------------------------------------------- 功能一：账户卡
 class TestAccountLayer(BaseCase):
-    TOP = ("账户总值", "累计已实现", "可提余额")
+    TOP = ("账户总值", "可提余额")   # P3 R5：「累计已实现」从顶层删除（并入绩效卡 U 对照行）
     SUB = ("钱包地址", "资金分布（统一账户）", "持仓名义", "今日已实现", "净手续费（付出）")
 
     def test_top3_and_secondary_items_all_present(self):
@@ -133,13 +133,15 @@ class TestAccountLayer(BaseCase):
                 self.assertIn(w, seg, f"顶层关键数缺「{w}」（/hl 与 /admin 都要验）")
             for w in self.SUB:
                 self.assertIn(w, seg, f"次级项缺「{w}」（搬位置不是删内容）")
-            # 顶层三数大字结构（.acct-top）与次级 muted 小字（.acct-sub）都在
+            # 顶层大字结构（.acct-top）与次级 muted 小字（.acct-sub）都在
             self.assertIn("acct-top", seg)
             self.assertIn("acct-sub", seg)
+            # P3 R4：次级项收进 <details>「资金明细」，默认收起
+            self.assertIn("<details class='acct-details'><summary>资金明细</summary>", seg)
 
     def test_top3_values_match_old_caliber(self):
         # 累计/今日已实现是交易所 closedPnl 口径，来源是 hl_fills（不是快照字段）：
-        # 落一笔 closed_pnl=-14.38 的平仓成交，让顶层「累计已实现」有非零真值可钉。
+        # 落一笔 closed_pnl=-14.38 的平仓成交，让绩效卡「累计已实现」U 对照行有真值可钉。
         self.db.hl_upsert_fill(tid="f1", symbol="BTC_USDT", coin="BTC", side=-1,
                                sz=0.00905, px=101_000.0, fee=0.0, fee_token="USDT",
                                dir="Close Short", closed_pnl=-14.38, hash="0xf1",
@@ -147,10 +149,15 @@ class TestAccountLayer(BaseCase):
         for html in self.both():
             seg = self.account_seg(html)
             self.assertIn("账户总值 <b>995.06 U</b>", seg)
-            self.assertIn("累计已实现", seg)
-            self.assertIn("-14.38 U", seg, "累计已实现为交易所 closedPnl 口径（负数如实）")
+            self.assertNotIn("累计已实现", seg, "P3 R5：账户卡顶层不再有「累计已实现」")
+            self.assertIn("-14.38 U", seg, "今日已实现为交易所 closedPnl 口径（负数如实）")
             self.assertIn("824.34 U", seg, "统一账户可提 = 现货 − 仓位/挂单占用")
             self.assertIn("（提现收 1U 手续费）", seg)
+            # 全页唯一出处：绩效卡 U 对照行
+            perf_seg = html.split("策略绩效（上线以来）", 1)[1]
+            self.assertIn("累计已实现", perf_seg)
+            self.assertIn("累计已实现 -14.38 U", perf_seg,
+                          "U 对照 = 交易所 closedPnl 口径（负数如实）")
 
     def test_dedup_rows_gone_from_account_but_position_columns_stay(self):
         self.info._snap = fake_snapshot(positions=[held_position()])

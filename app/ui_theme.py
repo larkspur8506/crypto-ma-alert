@@ -18,6 +18,14 @@ THEMES = ("auto", "dark", "light")
 THEME_COOKIE = "cma_theme"
 DEFAULT_THEME = "auto"
 
+# 用户可见产品名（P3 命名重设计）。工程名 crypto-ma-alert（repo/容器/镜像/日志前缀）
+# 一律不改 —— 这里只管「页面上叫什么」。副题一句话说清产品现状：标的 / 周期 / 交易所。
+PRODUCT_NAME = "双均线交易台"
+PRODUCT_SUBTITLE = "BTC / ETH / SOL · 4h 密集突破 · Hyperliquid 自动执行"
+# /hl 独立页与 /admin 共用同一个头部块（h1 + muted 副题）；.h1sub 样式在 views.DASH_CSS。
+H1_BLOCK = (f"<h1>{PRODUCT_NAME}</h1>"
+            f"<div class='h1sub'>{PRODUCT_SUBTITLE}</div>")
+
 # 手机「添加到主屏」用的 <head> 片段（apple-touch-icon / favicon / manifest / 主题色）。
 # 三个自包含页面（管理面板、/c 确认页、/hl 监控页）共用同一份，避免各处抄一遍走形。
 # 全用**绝对路径**：这些页面都挂在站点根下，反代换域名后天然同源，不依赖当前路径层级。

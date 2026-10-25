@@ -443,13 +443,14 @@ class TestRenewPanel(Base):
                                 "days_left": 100, "checked_ms": NOW_MS,
                                 "cleanup": "none", "source": "api", "level": "ok"})
         html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
-        self.assertIn("<h2>API 有效期</h2>", html)
         self.assertIn("代理钱包地址", html)
         self.assertIn("0xc1ee…be22", html, "地址要前 6 + 后 4 截断")
         self.assertIn("到期日", html)
         self.assertIn("还剩 100 天", html)
         self.assertIn("正常", html)
         self.assertIn("到期前自动清仓", html)
+        # P3 R3：状态卡降级为总览末尾 <details>（100 天 → 默认收起）
+        self.assertIn("<details class='card agent-card'><summary>API 有效期</summary>", html)
         # 状态卡里不再有写操作入口（续期表单已迁参数页）
         self.assertNotIn("action='/admin/hl/agent/renew'", html)
 
@@ -473,9 +474,9 @@ class TestRenewPanel(Base):
                                 "cleanup": "none", "source": "api", "level": "near"})
         c = self._client()
         ov = c.get("/admin", params={"k": "tk", "tab": "overview"}).text
-        # 总览末尾：账户卡与「系统」区块之后
-        self.assertLess(ov.index("账户</div>"), ov.index("<h2>API 有效期</h2>"))
-        self.assertLess(ov.index("<h2>系统</h2>"), ov.index("<h2>API 有效期</h2>"))
+        # 总览末尾：账户卡与「执行器」区块之后（P3 R2 系统→执行器；P3 R3 卡降级 details）
+        self.assertLess(ov.index("账户</div>"), ov.index("<summary>API 有效期</summary>"))
+        self.assertLess(ov.index("<h2>执行器</h2>"), ov.index("<summary>API 有效期</summary>"))
         # 三标的动态仍在账户卡之前（原位置未被挤动）
         if "三标的动态" in ov:
             self.assertLess(ov.index("三标的动态"), ov.index("账户</div>"))
@@ -533,7 +534,7 @@ class TestRenewPanel(Base):
     def test_unknown_state_renders_without_network(self):
         """state 空 → 显示未知与「下一个整点」，且不调用任何 info 方法。"""
         html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
-        self.assertIn("<h2>API 有效期</h2>", html)
+        self.assertIn("<summary>API 有效期</summary>", html)
         self.assertIn("未知", html)
         self.assertIn("下一个整点", html)
 

@@ -41,8 +41,8 @@ from urllib.parse import quote
 from app import posfields
 from app.hl import flows as hl_flows
 from app.hl import dd as hl_dd
-from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, normalize_theme, theme_attr,
-                          theme_switch_html)
+from app.ui_theme import (ICON_LINKS, SYMBOL_CSS, THEME_CSS, H1_BLOCK, PRODUCT_NAME,
+                          normalize_theme, theme_attr, theme_switch_html)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +52,7 @@ __all__ = [
     "status_payload", "render_dashboard", "build_router",
     "DASH_CSS", "_render_body", "THEME_CSS",
     "ROW_CHOICES", "DEFAULT_ROWS", "ROWS_COOKIE", "normalize_rows", "_signals_html",
+    "_stuck_badge_html", "_agent_badge_html",
 ]
 
 # 长表每页行数（手机优先）：默认 20，面板上可切 10/20/50，选择存 cookie `cma_rows`。
@@ -242,6 +243,71 @@ def _asub(label: str, value: str, cls: str = "", title: str = "") -> str:
 def _badge(dot_cls: str, label: str, value_html: str) -> str:
     return (f"<span class='badge'><span class='{dot_cls}'>&#9679;</span> "
             f"{label} <b>{value_html}</b></span>")
+
+
+def _strip_badge(dot_cls: str, label: str, value: str, title: str = "") -> str:
+    """状态条徽章（/hl 与 /admin 两条状态条共用一种写法；admin_ui._status_strip 也用它）。"""
+    t = f" title='{_esc(title)}'" if title else ""
+    return (f"<span class='badge'{t}><span class='{dot_cls}'>&#9679;</span> "
+            f"{label} <b>{value}</b></span>")
+
+
+def _stuck_badge_html(system: Any) -> str:
+    """卡单徽章（P3 R2）：只在 >0 时出现在状态条（琥珀）。
+
+    从「系统」卡搬来 —— 口径（持续 3 分钟未推进才计入）随迁进 title（桌面增强，
+    规格 R2 明确允许）；正常态状态条不出现「卡单」字样。
+    """
+    n = _opt_int(_as_dict(system).get("stuck_orders"))
+    if not n or n <= 0:
+        return ""
+    return _strip_badge("warn", "卡单", f"{n} 笔",
+                        "卡在 intent/sent 的下单：持续 3 分钟未推进才计入")
+
+
+def _agent_badge_html(agent: Any) -> str:
+    """API 有效期徽章（P3 R3）：状态条是唯一常驻出处。
+
+    ≤14 天琥珀、≤7 天红、已触发自动清仓红；不限期绿；读不到到期灰（如实显示，
+    下一个整点会自动检查）。数字来自 hl_agent_state（DB 缓存，零网络调用）。
+    """
+    a = _as_dict(agent)
+    level = str(a.get("level") or "")
+    cleanup = str(a.get("cleanup") or "none")
+    days = _opt_int(a.get("days_left"))
+    if cleanup == "done":
+        return _strip_badge("neg", "API", "已清仓", "API 授权已到期并触发自动清仓")
+    if level == "no_expiry":
+        return _strip_badge("pos", "API", "不限期", "API 授权未设到期时间")
+    if days is None:
+        return _strip_badge("muted", "API", "—", "API 授权有效期未知（每个整点自动检查）")
+    cls = "neg" if days <= 7 else ("warn" if days <= 14 else "pos")
+    return _strip_badge(cls, "API", f"{days} 天",
+                        "API 授权剩余有效期；≤3 天且有仓位时自动清仓（「开关」页可关）")
+
+
+def _orders_normal(positions: List[dict], orders: List[dict]) -> bool:
+    """挂单表按需渲染判定（P3 R1）。
+
+    正常态 = 每个持仓标的恰好一条 reduce-only 触发单、无其它挂单、无孤儿 ——
+    此时止损已由仓位表「止损 ✔️」列唯一表达，挂单表整块不渲染。
+    判不清（挂单不可信 / 数据缺失）一律返回 False = 照常渲染（fail-open：
+    宁可多显示，不可漏报）。纯渲染层判定，/api/hl/status 的 orders_open 口径不变。
+    """
+    # 挂单不可信（快照 orders_trusted=False）→ 止损列本身是「? 无法确认」，判不清。
+    if any(_as_dict(p).get("stop_unknown") for p in positions):
+        return False
+    by_coin: Dict[str, int] = {}
+    for od in (_as_dict(x) for x in orders):
+        coin = str(od.get("coin") or "")
+        if not (od.get("is_trigger") and od.get("reduce_only")):
+            return False                      # 非止损类型挂单 = 异常态
+        by_coin[coin] = by_coin.get(coin, 0) + 1
+    pos_coins = {str(_as_dict(p).get("coin") or "") for p in positions}
+    # 集合不等 = 有孤儿挂单 / 有仓没单；再逐标的数一遍保证「恰好一条」。
+    if set(by_coin) != pos_coins:
+        return False
+    return all(n == 1 for n in by_coin.values())
 
 
 def _td(text: str, cls: str = "") -> str:
@@ -894,6 +960,23 @@ def status_payload(deps: DashboardDeps) -> dict:
 
     kill, kill_reason = _kill_state(deps)
 
+    # API 有效期（P3 R3）：状态条徽章的数据源。只读 hl_agent_state DB 缓存
+    #（执行器每个整点刷新），面板渲染零网络调用；缺失/损坏一律空 dict → 徽章显「—」。
+    agent_out: dict = {}
+    try:
+        from app.hl import agent as _agent_mod
+        st = _agent_mod.read_state(deps.db) if deps.db is not None else {}
+        st = st if isinstance(st, dict) else {}
+        lvl = str(st.get("level") or "")
+        if not lvl:
+            # 老 state 没有 level 字段时的兜底（有 until 就按毫秒重算），口径同 admin_ui.render_agent_card
+            lvl = (_agent_mod.level_ms(st.get("valid_until_ms"), st.get("checked_ms"))
+                   if st.get("valid_until_ms") else "unknown")
+        agent_out = {"days_left": _opt_int(st.get("days_left")), "level": lvl,
+                     "cleanup": str(st.get("cleanup") or "none")}
+    except Exception as e:                                            # noqa: BLE001
+        logger.warning("[hl-views] 读 API 有效期状态失败（徽章显 —）：%s", e)
+
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": now,
@@ -945,6 +1028,9 @@ def status_payload(deps: DashboardDeps) -> dict:
         "curve": curve,
         # 策略绩效（上线以来）：总览卡片数据源（只读聚合，见 _perf_stats）。
         "perf": perf,
+        # API 有效期（P3 R3）：状态条徽章唯一常驻出处；/admin 的 get_payload 会用
+        # deps.agent_state_fn 的同一份缓存覆盖（注入测试路径）。
+        "agent": agent_out,
         "events": events,
     }
 
@@ -1131,7 +1217,9 @@ html,body{margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
      background:var(--bg);color:var(--fg);line-height:1.55;font-size:14px;padding:14px}
 .wrap{max-width:1180px;margin:0 auto}
-h1{font-size:19px;margin:0 0 10px;font-weight:600}
+h1{font-size:19px;margin:0 0 2px;font-weight:600}
+/* 头部副题（P3 命名重设计）：h1 下一行 muted 小字，一句话说清标的/周期/交易所。 */
+.h1sub{margin:0 0 10px;font-size:12px;color:var(--muted)}
 h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;margin-bottom:12px}
 .bar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-bottom:12px}
@@ -1190,6 +1278,11 @@ a{color:var(--link)}
 .acct-sub{display:flex;flex-wrap:wrap;gap:2px 16px;padding:8px 0 2px;
           font-size:12px;color:var(--muted);overflow-wrap:anywhere}
 .acct-sub b{font-weight:600;font-variant-numeric:tabular-nums}
+/* 账户卡次级折叠（P3 R4）与 API 有效期折叠（P3 R3）：原生 <details>，零 JS。
+   summary 摸起来要像可点的：指针光标 + muted 小字。 */
+details.acct-details>summary,details.card>summary{cursor:pointer;color:var(--muted);
+   font-size:12.5px;letter-spacing:1px;padding:2px 0}
+details.card>summary{font-size:12px;color:var(--h2)}
 /* 仓位表窄屏适配（P2）：小字行 tr.subm 默认隐藏（宽屏 13 列齐全）；≤640px 时
    隐藏 .hidem 列、显示小字行 —— 显隐只靠 CSS media query，零 JS。 */
 tr.subm{display:none}
@@ -1822,9 +1915,18 @@ def _perf_card_html(p: dict) -> str:
                  f"均R <b class=\"{'pos' if avg_r >= 0 else 'neg'}\">{avg_r:+.2f}</b> · "
                  f"胜率 {win_rate * 100:.0f}%（赢 {wins} 笔） · "
                  f"累计 R <b class=\"{'pos' if total_r >= 0 else 'neg'}\">{total_r:+.1f}</b></div>")
-    # 口径落可见文字（iOS 无悬停，铁律 5）。
-    o.append('<div class="legend">口径：按已平仓记录 · R = 盈亏 ÷ 开仓时计划风险 · '
-             '不含未平仓</div>')
+    # U 对照行（P3 R5）：本卡是 R（策略口径）的主场，金额视角给一行交易所口径对照，
+    # 数字与账户卡同源（account.total_realized）——「累计已实现」全页唯一出处就在这行。
+    acc = _as_dict(p.get("account"))
+    u_txt, u_cls = _sign(acc.get("total_realized"))
+    if u_txt != "—":
+        o.append(f"<div>按金额：<span class='{u_cls}'>累计已实现 {u_txt}</span>"
+                 f"<span class='muted'>（交易所口径，未扣手续费与资金费）</span></div>")
+    # 口径落可见文字（iOS 无悬停，铁律 5）+ 主从说明（P3 R5）：R 是本卡主数字、
+    # U 是对照，两个口径不直接换算 —— 不写清用户会以为数字打架。
+    o.append('<div class="legend">口径：按已平仓记录 · 不含未平仓 · '
+             'R = 策略口径（1R=开仓时计划风险）；U = 账户口径（交易所已实现）'
+             '——两者口径不同，不直接换算</div>')
     o.append("</div>")
     return "".join(o)
 
@@ -1877,7 +1979,6 @@ def _render_body(p: dict) -> str:
     latency = _opt_num(net.get("latency_ms"))
     error = str(net.get("error") or "")
     mismatch = bool(system.get("mismatch"))
-    stuck = _opt_num(system.get("stuck_orders"))
     pnl_all = _curve_points(curve.get("pnl"))
     twr_all = _curve_points(curve.get("twr"))
     # 时间窗（P1）：GET span ∈ 7/30/all，缺参/非法值回落 7（normalize_span 白名单）。
@@ -1885,7 +1986,7 @@ def _render_body(p: dict) -> str:
     shown_pnl, shown_twr, curve_span, _actual_days = _curve_window(pnl_all, twr_all, span)
 
     o: List[str] = []
-    o.append("<h1>Hyperliquid 执行器监控</h1>")
+    o.append(H1_BLOCK)
 
     # ---------------- 顶部状态条 ----------------
     o.append("<div class='bar'>")
@@ -1899,11 +2000,15 @@ def _render_body(p: dict) -> str:
         f"<span class='pos'>&#9679;</span> 对账 <b>一致</b>" if not mismatch
         else f"<span class='neg'>&#9679;</span> 对账 <b>不一致</b>"
     ) + "</span>")
+    # 卡单徽章（P3 R2）：只在 >0 时出现，正常态状态条不出现「卡单」字样。
+    o.append(_stuck_badge_html(system))
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
     # 这是「服务器 → Hyperliquid」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
     o.append(f"<span class='badge' title='oracle1 上的容器请求 Hyperliquid /info 的耗时（含失败重试）；"
              f"与你的浏览器到本站的延迟无关'>"
              f"<span class='pos'>&#9679;</span> HL 延迟 <b>{lat_txt}</b></span>")
+    # API 有效期徽章（P3 R3）：唯一常驻出处（原「API 有效期」卡降级为总览末尾的 details）。
+    o.append(_agent_badge_html(p.get("agent")))
     o.append(f"<span class='badge'><span class='muted'>&#9679;</span> 更新 "
              f"<b>{_fmt_dt(p.get('ts'))}</b></span>")
     o.append("</div>")
@@ -1924,14 +2029,15 @@ def _render_body(p: dict) -> str:
         logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
 
 
-    # ---------------- 账户卡片（P2：分层 + 消重复）----------------
-    # 分两层：顶层 3 个关键数（大字，手机一眼读）＋ 次级项收成 muted 小字行。
+    # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
+    # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」
+    #（默认收起，零 JS）。P3 R5：顶层删「累计已实现」—— 它已并入策略绩效卡
+    #（U 对照行，全页唯一出处），顶层只剩 账户总值 · 可提余额。
     # 「浮盈浮亏」「资金费（持仓期内）」两行删除：同一数字在仓位表每仓各有一份
     # （浮盈还带 ROE%，见下），账户级聚合行等于同屏第二遍；空仓时浮盈本来就没有
     # 可看的，无信息损失。次级项只是搬位置，一项不少、数值口径不变。
     o.append("<div class='card'><div class='sec'>账户</div>")
     today_txt, today_cls = _sign(acc.get("today_realized"))
-    total_txt, total_cls = _sign(acc.get("total_realized"))
     fees = _num(acc.get("fees_total"))
     # 可提口径与旧版逐字一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
     # （HL 提现固定收 1U 手续费；短说放数字后缀，口径细节在 title 悬停）。
@@ -1944,12 +2050,10 @@ def _render_body(p: dict) -> str:
         wd_html = f"{_fmt(wd)} U"
         wd_title = ""
     wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
-    total_b = f"<b class='{total_cls}'>{total_txt}</b>" if total_cls else f"<b>{total_txt}</b>"
     o.append("<div class='acct-top'>"
              f"<span>账户总值 <b>{_fmt(acc.get('equity'))} U</b></span>"
-             f"<span title='交易所 closedPnl 口径，未扣手续费与资金费'>"
-             f"累计已实现 {total_b}</span>"
              f"<span{wd_t}>可提余额 <b>{wd_html}</b></span></div>")
+    o.append("<details class='acct-details'><summary>资金明细</summary>")
     o.append("<div class='acct-sub'>")
     o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
     if acc.get("unified") and not acc.get("spot_ok", True):
@@ -1968,6 +2072,7 @@ def _render_body(p: dict) -> str:
                    title="交易所 closedPnl 口径，未扣手续费与资金费"))
     o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
     o.append("</div>")
+    o.append("</details>")
     # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
     # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
     o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
@@ -2100,48 +2205,48 @@ def _render_body(p: dict) -> str:
     o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
              '窄屏隐藏列的数值见各仓下方小字行</div>')
 
-    # ---------------- 挂单 ----------------
-    o.append("<h2>交易所挂单</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
-             "<th>币种</th><th>类型</th><th>方向</th><th class='num'>数量</th>"
-             "<th class='num'>限价</th><th class='num'>触发价</th><th class='num'>时间</th>"
-             "</tr></thead><tbody>")
-    for od in (_as_dict(x) for x in orders_open):
-        kind = "止损触发" if od.get("is_trigger") else ("市价/限价" if od.get("limit_px") else "下单")
-        if od.get("reduce_only"):
-            kind = (kind + " <span class='muted'>(减仓)</span>")
-        o.append("<tr>"
-                 + _td(_esc(od.get("coin") or "—"))
-                 + _td(kind)
-                 + _td("买" if od.get("is_buy") else "卖")
-                 + _td(_fmt_sz(od.get("sz")), "num")
-                 + _td(_fmt(od.get("limit_px")), "num")
-                 + _td(_fmt(od.get("trigger_px")), "num")
-                 + _td(_fmt_dt(od.get("timestamp")), "num")
-                 + "</tr>")
-    if not orders_open:
-        o.append("<tr><td colspan='7' class='muted'>交易所无挂单</td></tr>")
-    o.append("</tbody></table></div>")
+    # ---------------- 挂单（按需渲染，P3 R1）----------------
+    # 正常态（每仓恰好一条 reduce-only 触发单、无孤儿、无其它挂单）整块不渲染：
+    # 止损已由仓位表「止损 ✔️」列唯一表达（顺带消掉止损价在挂单表的第二次出现）。
+    # 异常态 / 判不清（fail-open）才照常渲染完整挂单表。子页 /admin/list/orders 不变。
+    if not _orders_normal(positions, orders_open):
+        o.append("<h2>交易所挂单</h2>")
+        o.append("<div class='tablewrap'><table><thead><tr>"
+                 "<th>币种</th><th>类型</th><th>方向</th><th class='num'>数量</th>"
+                 "<th class='num'>限价</th><th class='num'>触发价</th><th class='num'>时间</th>"
+                 "</tr></thead><tbody>")
+        for od in (_as_dict(x) for x in orders_open):
+            kind = "止损触发" if od.get("is_trigger") else ("市价/限价" if od.get("limit_px") else "下单")
+            if od.get("reduce_only"):
+                kind = (kind + " <span class='muted'>(减仓)</span>")
+            o.append("<tr>"
+                     + _td(_esc(od.get("coin") or "—"))
+                     + _td(kind)
+                     + _td("买" if od.get("is_buy") else "卖")
+                     + _td(_fmt_sz(od.get("sz")), "num")
+                     + _td(_fmt(od.get("limit_px")), "num")
+                     + _td(_fmt(od.get("trigger_px")), "num")
+                     + _td(_fmt_dt(od.get("timestamp")), "num")
+                     + "</tr>")
+        if not orders_open:
+            o.append("<tr><td colspan='7' class='muted'>交易所无挂单</td></tr>")
+        o.append("</tbody></table></div>")
 
-    # ---------------- 系统卡片 ----------------
+    # ---------------- 执行器（P3 R2 瘦身）----------------
+    # 原「系统」卡收敛：对账/熔断两行删除（顶部状态条徽章是唯一出处）、
+    # 卡单移状态条徽章（>0 才出现）—— 卡内不再重复任何一处状态条已有的事实。
+    # 只留「执行器最后事件」（判活读数）+ 交易所地址/环境一行 muted。
     # 注：「下单记录」「最近成交」两张表已从总览移除（2026-10-18 用户要求：与「记录」页
     # 的 hl_orders / hl_fills 完全重复 → 去 /admin?tab=records 看）。
     # 更早的「执行器事件」表同理（2026-10-15 移除）。「信号」表也在本次迁到记录页，
     # 渲染函数保留为 _signals_html（记录页复用它，两边长得一样）。
-    o.append("<h2>系统</h2>")
+    base_txt = str(net.get("base_url") or "—").replace("https://", "").replace("http://", "")
+    o.append("<h2>执行器</h2>")
     o.append("<div class='card'><div class='grid'>")
     o.append(_kv("执行器最后事件", _fmt_dt(system.get("executor_last_event_at"))))
-    o.append(_kv("卡在 intent/sent 的下单", f"{int(stuck or 0)} 笔",
-                 "neg" if stuck else "muted",
-                 title="持续 3 分钟未推进才计入"))
-    o.append(_kv("对账", "一致" if not mismatch else "不一致", "pos" if not mismatch else "neg"))
-    o.append(_kv("交易所地址", _esc(net.get("base_url") or "—")))
-    o.append(_kv("环境", "测试网" if net.get("testnet") else "主网"))
-    o.append(_kv("熔断", "已触发" if kill else "未触发", "neg" if kill else "pos"))
     o.append("</div>")
-    # 注脚（可见文字）：卡单与 HL 延迟两条口径原先只在两处 title 里，手机上读不到。
-    o.append('<div class="legend">卡单 = 持续 3 分钟未推进才计入 · '
-             'HL 延迟 = 容器请求 /info 耗时（含失败重试），与本机网速无关</div>')
+    o.append(f"<div class='muted'>交易所 {_esc(base_txt)} · "
+             f"{'测试网' if net.get('testnet') else '主网'}</div>")
     # P2：原「数据源健康」「已处理到」两张表已整块删除（不是折叠）—— 每标的数据源
     # 状态 / 最后成功 / 已处理到，由顶部「三标的动态」卡在该标的名下的小字行唯一承载
     #（见 _feed_line），同一事实整页一种写法。
@@ -2172,7 +2277,7 @@ def render_dashboard(payload: dict) -> str:
         body = _render_body(p)
     except Exception as e:                                        # noqa: BLE001
         logger.exception("[hl-views] render_dashboard 渲染失败：%s", e)
-        body = (f"<h1>Hyperliquid 执行器监控</h1>"
+        body = (f"{H1_BLOCK}"
                 f"<div class='banner'>渲染失败：{_esc(e)}</div>")
     refresh = int(_num(p.get("refresh")))
     if refresh not in (10, 30, 60):
@@ -2185,7 +2290,7 @@ def render_dashboard(payload: dict) -> str:
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"{ICON_LINKS}"
-        f"{meta}<title>Hyperliquid 执行器监控</title>{THEME_CSS}{DASH_CSS}</head>"
+        f"{meta}<title>{PRODUCT_NAME} · 总览</title>{THEME_CSS}{DASH_CSS}</head>"
         f"<body><div class='wrap'>{body}{_render_footer(refresh, theme, str(p.get('admin_k') or ''))}</div></body></html>")
 
 

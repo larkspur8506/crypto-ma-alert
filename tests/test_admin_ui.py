@@ -214,10 +214,13 @@ class TestAuth(BaseCase):
 class TestOverviewTab(BaseCase):
     def test_overview_200_with_key_blocks(self):
         html = self.body(tab="overview")
-        for s in ("账户总值", "盈亏曲线（已剔除出入金）", "仓位", "交易所挂单"):
+        for s in ("账户总值", "盈亏曲线（已剔除出入金）", "仓位"):
             self.assertIn(s, html)
-        # 2026-10-19：状态卡在总览末尾（PR#29 搬多了，用户拍板只把「更新 API」表单留参数页）
-        self.assertIn("<h2>API 有效期</h2>", html)
+        # 本 fixture 的快照没带 orders_trusted（挂单不可信）→ P3 R1 fail-open：
+        # 判不清就照常渲染挂单表（正常态 0 处的两态断言在 tests/test_panel_p3.py）
+        self.assertIn("交易所挂单", html)
+        # 2026-10-19：状态卡在总览末尾；P3 R3 降级为 <details>（默认收起）
+        self.assertIn("<summary>API 有效期</summary>", html)
         # 2026-10-15 用户反馈：总览与「记录」页的执行器事件表完全重复 → 总览移除
         self.assertNotIn("执行器事件", html)
         # 2026-10-18 同一类操作：下单记录 / 最近成交 / 信号 三张历史表迁到「记录」页
@@ -226,13 +229,13 @@ class TestOverviewTab(BaseCase):
             self.assertNotIn(gone, html, f"总览不该再有历史表：{gone}")
 
     def test_overview_keeps_current_state_blocks(self):
-        """迁走三张表 + API 有效期卡片后，总览的当下块必须还在（仓位/挂单/系统）。"""
+        """迁走三张表 + API 有效期卡降级后，总览的当下块必须还在（仓位/执行器）。"""
         html = self.body(tab="overview")
-        for keep in ("<h2>仓位</h2>", "<h2>交易所挂单</h2>", "<h2>系统</h2>",
+        for keep in ("<h2>仓位</h2>", "<h2>执行器</h2>",
                      "<h2>盈亏曲线（已剔除出入金）</h2>"):
             self.assertIn(keep, html, f"总览缺少当下块：{keep}")
-        # API 有效期状态卡在总览末尾（只把写私钥的「更新 API」表单留在参数页）
-        self.assertIn("<h2>API 有效期</h2>", html)
+        # P3 R2：对账/熔断两行从「系统」（现「执行器」）卡删除 —— 状态条徽章是唯一出处
+        self.assertIn("<summary>API 有效期</summary>", html)
         # 三标的动态（用户钉死在 tabs 之后第一块）仍在
         self.assertIn("三标的动态", html)
 
@@ -241,7 +244,7 @@ class TestOverviewTab(BaseCase):
         self.assertEqual(html.count("<h1>"), 1, "整页只能有一个 <h1>（hl 自带标题已剥掉）")
         # <h2> 区块是 hl/views._render_body 的产物，admin_ui 自己一个 <h2> 都不渲染
         # （记录页的五块用 <div class='sec'> 标题，不用 <h2>）
-        for h2 in ("<h2>仓位</h2>", "<h2>盈亏曲线（已剔除出入金）</h2>", "<h2>交易所挂单</h2>"):
+        for h2 in ("<h2>仓位</h2>", "<h2>盈亏曲线（已剔除出入金）</h2>", "<h2>执行器</h2>"):
             self.assertIn(h2, html, f"总览应内嵌 _render_body 的 {h2}")
         # 下单记录已迁走 → 总览的 <h2> 计数也随之减少（防"删了又长回来"）
         self.assertNotIn("<h2>下单记录", html)
@@ -680,7 +683,8 @@ class TestMobileNoJs(BaseCase):
     def test_no_emoji_spray_in_status_strip(self):
         html = self.body(tab="overview")
         strip = html.split("<div class='bar'>")[1].split("</div>")[0]
-        self.assertEqual(strip.count("&#9679;"), 5)      # 五个状态徽标各一个点
+        # P3 R2/R3 后常驻徽标：模式/熔断/对账/HL 延迟/API 有效期/更新（卡单 >0 才加一个点）
+        self.assertEqual(strip.count("&#9679;"), 6)
 
 
 class TestLegacyRedirects(BaseCase):
@@ -779,7 +783,7 @@ class TestFullAppWiring(unittest.TestCase):
         with TestClient(mod.app) as c:
             r = c.get("/admin", params={"k": TOKEN})
             self.assertEqual(r.status_code, 200)
-            self.assertIn("crypto-ma-alert 管理面板", r.text)
+            self.assertIn("双均线交易台", r.text)
             for tab in ("overview", "params", "switch", "records"):
                 self.assertIn(f"tab={tab}", r.text)
 
@@ -883,7 +887,9 @@ class TestFullAppWiring(unittest.TestCase):
             r = c.get(f"/c/{pid}", params={"a": "view", "t": tok})
             self.assertEqual(r.status_code, 200)
             self.assertIn("持仓中", r.text)
-            self.assertNotIn("crypto-ma-alert 管理面板", r.text)
+            # P3 命名同步：确认页 title 用「双均线交易台」，工程名/旧面板头不再出现
+            self.assertIn("双均线交易台", r.text)
+            self.assertNotIn("crypto-ma-alert", r.text)
 
     def test_health_still_reports_hl_mode(self):
         # 无 k 的 /health 不再暴露 hl_mode/hl_kill（公网站点）；带 k 才给

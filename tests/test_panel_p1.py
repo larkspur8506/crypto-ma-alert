@@ -119,14 +119,17 @@ class BaseCase(unittest.TestCase):
 
 # ---------------------------------------------------------------- 功能一：绩效卡
 class TestPerfCard(BaseCase):
-    LEGEND = "口径：按已平仓记录 · R = 盈亏 ÷ 开仓时计划风险 · 不含未平仓"
+    LEGEND = ("口径：按已平仓记录 · 不含未平仓 · R = 策略口径（1R=开仓时计划风险）；"
+              "U = 账户口径（交易所已实现）——两者口径不同，不直接换算")
 
     def test_card_between_account_and_curve_with_legend(self):
         self.closed_pos()                       # 多 +1.0
         html = self.hl()
         self.assertIn("策略绩效（上线以来）", html)
         self.assertIn(self.LEGEND, html, "口径必须落可见文字（iOS 无悬停）")
-        i_acc = html.index("累计已实现")
+        # P3 R5：「累计已实现」从账户卡顶层删了，全页唯一出处是绩效卡的 U 对照行；
+        # 位置断言改钉「账户卡 → 绩效卡 → 盈亏曲线」的先后。
+        i_acc = html.index("<div class='sec'>账户</div>")
         i_perf = html.index("策略绩效（上线以来）")
         i_curve = html.index("<h2>盈亏曲线（已剔除出入金）</h2>")
         self.assertLess(i_acc, i_perf, "绩效卡必须在「账户」卡之后")

@@ -74,7 +74,7 @@ class TestAppAssembly(unittest.TestCase):
                 self.assertEqual(r.headers.get("cache-control"), "public, max-age=604800", p)
             # manifest 内容要和静态文件一致（name/short_name/颜色/两个 any 图标）
             m = c.get("/site.webmanifest").json()
-            self.assertEqual((m["name"], m["short_name"]), ("双均线", "双均线"))
+            self.assertEqual((m["name"], m["short_name"]), ("双均线交易台", "双均线交易台"))
             self.assertEqual(m["start_url"], "/")
             self.assertEqual(m["display"], "browser")
             self.assertEqual((m["background_color"], m["theme_color"]), ("#0d1117", "#0d1117"))

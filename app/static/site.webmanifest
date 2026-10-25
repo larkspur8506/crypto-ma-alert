@@ -1,6 +1,6 @@
 {
-  "name": "双均线",
-  "short_name": "双均线",
+  "name": "双均线交易台",
+  "short_name": "双均线交易台",
   "start_url": "/",
   "display": "browser",
   "background_color": "#0d1117",

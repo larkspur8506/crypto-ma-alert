@@ -43,11 +43,12 @@ from app.hl import dd as hl_dd
 from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
-                        _ST_TXT, _disp, _fee_quoted, _fmt_sz, _kv, _render_body,
-                        normalize_span,
+                        _ST_TXT, _agent_badge_html, _disp, _fee_quoted, _fmt_sz, _kv,
+                        _render_body, _stuck_badge_html, normalize_span,
                         _signals_html, normalize_rows, status_payload)
-from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, THEMES, normalize_theme,
-                          theme_attr, theme_switch_html)
+from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, H1_BLOCK, PRODUCT_NAME,
+                          PRODUCT_SUBTITLE, THEMES, normalize_theme, theme_attr,
+                          theme_switch_html)
 
 logger = logging.getLogger(__name__)
 
@@ -389,10 +390,21 @@ def get_payload(deps: AdminDeps) -> dict:
     """overview Tab 与顶部状态条共用一份 payload（status_payload 本身已保证不抛异常）。"""
     try:
         p = status_payload(deps.hl_deps)
-        return p if isinstance(p, dict) else {}
+        p = p if isinstance(p, dict) else {}
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[admin] status_payload 失败：%s", e)
-        return {}
+        p = {}
+    # API 有效期（P3 R3）：status_payload 里已按 hl_agent_state DB 缓存填了 agent；
+    # AdminDeps 注入的 agent_state_fn 是同一份缓存（render_agent_card 也读它）——
+    # 可注入时用它覆盖，保证状态条徽章与「API 有效期」details 永远是同一个数。
+    if deps.agent_state_fn is not None:
+        try:
+            st = deps.agent_state_fn()
+            if isinstance(st, dict):
+                p["agent"] = st
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[admin] 读 agent_state 失败（徽章按 status_payload 兜底）：%s", e)
+    return p
 
 
 def btc_price(deps: AdminDeps) -> float:
@@ -1244,7 +1256,7 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
     head = (f"Σ全部流水 = {_fmt(total)} U ｜ 当前账户权益（最新快照）= {equity_txt} ｜ "
             f"残差 = 权益 − Σ流水 = {_fmt(residual)} U（未实现盈亏 + 口径零头）")
     return (f"<h2>资金流水</h2>"
-            f"<div class='card'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）"
+            f"<div class='card' id='cma-ledger'><div class='sec'>资金流水（最近 {n} 条 · 最新在前）"
             f"{_all_link('ledger', _token_of(deps))}</div>"
             f"<div class='hint'>{_esc(head)}</div>"
             + _table("<th>时间</th><th>类型</th><th class='num'>金额</th>"
@@ -1255,6 +1267,12 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
             "</div>")
 
 
+# 记录页锚点导航（P3 R6）：slug 即各区块容器的 id（加 cma- 前缀做命名空间）。
+# 六个 slug 互不相同 —— 渲染前的「查重」就在这份表上：同一 id 出现两次会跳错块。
+_RECORD_ANCHORS = (("资金流水", "cma-ledger"), ("下单", "cma-orders"), ("成交", "cma-fills"),
+                   ("信号", "cma-signals"), ("提醒", "cma-alerts"), ("事件", "cma-events"))
+
+
 def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                    signals: Optional[List[Dict[str, Any]]] = None) -> str:
     """记录页六块：资金流水 → 下单记录 → 成交 → 信号 → 提醒日志 → 执行器事件。
@@ -1262,9 +1280,16 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     ``signals`` 来自 ``payload["signals"]``（hl/views.status_payload 构造）；缺省
     None 时按空表渲染「暂无信号」（直接调 render_records 的老调用点不会炸）。
     信号块与总览原来是同一份渲染代码 —— 这里直接复用 ``views._signals_html``。
+
+    P3 R6：页顶一行零 JS 锚点导航（六个 <a href='#cma-…'>），各区块容器带对应 id；
+    id 前缀 cma- 是命名空间 —— 渲染前查重（_RECORD_ANCHORS 六个 slug 互不相同），
+    不与页面既有 id 冲突。
     """
     n = normalize_rows(rows_n)
     o: List[str] = []
+    # ---- 锚点导航（P3 R6）：小屏自然换行，样式复用 tabs 行，零 JS ----
+    o.append("<div class='tabs'>" + "".join(
+        f"<a href='#{sid}'>{label}</a>" for label, sid in _RECORD_ANCHORS) + "</div>")
     # ---- 资金流水（feat/funds-ledger）----
     # 位置铁律：必须在记录页**任何既有区块之前**（本函数原来第一块是 <h2>记录</h2>，
     # 资金流水的 <h2> 排在它前面，测试按 h2 顺序断言位置）。
@@ -1274,7 +1299,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
              f"（页脚「每页行数」可切 10/20/50）。</div>")
 
     # ---- 下单记录 ----
-    o.append(f"<div class='card'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
+    o.append(f"<div class='card' id='cma-orders'><div class='sec'>下单记录（hl_orders · 最近 {n} 条）"
              f"{_all_link('orders', _token_of(deps))}</div>")
     rows = ""
     _orders_rows = _rows(deps, "hl_recent_orders", n)
@@ -1298,7 +1323,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     o.append("</div>")
 
     # ---- 成交 ----
-    o.append(f"<div class='card'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
+    o.append(f"<div class='card' id='cma-fills'><div class='sec'>成交（hl_fills · 最近 {n} 条）"
              f"{_all_link('fills', _token_of(deps))}</div>")
     rows = ""
     for r in _rows(deps, "hl_recent_fills", n):
@@ -1327,7 +1352,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     # 用 _signals_html 渲染（自带 <h2>信号</h2> + 表格，与总览那一块逐字相同），
     # 外面只套 card 边框、不再加 sec 标题 —— 否则「信号」会出现两次。
     # 切片用 n：以前总览整表渲染，仓位历史一长页面就无限变长（顺手按每页行数收口）。
-    o.append("<div class='card'>" + _signals_html(list(signals or [])[:n])
+    o.append("<div class='card' id='cma-signals'>" + _signals_html(list(signals or [])[:n])
              + f"<div class='foot'><span class='muted'>信号 / 仓位历史（含已平仓）：</span>"
                f"{_all_link('positions', _token_of(deps))}</div></div>")
 
@@ -1343,7 +1368,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     _shown_n = len(_alert_rows)
     _alert_title = (f"提醒日志（alert_logs · 最近 {_shown_n} 条）" if _shown_n
                     else "提醒日志（alert_logs）")
-    o.append(f"<div class='card'><div class='sec'>{_alert_title}"
+    o.append(f"<div class='card' id='cma-alerts'><div class='sec'>{_alert_title}"
              f"{_all_link('alerts', _token_of(deps))}</div>")
     # 口径落可见文字：主页滤掉了什么、去哪看全部，必须写出来而不是让人猜少了行。
     # （措辞避开「全部 ›」字面 —— 那是 _all_link 的专属词，测试按出现次数数链接。）
@@ -1387,7 +1412,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
     _shown_n = len(_event_rows)
     _event_title = (f"执行器事件（hl_events · 最近 {_shown_n} 条）" if _shown_n
                     else "执行器事件（hl_events）")
-    o.append(f"<div class='card'><div class='sec'>{_event_title}"
+    o.append(f"<div class='card' id='cma-events'><div class='sec'>{_event_title}"
              f"{_all_link('events', _token_of(deps))}</div>")
     o.append("<div class='hint'>主页已隐藏「心跳」与「对账一致」例行行；"
              "异常 / 决策 / 下单照常显示，全部事件见「全部」子页。</div>")
@@ -1852,8 +1877,8 @@ def _subpage_page(token: str, slug: str, body_html: str, theme: str = DEFAULT_TH
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"{ICON_LINKS}"
-        f"<title>crypto-ma-alert · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
-        f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
+        f"<title>{PRODUCT_NAME} · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
+        f"<body><div class='wrap'>{H1_BLOCK}"
         f"{_tabs_html('records', token)}{body_html}"
         f"{theme_switch_html('records', theme, token)}"
         f"{rows_switch_html('records', rows_n, token)}"
@@ -1936,7 +1961,12 @@ button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
 
 
 def _status_strip(p: dict) -> str:
-    """顶部常显状态条：执行模式 / 熔断 / 对账 / HL 延迟 / 更新时间。"""
+    """顶部常显状态条：执行模式 / 熔断 / 对账 / 卡单(>0) / HL 延迟 / API 有效期 / 更新时间。
+
+    P3 R2/R3：卡单与 API 有效期两个徽章从这里唯一常驻（原「系统」卡的卡单行、
+    原「API 有效期」卡的常驻整卡均已删）—— 徽章渲染与 /hl 状态条共用 views 的
+    同一个函数（同一事实一种写法）。
+    """
     mode = str(p.get("mode") or "off")
     if mode not in _MODE_TXT:
         mode = "off"
@@ -1955,9 +1985,13 @@ def _status_strip(p: dict) -> str:
         _badge(_MODE_CLS[mode], "模式", _MODE_TXT[mode]),
         _badge("neg" if kill else "pos", "熔断", kill_val, kill_reason),
         _badge("pos" if not mismatch else "neg", "对账", "一致" if not mismatch else "不一致"),
+        # 卡单徽章（P3 R2）：>0 才出现（琥珀），正常态状态条不出现「卡单」字样。
+        _stuck_badge_html(system),
         _badge("pos" if lat is not None else "muted", "HL 延迟",
                f"{lat:.0f} ms" if lat is not None else "—",
                "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关"),
+        # API 有效期徽章（P3 R3）：唯一常驻出处，≤14 天琥珀、≤7 天红、已清仓红。
+        _agent_badge_html(p.get("agent")),
         _badge("muted", "更新", _ts(p.get("ts"))),
     ]
     return "<div class='bar'>" + "".join(items) + "</div>"
@@ -1994,7 +2028,10 @@ def _overview_body(deps: AdminDeps, payload: dict) -> str:
         payload = dict(payload)
         payload["why"] = _why_rows_for(deps)
     body = _render_body(payload)
-    body = re.sub(r"<h1>.*?</h1>\s*", "", body, count=1, flags=re.S)
+    # 剥掉 _render_body 自带的 <h1> + 副题（.h1sub）和它自己的状态条：
+    # 本面板顶部已有「双均线交易台」标题 + 状态条，避免同一屏出现两个 h1、两条状态条。
+    body = re.sub(r"<h1>.*?</h1>\s*(?:<div class='h1sub'>.*?</div>\s*)?", "", body,
+                  count=1, flags=re.S)
     body = re.sub(r"<div class='bar'>.*?</div>\s*", "", body, count=1, flags=re.S)
     try:
         body += render_agent_card(deps)
@@ -2109,8 +2146,15 @@ def render_agent_card(deps: AdminDeps) -> str:
         left_txt = "下一个整点自动检查"
 
     o: List[str] = []
-    o.append("<h2>API 有效期</h2>")
-    o.append("<div class='card'><div class='grid'>")
+    # P3 R3：整卡从常驻 h2+card 降级为总览末尾的 <details>（默认收起，零 JS）；
+    # 剩余 ≤14 天（THRESH_NEAR，与提醒同一阈值）或已触发清仓/已过期时服务端渲染
+    # open —— 零 JS 的「自动展开」。徽章（状态条）是唯一常驻出处，这里是低频详情。
+    open_attr = ""
+    if ((days_i is not None and days_i <= agent_mod.THRESH_NEAR)
+            or level in ("cleanup", "expired")):
+        open_attr = " open"
+    o.append(f"<details class='card agent-card'{open_attr}><summary>API 有效期</summary>")
+    o.append("<div class='grid'>")
     o.append(_kv("代理钱包地址", f"<span class='mono'>{_esc(addr)}</span>",
                  title="执行器用来签名的 API 钱包（不是主钱包地址）"))
     o.append(_kv("到期日", _esc(until_txt)))
@@ -2127,7 +2171,7 @@ def render_agent_card(deps: AdminDeps) -> str:
         o.append("<div class='hint'>有效期来自「参数」页的手工兜底值（HL 授权接口没查到同名 Hermes）。</div>")
     o.append("<div class='legend'>到期后执行器不能再开仓、平仓、撤单；到期前系统会按剩余天数提醒"
              f"（≤{agent_mod.THRESH_CLEANUP} 天且有仓位时自动清仓，可在「开关」页的「策略与保护」里关闭）。</div>")
-    o.append("</div>")
+    o.append("</details>")
     return "".join(o)
 
 
@@ -2183,8 +2227,8 @@ def _page(token: str, tab: str, strip_html: str, body_html: str, msg: str = "",
         f"<!doctype html><html lang='zh-CN'{attr_html}><head><meta charset='utf-8'>"
         f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
         f"{ICON_LINKS}"
-        f"<title>crypto-ma-alert · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
-        f"<body><div class='wrap'><h1>crypto-ma-alert 管理面板</h1>"
+        f"<title>{PRODUCT_NAME} · {label}</title>{THEME_CSS}{DASH_CSS}{ADMIN_CSS}</head>"
+        f"<body><div class='wrap'>{H1_BLOCK}"
         f"{strip_html}{_tabs_html(tab, token)}{banner}{body_html}"
         f"{theme_switch_html(tab, theme, token)}"
         f"{rows_switch_html(tab, rows_n, token)}"

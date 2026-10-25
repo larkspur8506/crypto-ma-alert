@@ -96,11 +96,13 @@ class TestOverviewLegends(unittest.TestCase):
         self.assertLess(self.html.index("账户"), self.html.index(frag))
         self.assertLess(self.html.index(frag), self.html.index("<h2>盈亏曲线（已剔除出入金）</h2>"))
 
-    def test_system_legend_visible(self):
+    def test_system_legend_moved_to_badge_title(self):
+        # P3 R2：系统卡瘦身为「执行器」，卡单/HL 延迟注脚整行删除 ——
+        # 卡单口径随迁到状态条徽章 title（正常态徽章不出现，词面 0 处）
         frag = f'<div class="legend">{LEGEND_SYSTEM}</div>'
-        self.assertIn(frag, self.html)
-        # 在系统卡内（P2：「数据源健康」表已合并进三标的卡，不存在于本页）
-        self.assertLess(self.html.index("<h2>系统</h2>"), self.html.index(frag))
+        self.assertNotIn(frag, self.html)
+        self.assertNotIn("卡单", self.html)
+        self.assertIn("<h2>执行器</h2>", self.html)
         self.assertNotIn("数据源健康", self.html)
 
     def test_feed_legend_visible(self):
