@@ -185,6 +185,18 @@ CREATE TABLE IF NOT EXISTS hl_funding (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_hl_snap_ts ON hl_snapshots(ts);
+-- 面板快照（阶段 B）：调度器每轮把「面板要显示的那份数据」写一行，面板零网络零重算。
+-- 与 hl_snapshots 一样是**观测表**：交易/风控/对账一律不读它（读数只给展示用）。
+-- why_json 存 /why 的六步结论（只在 tick 后更新，因为它随 4h bar 收盘变化）；
+-- snapshot_json 存 HlInfo.snapshot() 的归一化结果（权益/仓位/挂单），mids_json 存现价。
+CREATE TABLE IF NOT EXISTS panel_snapshots (
+    ts REAL PRIMARY KEY,
+    snapshot_json TEXT NOT NULL,
+    mids_json TEXT NOT NULL,
+    why_json TEXT,
+    source TEXT,                 -- tick | monitor | after-write（排障用，不参与判定）
+    created_at REAL NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_hl_flows_ts ON hl_flows(ts);
 CREATE INDEX IF NOT EXISTS idx_hl_funding_ts ON hl_funding(ts);
 CREATE INDEX IF NOT EXISTS idx_hl_events_created ON hl_events(created_at);
@@ -817,6 +829,63 @@ class DB:
     def hl_snapshots(self, since_ts: float = 0.0, limit: int = 4000) -> List[sqlite3.Row]:
         return list(self.conn.execute(
             "SELECT * FROM hl_snapshots WHERE ts >= ? ORDER BY ts ASC LIMIT ?", (since_ts, limit)))
+
+    # ---------------------------------------------------------------- 面板快照（阶段 B）
+    # 只有调度器写（main.capture_panel_snapshot），面板只读；交易/风控/对账一律不读这张表。
+    @_locked
+    def panel_snapshot_write(self, snapshot: Dict[str, Any], mids: Dict[str, Any],
+                             why: Optional[List[Any]], ts: float, source: str = "") -> float:
+        """写一行面板快照（同一 ts 覆盖，天然幂等）。返回实际写入的 ts。"""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO panel_snapshots(ts, snapshot_json, mids_json, why_json,"
+            " source, created_at) VALUES(?,?,?,?,?,?)",
+            (float(ts),
+             json.dumps(snapshot or {}, ensure_ascii=False),
+             json.dumps(mids or {}, ensure_ascii=False),
+             None if why is None else json.dumps(why, ensure_ascii=False, default=str),
+             str(source or ""), now()))
+        self.conn.commit()
+        return float(ts)
+
+    @_locked
+    def panel_snapshot_latest(self) -> Optional[Dict[str, Any]]:
+        """最新一行（已解 JSON）；没有就返回 None。解析失败按「没有快照」处理并记日志。"""
+        row = self.conn.execute(
+            "SELECT ts, snapshot_json, mids_json, why_json, source FROM panel_snapshots"
+            " ORDER BY ts DESC LIMIT 1").fetchone()
+        if row is None:
+            return None
+        try:
+            snapshot = json.loads(row["snapshot_json"] or "{}")
+            mids = json.loads(row["mids_json"] or "{}")
+            why = None if row["why_json"] is None else json.loads(row["why_json"])
+        except (TypeError, ValueError) as e:
+            logger.warning("[db] 面板快照解析失败（按无快照处理）：%s", e)
+            return None
+        return {"ts": float(row["ts"]), "snapshot": snapshot, "mids": mids,
+                "why": why, "source": row["source"] or ""}
+
+    @_locked
+    def panel_snapshot_why(self) -> Optional[tuple]:
+        """最近一条**带 why** 的快照 → (ts, why)。why 只在 tick 后写，比读数行稀疏。"""
+        for row in self.conn.execute(
+                "SELECT ts, why_json FROM panel_snapshots WHERE why_json IS NOT NULL"
+                " ORDER BY ts DESC LIMIT 1"):
+            try:
+                return float(row["ts"]), json.loads(row["why_json"])
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    @_locked
+    def prune_panel_snapshots(self, keep: int = 288) -> int:
+        """只留最近 keep 行（默认 288 = 每 5 分钟一行、24 小时）。返回删除行数。"""
+        keep = max(1, int(keep))
+        cur = self.conn.execute(
+            "DELETE FROM panel_snapshots WHERE ts NOT IN"
+            " (SELECT ts FROM panel_snapshots ORDER BY ts DESC LIMIT ?)", (keep,))
+        self.conn.commit()
+        return int(cur.rowcount or 0)
 
     @_locked
     def hl_latest_snapshot(self) -> Optional[sqlite3.Row]:
