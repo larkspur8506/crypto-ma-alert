@@ -2094,7 +2094,12 @@ def _status_strip(p: dict) -> str:
     system = p.get("system") or {}
     net = p.get("network") or {}
     mismatch = bool(system.get("mismatch"))
-    lat = _opt_num(net.get("latency_ms"))
+    # 读数来自调度器快照时，本次渲染**没有访问交易所** ⇒ 这个延迟数字没被测过。
+    # 显示成「1 ms」会让用户以为网络很好，所以快照模式下显式留空（—）并说明原因。
+    from_snapshot = _opt_num(p.get("panel_age_s")) is not None
+    lat = None if from_snapshot else _opt_num(net.get("latency_ms"))
+    lat_title = ("读数是调度器快照，本次渲染没有访问交易所 —— 所以这里不显示网络延迟"
+                 if from_snapshot else "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关")
     kill_reason = str(p.get("kill_reason") or "").strip()
     # 熔断触发且原因非空 → 值里带上原因（可见文字）；iOS Safari 无 title 悬停，
     # 原先原因只在 title 里、手机上读不到。未触发时值不变，title 保留。
@@ -2108,8 +2113,7 @@ def _status_strip(p: dict) -> str:
         # 卡单徽章（P3 R2）：>0 才出现（琥珀），正常态状态条不出现「卡单」字样。
         _stuck_badge_html(system),
         _badge("pos" if lat is not None else "muted", "HL 延迟",
-               f"{lat:.0f} ms" if lat is not None else "—",
-               "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关"),
+               f"{lat:.0f} ms" if lat is not None else "—", lat_title),
         # API 有效期徽章（P3 R3）：唯一常驻出处，≤14 天琥珀、≤7 天红、已清仓红。
         _agent_badge_html(p.get("agent")),
         # 数据新鲜度（阶段 B）：读数来自调度器快照时标出「几秒/几分钟前」，

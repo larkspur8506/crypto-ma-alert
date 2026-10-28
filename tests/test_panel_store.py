@@ -269,6 +269,17 @@ class TestWiring(unittest.TestCase):
             self.assertEqual(self.info.total, 0, f"面板应零请求：{self.info.snapshots} 次快照")
             # 状态条要如实标出「数据 X 秒前」
             self.assertIn("数据", r.text)
+            # 快照模式没访问交易所 ⇒ 不能显示一个未实测的网络延迟（曾显示成「1 ms」）
+            self.assertIn("HL 延迟 <b>—</b>", r.text)
+            self.assertNotIn("HL 延迟 <b>0 ms</b>", r.text)
+
+    def test_live_mode_still_shows_latency(self):
+        """没有快照（回落实时）时延迟徽章照常给数字 —— 这条防止修上一条修过头。"""
+        with self.TestClient(self.mod.app) as c:
+            r = c.get("/admin", params={"k": "snap-tk"})
+            self.assertEqual(r.status_code, 200)
+            self.assertIn("HL 延迟 <b>", r.text)
+            self.assertIn(" ms</b>", r.text)
 
     def test_panel_without_snapshot_falls_back_and_still_renders(self):
         with self.TestClient(self.mod.app) as c:
