@@ -365,8 +365,11 @@ def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
         store = panel_snapshot_store()
         store.write(snapshot=snapshot, mids=mids, why=why_rows, source=source or "scheduler")
         store.prune()
+        # 统一账户下 `equity`（永续口径）恒为 0，账户总值在 `equity_total` —— 日志里取后者，
+        # 否则运维看到「equity=0.0」会以为读坏了（面板本身两个字段都拿到，不受影响）。
+        shown_equity = snapshot.get("equity_total") or snapshot.get("equity")
         logger.info("[panel] 快照已写入（%s）：equity=%s 持仓=%d 挂单=%d 现价=%d why=%s",
-                    source or "scheduler", snapshot.get("equity"),
+                    source or "scheduler", shown_equity,
                     len(snapshot.get("positions") or []), len(snapshot.get("open_orders") or []),
                     len(mids or {}), "有" if why_rows else "沿用")
         return True
