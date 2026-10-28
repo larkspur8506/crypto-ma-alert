@@ -13,13 +13,16 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
+from dataclasses import replace
 from urllib.parse import quote as _urlquote
 from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Form, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse, Response
+from starlette.middleware.gzip import GZipMiddleware
 
 from app import engine, market, posfields, sizing, strategy
 from app.config import Config
@@ -37,6 +40,10 @@ db = DB(DB_PATH)
 config = Config()
 notifier = get_notifier(config)
 scheduler = None
+
+# gzip 的起压门槛（见 add_middleware 处的理由）。之所以不叫 min_size：Starlette >=0.20
+# 把这个参数从 min_size 改名成 minimum_size（fastapi>=0.110 依赖的版本都是新名字）。
+GZIP_MIN_SIZE = 1024
 
 PAGE_CSS = """
 <style>
@@ -242,12 +249,40 @@ def hl_info_base() -> str:
 
 
 def get_hl_info():
-    """只读客户端（面板/看护/执行器共用；无凭据也能用）。"""
+    """只读客户端（面板/看护/执行器共用；无凭据也能用）。
+
+    **不带缓存**：执行器、tick、对账、看护消费的必须是实时读数（fail-closed 的前提）。
+    面板要省请求请用 `panel_hl_info()` —— 它是本函数返回值的一层 TTL 包装，只存在于面板依赖里。
+    """
     global _hl_info
     if _hl_info is None:
         from app.hl.info import HlInfo
         _hl_info = HlInfo(base_url=hl_info_base())
     return _hl_info
+
+
+_panel_info = None
+
+
+def panel_hl_info():
+    """面板专用的只读客户端包装（`snapshot`/`all_mids` 带 10s TTL 缓存）。
+
+    只被 `_admin_deps()` 使用，`/api/hl/*` 与执行器仍走 `get_hl_info()` 的实时值。
+    真身被换掉（测试 reload / 地址切换重建）时自动重建包装，避免拿旧对象的缓存回答新问题。
+    """
+    global _panel_info
+    from app.panel_cache import PanelInfo
+    raw = get_hl_info()
+    if _panel_info is None or getattr(_panel_info, "raw", None) is not raw:
+        _panel_info = PanelInfo(raw)
+    return _panel_info
+
+
+def invalidate_panel_cache() -> None:
+    """面板写操作（参数/模式/kill）成功后调用：下一次渲染重新取真值。"""
+    global _panel_info
+    if _panel_info is not None:
+        _panel_info.invalidate()
 
 
 def build_executor():
@@ -452,6 +487,42 @@ def _job_weekly() -> None:
     logger.info("周报（未推送，仅落库）:\n%s", text)
 
 
+# ---------------------------------------------------------------- K 线预热（阶段 A2）
+# /why 的 K 线缓存（app/why.py::FEED_TTL_S=900）过期后，第一个访问者要自己等 10–12s
+# 现取三标的行情。启动后先在后台把这个缓存填好，首个访问者直接命中。
+# 与 ENABLE_SCHEDULER 分开开关：预热只影响首屏快慢，跟「要不要跑定时任务」是两件事。
+
+_WHY_PREHEAT_OFF = ("0", "false", "no", "off")
+
+
+def _why_preheat_on() -> bool:
+    """预热开关，默认**开**（只有离线测试/无网络环境才该关）。"""
+    return (os.environ.get("WHY_PREHEAT", "1") or "1").strip().lower() not in _WHY_PREHEAT_OFF
+
+
+def _job_why_preheat() -> None:
+    """后台线程里跑：只填 K 线缓存，失败只记日志（服务照常跑，首屏退回现取）。"""
+    try:
+        from app import why as why_mod
+        bad = why_mod.preheat(current_config())
+        if bad:
+            logger.warning("K 线预热部分失败（首屏会现取，不影响交易与提醒）：%s", "；".join(bad))
+        else:
+            logger.info("K 线预热完成：三标的已进 /why 缓存，首个访问者不再等现取")
+    except Exception as e:                                          # noqa: BLE001
+        logger.warning("K 线预热失败（不影响服务）：%s", e)
+
+
+def _start_why_preheat() -> Optional[threading.Thread]:
+    """起守护线程预热，**绝不阻塞 startup**：首屏慢几秒可以等，服务起不来不行。"""
+    if not _why_preheat_on():
+        logger.info("K 线预热已关闭（WHY_PREHEAT=0）")
+        return None
+    th = threading.Thread(target=_job_why_preheat, name="why-preheat", daemon=True)
+    th.start()
+    return th
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global scheduler
@@ -471,12 +542,24 @@ async def lifespan(app: FastAPI):
         scheduler.start()
         logger.info("调度器已启动：tick 每小时 :03/:33（UTC 时刻）；心跳 %02d:00 UTC；周报周一；"
                     "HL 监控每 5 分钟（模式=%s）；API 有效期检查每小时 :11", config.heartbeat_hour, hl_mode())
+    # 预热放在 scheduler 判断之外：只提醒模式（ENABLE_SCHEDULER=false）也需要它，
+    # 而且它是后台线程，起到这一步不会拖慢 startup。
+    _start_why_preheat()
     yield
     if scheduler:
         scheduler.shutdown(wait=False)
 
 
 app = FastAPI(title="crypto-ma-alert", lifespan=lifespan)
+
+# ---------------------------------------------------------------- gzip（阶段 A3）
+# 面板 HTML 实测 ~60KB 未压缩，手机流量/首屏都要多背 ~59KB 的重复 CSS 与表格标记。
+# 1024 字节起压：小 JSON（/health、/api/hl/*）压了省不了几字节，反而多一次 CPU 与
+# 一层 content-encoding；面板 HTML/CSV 导出都远超这个门槛。
+# 流式端点（CSV 导出）由 middleware 自己按 chunk 增量压缩；text/event-stream 在 Starlette
+# 1.x 的默认排除表里，本服务也没有 SSE 端点，不会破坏长连接。
+app.add_middleware(GZipMiddleware, minimum_size=GZIP_MIN_SIZE)
+
 
 
 # ---------------------------------------------------------------- 鉴权
@@ -603,10 +686,33 @@ def _mount_hl_keyform() -> None:
 
 
 # ---------------------------------------------------------------- 合并管理面板
+def _panel_write(fn):
+    """把面板写操作包一层：**写成功之后**立刻让面板读数缓存失效。
+
+    为什么要失效：面板读数（账户快照/现价）本身不依赖配置，但写操作会改变页面上其它区块
+    （模式、kill 状态、参数生效值），如果刚写完的那次跳转还渲染着 10s 前的快照，用户会怀疑
+    「点了没生效」。代价只是写操作后多取一次快照，一次点击一次，可以接受。
+    """
+    if fn is None:
+        return None
+
+    def wrapped(*args, **kwargs):
+        out = fn(*args, **kwargs)
+        invalidate_panel_cache()
+        return out
+
+    return wrapped
+
+
 def _admin_deps():
     """装配合并面板的依赖（全部走可替换函数，测试里可换成假实现）。"""
     from app.admin_ui import AdminDeps
     hl = _hl_deps()
+    # 面板侧的只读客户端换成 TTL 包装：一次渲染 4 个 HL 请求（1.5–1.8s）→ 10s 内复用。
+    # 只换**这一份** DashboardDeps 的 info（dataclasses.replace 产生新对象），
+    # `_hl_deps()` 自身、`/api/hl/*`、执行器、看护仍拿 get_hl_info() 的实时客户端。
+    pinfo = panel_hl_info()
+    hl = replace(hl, info=pinfo)
     return AdminDeps(
         db=db,
         config_fn=current_config,
@@ -615,7 +721,10 @@ def _admin_deps():
         token_fn=lambda: config.admin_token,
         address_fn=lambda: hl_params().account_address,
         private_key_fn=lambda: hl_params().private_key,
-        mids_fn=lambda: get_hl_info().all_mids(),
+        mids_fn=pinfo.all_mids,                        # 与 snapshot 里的现价共用同一份缓存
+        # 写路径（参数/模式/开关/kill）成功后失效面板缓存
+        set_config=_panel_write(getattr(db, "set_config", None)),
+        hl_set_kill=_panel_write(getattr(db, "hl_set_kill", None)),
         # 到期检查 + 面板「更新 API」：都走 app.hl.agent（面板卡片只读 state，零网络）
         agent_state_fn=lambda: _agent_state(),
         renew_fn=lambda key: _renew_agent_key(key),
