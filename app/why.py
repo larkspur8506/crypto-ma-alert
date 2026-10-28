@@ -35,9 +35,14 @@ from app import symbol_registry as registry
 
 logger = logging.getLogger(__name__)
 
-FEED_TTL_S = 300.0      # K 线缓存寿命。取 5 分钟的理由：信号侧只随「4h bar 收盘」变化，
-                        # 300s 的行情陈旧不可能改变六步结论；而面板刷新是同步路径，
-                        # 每次现拉 3 个标的 × 5000 根会把首屏拖慢好几秒。
+FEED_TTL_S = 900.0      # K 线缓存寿命 15 分钟。理由：信号侧只随「4h bar 收盘」变化，
+                        # 4h 一根 = 14400s，900s 远小于一根 bar，所以 15 分钟内的行情陈旧
+                        # 不可能改变六步结论；而面板刷新是同步路径，每次现拉 3 个标的 × 5000 根
+                        # 会把首屏拖慢 10–12s。
+                        # 2026-10-28（面板提速 A2）：300 → 900。原值 5 分钟意味着「开着面板
+                        # 偶尔看一眼」的人每 5 分钟就要撞一次 10s 级的冷取；900s 让同一根 4h
+                        # bar 内几乎总是命中，代价只是价格列最多旧 15 分钟（价格列不是信号，
+                        # 实时价另有 allMids 路径）。启动预热见 preheat()。
                         # 闸门与仓位**不走这个缓存**（见 build_rows 末尾），它们必须实时。
 
 _WHY_CACHE: Dict[Tuple[str, int, Tuple], Dict[str, Any]] = {}
@@ -301,6 +306,33 @@ def build_rows(db: Any, cfg: Any, symbols: Optional[Sequence[str]] = None,
         row["gate"] = row["gates"].get(gkey) or {}
         rows.append(row)
     return rows
+
+
+def preheat(cfg: Any, symbols: Optional[Sequence[str]] = None, fetch=None,
+            now_ms: Optional[int] = None) -> List[str]:
+    """启动预热：只把各标的 K 线填进 `_FEED_CACHE`，**不算六步**（不写 `_WHY_CACHE`）。
+
+    为什么只热 K 线：K 线是冷启动唯一的外部 I/O（3 个标的 × 5000 根，实测 10–12s）；六步
+    计算本身 0.4s/标的，而且它依赖阈值指纹 —— 预热时算等于把「启动那一刻的参数」写进缓存，
+    万一面板随后改参数，指纹会让它自然重算，没必要提前算。
+
+    返回失败列表（人话），调用方只记日志：预热失败绝不能让服务起不来，也不能改变任何判定。
+    与 `build_rows` 共用 `_fetch_many`/`_fetch_bars`，所以缓存键、TTL、根数校验都是同一套口径。
+    """
+    fetch = fetch or market.fetch
+    syms: List[str] = [str(s) for s in (symbols if symbols is not None
+                                        else (getattr(cfg, "symbols", None) or []))]
+    if not syms:
+        return ["未配置标的（cfg.symbols 为空）"]
+    feeds = _fetch_many(fetch, syms, now_ms)
+    bad: List[str] = []
+    for symbol in syms:
+        got = feeds.get(symbol)
+        if isinstance(got, Exception):
+            bad.append(f"{symbol}: {type(got).__name__}: {got}")
+        elif got is None:
+            bad.append(f"{symbol}: 未取到行情")
+    return bad
 
 
 def clear_cache() -> None:
