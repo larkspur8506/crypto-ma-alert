@@ -407,6 +407,17 @@ def get_payload(deps: AdminDeps) -> dict:
                 p["agent"] = st
         except Exception as e:                                    # noqa: BLE001
             logger.warning("[admin] 读 agent_state 失败（徽章按 status_payload 兜底）：%s", e)
+    # 阶段 B：面板读数来自调度器写的快照时，把「这份数据多旧」交给状态条。
+    # 实时读数（PanelInfo / 直连 HlInfo）没有 age_s，取不到就不显示徽章。
+    try:
+        info = getattr(deps.hl_deps, "info", None)
+        age_fn = getattr(info, "age_s", None)
+        if callable(age_fn):
+            age = _opt_num(age_fn())
+            if age is not None and age >= 0:
+                p["panel_age_s"] = age
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 读面板快照年龄失败（不显示徽章）：%s", e)
     return p
 
 
@@ -2049,6 +2060,26 @@ button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
 </style>"""
 
 
+def _panel_age_badge(age: Any) -> str:
+    """数据新鲜度徽章（阶段 B）：读数是快照时标出「多旧」；实时读取时返回空串。
+
+    只有「读数来自调度器快照」才会传 age 进来 —— 实时读取（PanelInfo/直连）没有 age_s。
+    超过 10 分钟转琥珀：monitor 每 5 分钟一轮，两轮没刷新就说明调度器出问题了。
+    """
+    f = _opt_num(age)
+    if f is None or f < 0:
+        return ""
+    if f < 60:
+        txt = f"{int(f)} 秒前"
+    elif f < 3600:
+        txt = f"{int(f // 60)} 分钟前"
+    else:
+        txt = f"{f / 3600:.1f} 小时前"
+    return _badge("muted" if f < 600 else "warn", "数据", txt,
+                  "面板读数是调度器最近一轮的读数（每 5 分钟刷新一次），不是此刻的实时值；"
+                  "下单/对账/熔断走的始终是实时读数")
+
+
 def _status_strip(p: dict) -> str:
     """顶部常显状态条：执行模式 / 熔断 / 对账 / 卡单(>0) / HL 延迟 / API 有效期 / 更新时间。
 
@@ -2081,6 +2112,9 @@ def _status_strip(p: dict) -> str:
                "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关"),
         # API 有效期徽章（P3 R3）：唯一常驻出处，≤14 天琥珀、≤7 天红、已清仓红。
         _agent_badge_html(p.get("agent")),
+        # 数据新鲜度（阶段 B）：读数来自调度器快照时标出「几秒/几分钟前」，
+        # 实时读取时不渲染（避免正常态多一个恒为「0 秒」的噪音徽章）。
+        _panel_age_badge(p.get("panel_age_s")),
         _badge("muted", "更新", _ts(p.get("ts"))),
     ]
     return "<div class='bar'>" + "".join(items) + "</div>"

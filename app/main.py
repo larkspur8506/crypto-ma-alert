@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -280,9 +281,98 @@ def panel_hl_info():
 
 def invalidate_panel_cache() -> None:
     """面板写操作（参数/模式/kill）成功后调用：下一次渲染重新取真值。"""
-    global _panel_info
+    global _panel_info, _panel_invalidated_at
+    _panel_invalidated_at = time.time()
     if _panel_info is not None:
         _panel_info.invalidate()
+    # 阶段 B：快照里的六步解释/读数也可能被这次写操作改变（阈值、模式、kill），
+    # 所以同时让「下一位访问者」绕过快照走一次实时，别让人刚改完参数就看到旧解释。
+    if _snapshot_info is not None:
+        _snapshot_info.invalidate()
+
+
+# 最近一次面板写操作的时刻：/why 在写后 5 秒内强制现算（见 _why_rows）。
+_panel_invalidated_at = 0.0
+
+
+# ---------------------------------------------------------------- 面板快照（阶段 B）
+# 调度器每轮把面板要显示的读数写进 `panel_snapshots`，面板只读库、零网络零重算。
+# 细节与取舍见 app/panel_store.py 的模块头。
+
+_snapshot_store = None
+_snapshot_info = None
+
+_PANEL_SNAPSHOT_OFF = ("0", "false", "no", "off")
+
+
+def panel_snapshot_on() -> bool:
+    """快照开关，默认**开**（PANEL_SNAPSHOT=0 时退回 A1 的 10s 进程内缓存）。"""
+    return (os.environ.get("PANEL_SNAPSHOT", "1") or "1").strip().lower() not in _PANEL_SNAPSHOT_OFF
+
+
+def panel_snapshot_store():
+    """快照表门面（按 db 实例缓存；测试换库时自动重建）。"""
+    global _snapshot_store
+    from app.panel_store import PanelSnapshotStore
+    if _snapshot_store is None or getattr(_snapshot_store, "db", None) is not db:
+        _snapshot_store = PanelSnapshotStore(db)
+    return _snapshot_store
+
+
+def panel_snapshot_info():
+    """面板专用的快照读取器：先读库，过期/缺失回落 `panel_hl_info()`（实时 + 10s）。"""
+    global _snapshot_info
+    from app.panel_store import SnapshotInfo
+    raw = get_hl_info()
+    fallback = panel_hl_info()
+    if (_snapshot_info is None or getattr(_snapshot_info, "fallback", None) is not fallback
+            or getattr(_snapshot_info, "store", None) is not panel_snapshot_store()):
+        _snapshot_info = SnapshotInfo(panel_snapshot_store(), fallback)
+    return _snapshot_info
+
+
+def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
+    """把「面板这一轮要显示的数据」写进快照表（**只读交易所，绝不下单**）。
+
+    调用点只有两个：tick 之后（带六步结论）与 hl_monitor 之后（纯读数刷新）。
+    `with_why=False` 时沿用上一条 why（六步结论只在 4h bar 收盘后才会变，每 5 分钟重算
+    3 个标的 × 5000 根 K 线纯属浪费）。
+
+    任何异常都只记日志并返回 False —— 面板会在快照缺失时回落实时读取，交易不受影响。
+    """
+    try:
+        address = hl_params().account_address
+        if not address:
+            logger.info("[panel] 快照跳过：未配置钱包地址（面板会回落实时读取）")
+            return False
+        info = get_hl_info()
+        mids = info.all_mids()
+        snapshot = info.snapshot(address, mids=mids)
+        why_rows = None
+        if with_why:
+            from app import why as why_mod
+            try:
+                why_rows = why_mod.build_rows(db, current_config())
+            except Exception as e:                                # noqa: BLE001
+                # 六步算不出来不该让整条快照作废：读数（权益/挂单/现价）仍然有效
+                logger.warning("[panel] 快照的六步结论生成失败（沿用上一条）：%s", e)
+                why_rows = None
+        if why_rows is None:
+            try:
+                why_rows = panel_snapshot_store().latest_why()
+            except Exception:                                     # noqa: BLE001
+                why_rows = None
+        store = panel_snapshot_store()
+        store.write(snapshot=snapshot, mids=mids, why=why_rows, source=source or "scheduler")
+        store.prune()
+        logger.info("[panel] 快照已写入（%s）：equity=%s 持仓=%d 挂单=%d 现价=%d why=%s",
+                    source or "scheduler", snapshot.get("equity"),
+                    len(snapshot.get("positions") or []), len(snapshot.get("open_orders") or []),
+                    len(mids or {}), "有" if why_rows else "沿用")
+        return True
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[panel] 快照写入失败（面板会回落实时读取）：%s", e)
+        return False
 
 
 def build_executor():
@@ -328,6 +418,9 @@ def _job_tick() -> None:
         if sent:
             logger.info("tick 发送 %d 条提醒", len(sent))
         _retry_failed_alerts()
+        # 阶段 B：tick 刚算过六步、也刚读过行情 —— 顺手把面板快照写掉（含 why）。
+        # 放在锁外：写快照是纯读操作 + 一次 INSERT，不该延长交易路径的持锁时间。
+        capture_panel_snapshot("tick", with_why=True)
     except Exception as e:                                    # noqa: BLE001
         logger.exception("tick 异常: %s", e)
 
@@ -440,12 +533,14 @@ def _job_hl_monitor() -> None:
     """
     with _tick_lock:
         ex = build_executor()
-        if ex is None:
-            return
-        try:
-            ex.run(force_snapshot=True)
-        except Exception as e:                                    # noqa: BLE001
-            logger.exception("HL 执行器监控轮异常: %s", e)
+        if ex is not None:
+            try:
+                ex.run(force_snapshot=True)
+            except Exception as e:                                    # noqa: BLE001
+                logger.exception("HL 执行器监控轮异常: %s", e)
+    # 阶段 B：读数刷新（5 分钟一轮）。放在锁外，且**无论执行器是否启用**都要刷新 ——
+    # 面板在 mode=off/无凭据时也该能看到账户读数（只读，不碰下单路径）。
+    capture_panel_snapshot("monitor", with_why=False)
 
 
 def _job_heartbeat() -> None:
@@ -708,10 +803,12 @@ def _admin_deps():
     """装配合并面板的依赖（全部走可替换函数，测试里可换成假实现）。"""
     from app.admin_ui import AdminDeps
     hl = _hl_deps()
-    # 面板侧的只读客户端换成 TTL 包装：一次渲染 4 个 HL 请求（1.5–1.8s）→ 10s 内复用。
-    # 只换**这一份** DashboardDeps 的 info（dataclasses.replace 产生新对象），
+    # 面板侧的只读客户端（阶段 A1/A2 + B）：
+    #   默认 = 读快照表（零网络零重算），快照缺失/过期时回落 PanelInfo（实时 + 10s TTL）；
+    #   PANEL_SNAPSHOT=0 时退回 A1 的纯 TTL 包装。
+    # 只换**这一份** AdminDeps 的 info（dataclasses.replace 产生新对象），
     # `_hl_deps()` 自身、`/api/hl/*`、执行器、看护仍拿 get_hl_info() 的实时客户端。
-    pinfo = panel_hl_info()
+    pinfo = panel_snapshot_info() if panel_snapshot_on() else panel_hl_info()
     hl = replace(hl, info=pinfo)
     return AdminDeps(
         db=db,
@@ -721,7 +818,7 @@ def _admin_deps():
         token_fn=lambda: config.admin_token,
         address_fn=lambda: hl_params().account_address,
         private_key_fn=lambda: hl_params().private_key,
-        mids_fn=pinfo.all_mids,                        # 与 snapshot 里的现价共用同一份缓存
+        mids_fn=pinfo.all_mids,                        # 与 snapshot 里的现价共用同一份快照
         # 写路径（参数/模式/开关/kill）成功后失效面板缓存
         set_config=_panel_write(getattr(db, "set_config", None)),
         hl_set_kill=_panel_write(getattr(db, "hl_set_kill", None)),
@@ -729,15 +826,32 @@ def _admin_deps():
         agent_state_fn=lambda: _agent_state(),
         renew_fn=lambda key: _renew_agent_key(key),
         cleanup_enabled_fn=lambda: _cleanup_on(),
-        # /why 诊断（只读）：面板每次刷新现取 4h K 线算六步 + 读闸门类状态
+        # /why 诊断（只读）：阶段 B 起优先读快照里的六步结论，缺失才现取
         why_rows_fn=lambda: _why_rows(),
         # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
         price_fallback=0.0,
     )
 
 
-def _why_rows() -> list:
-    """面板「为什么没开仓」的数据源（只读；异常一律退回空列表，别弄挂总览）。"""
+def _why_rows(live: bool = False) -> list:
+    """面板「为什么没开仓」的数据源（只读；异常一律退回空列表，别弄挂总览）。
+
+    阶段 B：默认读快照里的六步结论（tick 后写入，最多滞后一个 tick 周期）；
+    快照过期/没带 why 时才现取 K 线重算（那一下约 1.2s，且只在快照断档时发生）。
+    """
+    if not live and panel_snapshot_on():
+        # 面板写操作（参数/模式/kill）后 5 秒内的渲染一律现算：改完阈值立刻要看到新解释，
+        # 不能等下一轮 tick 才刷新（这一点与 A1 的 10s 缓存同一取舍，只是从 10s 收到 5s）。
+        if (time.time() - _panel_invalidated_at) < 5.0:
+            live = True
+    if not live and panel_snapshot_on():
+        try:
+            info = panel_snapshot_info()
+            row = info.stored_row()                   # 同一套「过期就不用」的判据
+            if row is not None and row.get("why"):
+                return copy.deepcopy(row["why"])
+        except Exception as e:                                  # noqa: BLE001
+            logger.warning("/why 快照读取失败（改现取）：%s", e)
     try:
         from app import why as why_mod
         return why_mod.build_rows(db, current_config())
