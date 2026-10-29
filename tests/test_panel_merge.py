@@ -123,11 +123,11 @@ class TestSinglePrice(PanelMergeBase):
         self.assertIn('<span class="px">81,516.00</span>', _card(html, "BTC"))
 
     def test_reason_wording_matches_state_word(self):
-        """状态词「均线未密集」与原因行「均线不密集：…」曾是两种说法 —— 只做展示层替换，
-        不动 strategy 的文案（/api/hl/why 仍是原文），面板里必须只剩一种。"""
+        """2026-10-29 精简后密集拦截只报「带宽 X% · 门槛 Y%」两个数；strategy 的原文
+        （「均线不密集：…」）不得再漏到面板上（/api/hl/why 仍是原文）。"""
         html = self.render({"why": [_why()]})
         card = _card(html, "BTC")
-        self.assertIn("均线未密集", card)
+        self.assertIn("带宽 1.62% · 门槛 1.73%", card)
         self.assertNotIn("均线不密集", card)
 
     def test_reason_line_does_not_repeat_price(self):
@@ -179,21 +179,24 @@ class TestSqueezeReasonAccuracy(PanelMergeBase):
         html = self.render({"symbol_state": [_st(dense_cnt=3)], "why": [_why()]})
         card = _card(html, "BTC")
         self.assertIn("密集酝酿 3/6", card)
-        self.assertIn("带宽 1.62% 已压到门槛 1.73% 以内", card)
-        self.assertIn("连续密集 3 根、满 6 根才具备开仓条件", card)
+        # 2026-10-29 精简：原因行只报当下带宽与门槛两个数
+        self.assertIn("带宽 1.62% · 门槛 1.73%", card)
         self.assertNotIn("未压到门槛", card)
+        self.assertNotIn("连续密集", card)
 
     def test_uncompressed_band_reports_band_blocker(self):
         row = _why(band_cur=0.0180, thr_cur=0.0173)
         html = self.render({"symbol_state": [_st(dense_cnt=0)], "why": [row]})
         card = _card(html, "BTC")
-        self.assertIn("带宽 1.80% 未压到门槛 1.73% 以内", card)
-        self.assertIn("连续密集 0 根", card)
+        self.assertIn("带宽 1.80% · 门槛 1.73%", card)
+        self.assertNotIn("未压到门槛", card)
+        self.assertNotIn("连续密集", card)
 
-    def test_custom_min_squeeze_bars_in_sentence(self):
+    def test_custom_min_squeeze_bars_still_renders(self):
+        # 精简后 min_squeeze_bars 不再出现在句子里，但非默认值不得破坏渲染
         row = _why(min_squeeze_bars=8)
         html = self.render({"symbol_state": [_st(dense_cnt=3)], "why": [row]})
-        self.assertIn("满 8 根才具备开仓条件", _card(html, "BTC"))
+        self.assertIn("带宽 1.62% · 门槛 1.73%", _card(html, "BTC"))
 
     def test_drift_marker_on_new_sentence(self):
         row = _why()
@@ -344,7 +347,7 @@ class TestMissingWhyRow(PanelMergeBase):
                              _st(symbol="SOL_USDT", coin="SOL", price=None, dense_cnt=None)],
         })
         btc, eth, sol = _card(html, "BTC"), _card(html, "ETH"), _card(html, "SOL")
-        self.assertIn("均线未密集：带宽", btc)         # 有 why 的原因行（词面已统一）
+        self.assertIn("带宽 1.62% · 门槛 1.73%", btc)  # 有 why 的原因行（2026-10-29 精简版）
         self.assertNotIn("均线不密集", btc, "同一张卡里不许再出现 strategy 的原文措辞")
         self.assertIn("诊断数据暂不可用", eth)          # 缺 why → 标注读数时间
         self.assertIn(f"显示 {_fmt_dt(UPDATED_AT, '%H:%M')} 的读数", eth)

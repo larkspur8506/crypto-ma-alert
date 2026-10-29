@@ -183,12 +183,11 @@ class TestRenderBlock(unittest.TestCase):
                       html)
         if os.environ.get("DISPLAY_TZ_OFFSET", "8").strip() in ("8", "8.0", ""):
             self.assertIn("行情 16:53 ·", html)   # 1760000000 = 2025-10-09 08:53:20 UTC = 北京 16:53
-        # 位置：总览页最顶部 —— tabs 之后第一个区块，在「账户」卡片之前
+        # 位置：2026-10-29 起与「仓位」表对换 —— 仓位在最顶，本块在盈亏曲线之后
         # （P2 起 <style> 的注释里也有「账户」二字，锚点必须钉在卡片 sec 头上）
-        self.assertLess(html.index("三标的动态"),
-                        html.index("<div class='sec'>账户</div>"))
-        self.assertLess(html.index("<h1>双均线交易台</h1>"), html.index("三标的动态"))
-        self.assertLess(html.index("三标的动态"), html.index("<h2>仓位</h2>"))
+        self.assertLess(html.index("<h1>双均线交易台</h1>"), html.index("<h2>仓位</h2>"))
+        self.assertLess(html.index("<h2>仓位</h2>"), html.index("三标的动态"))
+        self.assertLess(html.index("<div class='sec'>账户</div>"), html.index("三标的动态"))
 
     def test_head_time_takes_newest_of_three(self):
         html = self.render([self.row(symbol="A_USDT", coin="A", updated_at=1760000000.0),
@@ -259,29 +258,15 @@ class TestRenderBlock(unittest.TestCase):
         # 同卡片里没有入场行（持仓标的只给离场线）
         self.assertNotIn("上破开多", card)
 
-    def test_legend_row_rendered_in_block(self):
-        # 手机（iOS Safari 无 title 悬停）唯一能看到 ①②③ 口径的地方 → 必须是可见文字
-        # 注意：CSS 里也有 .sym-legend（在 <head>），所以用 div 标签定位，别用裸类名
+    def test_legend_row_removed(self):
+        # 2026-10-29 用户要求整段删除图例行；口径细节只保留在 title 悬停里。
         html = self.render([self.row()])
-        # 面板合并后只剩一条脚注：原「为什么没开仓」的「信号 / 闸门」口径并进同一句；
-        # P2 再并入原「数据源健康」的 fail-closed 口径（随数据源小字行搬进本卡图例）
-        legend = ('<div class="sym-legend">① 离场按 4h 收盘判定 · '
-                  '② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空 · '
-                  '信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）· '
-                  '闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），'
-                  '只影响「什么时候动手」，不改变信号本身；闸门正常时不显示 · '
-                  '信号源固定 hl-candle（fail-closed：源失败即跳过本轮，不换源）</div>')
-        self.assertIn(legend, html)
-        # 图例在 grid 之后、区块 card 收尾之前（即仍在「三标的动态」区块内）
-        mark = '<div class="sym-legend">'
-        self.assertLess(html.index("三标的动态"), html.index(mark))
-        self.assertLess(html.index(mark), html.index("<h2>仓位</h2>"))
-        # 三段口径逐条可见
+        self.assertNotIn('<div class="sym-legend">', html)
         for frag in ("① 离场按 4h 收盘判定", "② 破线+密集满 6 根开多",
-                     "③ 破线+MA200 下方才开空", "闸门 = 执行器动作前的附加保护"):
-            self.assertIn(frag, html)
-        # 样式类随页面下发（只用现有 CSS 变量，两主题自动适配）；
-        # 本轮起 .legend 与 .sym-legend 合组同规则（账户/系统/数据源三条注脚共用）
+                     "③ 破线+MA200 下方才开空", "闸门 = 执行器动作前的附加保护",
+                     "信号源固定 hl-candle"):
+            self.assertNotIn(frag, html)
+        # 样式类仍随页面下发（.legend 注脚还有别的使用方）
         self.assertIn(".sym-legend,.legend{margin-top:8px;font-size:11px;"
                       "color:var(--muted);line-height:1.6}", html)
         # 桌面端悬停口径保留（title 原文不动）

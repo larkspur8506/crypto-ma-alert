@@ -477,9 +477,9 @@ class TestRenewPanel(Base):
         # 总览末尾：账户卡与「执行器」区块之后（P3 R2 系统→执行器；P3 R3 卡降级 details）
         self.assertLess(ov.index("账户</div>"), ov.index("<summary>API 有效期</summary>"))
         self.assertLess(ov.index("<h2>执行器</h2>"), ov.index("<summary>API 有效期</summary>"))
-        # 三标的动态仍在账户卡之前（原位置未被挤动）
+        # 2026-10-29 与仓位表对换：三标的动态在账户卡之后（仓位表移到最顶）
         if "三标的动态" in ov:
-            self.assertLess(ov.index("三标的动态"), ov.index("账户</div>"))
+            self.assertGreater(ov.index("三标的动态"), ov.index("账户</div>"))
         # 参数页：续期小区块在「保存全部参数」之后
         html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
         self.assertLess(html.index("保存全部参数"), html.index("更新 API（续期）"))

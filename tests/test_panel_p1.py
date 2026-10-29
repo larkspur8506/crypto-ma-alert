@@ -117,23 +117,21 @@ class BaseCase(unittest.TestCase):
         return html.split("<h2>信号</h2>", 1)[1].split("</table>", 1)[0]
 
 
-# ---------------------------------------------------------------- 功能一：绩效卡
+# ---------------------------------------- 功能一：绩效行（原整卡，2026-10-29 精简并入盈亏曲线）
 class TestPerfCard(BaseCase):
-    LEGEND = ("口径：按已平仓记录 · 不含未平仓 · R = 策略口径（1R=开仓时计划风险）；"
-              "U = 账户口径（交易所已实现）——两者口径不同，不直接换算")
 
-    def test_card_between_account_and_curve_with_legend(self):
+    def test_line_inside_curve_block_and_old_card_gone(self):
         self.closed_pos()                       # 多 +1.0
         html = self.hl()
-        self.assertIn("策略绩效（上线以来）", html)
-        self.assertIn(self.LEGEND, html, "口径必须落可见文字（iOS 无悬停）")
-        # P3 R5：「累计已实现」从账户卡顶层删了，全页唯一出处是绩效卡的 U 对照行；
-        # 位置断言改钉「账户卡 → 绩效卡 → 盈亏曲线」的先后。
+        self.assertNotIn("策略绩效（上线以来）", html, "旧绩效整卡已删")
+        self.assertNotIn("口径：按已平仓记录", html, "口径说明已随整卡删除")
+        self.assertNotIn("两者口径不同，不直接换算", html)
+        # 位置：账户卡之后、且在「盈亏曲线」区块内部
         i_acc = html.index("<div class='sec'>账户</div>")
-        i_perf = html.index("策略绩效（上线以来）")
         i_curve = html.index("<h2>盈亏曲线（已剔除出入金）</h2>")
-        self.assertLess(i_acc, i_perf, "绩效卡必须在「账户」卡之后")
-        self.assertLess(i_perf, i_curve, "绩效卡必须在「盈亏曲线」之前")
+        i_line = html.index("上线以来：已平仓")
+        self.assertLess(i_acc, i_curve)
+        self.assertLess(i_curve, i_line, "绩效行必须并入盈亏曲线区块")
 
     def test_stats_line_side_split_and_values(self):
         self.closed_pos(side=1, exit_px=103_000.0)            # 多 r=+1.0
@@ -160,13 +158,12 @@ class TestPerfCard(BaseCase):
         self.db.conn.execute("UPDATE positions SET r_multiple=NULL WHERE id=?", (pid,))
         self.db.conn.commit()
         html = self.hl()
-        self.assertIn("暂无已平仓记录", html, "r=NULL 的行不计入笔数（不猜 0）")
+        self.assertNotIn("上线以来：已平仓", html, "r=NULL 不计入笔数（不猜 0），只显「暂无」行")
         self.assertNotIn("均R", html)
 
     def test_zero_closed_no_division(self):
         html = self.hl()
-        self.assertIn("策略绩效（上线以来）", html)
-        self.assertIn("暂无已平仓记录", html, "N=0 不除零、不编数")
+        self.assertIn("上线以来：暂无已平仓记录", html, "N=0 不除零、不编数")
         self.assertNotIn("胜率", html)
 
     def test_payload_carries_perf_stats(self):
@@ -258,12 +255,16 @@ class TestCurveSpan(BaseCase):
         self.assertIn("✅ 近 30 天", html30)
 
     def test_dd_line_unchanged_by_span(self):
-        # 「策略回撤」行是 hl_dd_state 峰值口径，不随 span 变（规格明令不动）。
+        # 「策略回撤」行是 hl_dd_state 峰值口径，不随 span 变（规格明令不动）；
+        # 2026-10-29 起行内不再带「（剔除出入金，峰值以来；按流水同步节奏更新）」括注。
         h7 = self.hl()
         h30 = self.hl(span="30")
-        line = "（剔除出入金，峰值以来；按流水同步节奏更新）"
-        self.assertIn(line, h7)
-        self.assertIn(line, h30)
+        self.assertNotIn("剔除出入金，峰值以来", h7)
+        for h in (h7, h30):
+            i = h.index("策略回撤")
+            self.assertIn(" · 告警线", h[i:i + 120])
+        self.assertEqual(h7[h7.index("策略回撤"):h7.index("</div>", h7.index("策略回撤"))],
+                         h30[h30.index("策略回撤"):h30.index("</div>", h30.index("策略回撤"))])
 
 
 # ---------------------------------------------------------------- 功能三：记录页降噪
