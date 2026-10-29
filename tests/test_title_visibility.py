@@ -105,10 +105,9 @@ class TestOverviewLegends(unittest.TestCase):
         self.assertIn("<h2>执行器</h2>", self.html)
         self.assertNotIn("数据源健康", self.html)
 
-    def test_feed_legend_visible(self):
-        # P2 合并：fail-closed 口径脚注随数据源小字行搬进「三标的动态」卡图例
-        self.assertIn(LEGEND_FEED, self.html)
-        self.assertLess(self.html.index("三标的动态"), self.html.index(LEGEND_FEED))
+    def test_feed_legend_removed(self):
+        # 2026-10-29 用户要求删除图例行（含 fail-closed 口径脚注）
+        self.assertNotIn(LEGEND_FEED, self.html)
 
     def test_margin_legacy_term_not_in_visible_text(self):
         """豁免：剥掉所有 title 后，「已用保证金」不得出现在可见文本里。"""

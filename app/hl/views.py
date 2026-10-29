@@ -1327,16 +1327,6 @@ tr.subm td{white-space:normal;font-size:11.5px;color:var(--muted)}
 _SQUEEZE_CAP = 6          # 密集根数展示封顶：满 6 根即已满足入场前提
 _NEAR_TITLE = "接近触发（按收盘判定）"
 # 图例行（区块底部，手机看不见 title 悬停，口径必须落在可见文字上）：
-# ① 离场只看收盘破线 → 琥珀（接近）就有意义；②③ 破线还要满足前置条件，琥珀会误导。
-# 「信号 = 六步规则 / 闸门 = 动作前的附加保护」这段原属「为什么没开仓」的脚注 ——
-# 两块合一后只剩一条脚注，否则同一屏又要读两遍口径。
-_LEGEND_HTML = ("<div class=\"sym-legend\">① 离场按 4h 收盘判定 · "
-                "② 破线+密集满 6 根开多 · ③ 破线+MA200 下方才开空 · "
-                "信号 = 六步规则（根数 → 密集 → 破线 → MA200 → 止损距离）· "
-                "闸门 = 执行器动作前的附加保护（成交回报后 15s 静置、10 分钟内 5 次撤挂熔断），"
-                "只影响「什么时候动手」，不改变信号本身；闸门正常时不显示 · "
-                # P2 合并后这句口径跟着数据源小字行搬进本卡（原「数据源健康」表脚注）：
-                "信号源固定 hl-candle（fail-closed：源失败即跳过本轮，不换源）</div>")
 _EXIT_TITLE = {1: "按 4h 收盘判定，非盘中触发：收盘跌破该线即自动平仓",
                -1: "按 4h 收盘判定，非盘中触发：收盘站上该线即自动平仓"}
 _LONG_TITLE = "4h 收盘突破该线即入场（需均线密集满 6 根）"
@@ -1499,17 +1489,11 @@ def _reason_line(r: Dict[str, Any]) -> str:
     #    的带宽/门槛（band_cur/thr_cur），拦截点是密集时按真话组句；字段缺失（旧缓存/
     #    降级路径）回落 strategy 原文 + ①②的替换。
     if str(why.get("blocked_by") or "") == "squeeze":
+        # 精简（2026-10-29 用户要求）：只报当下的带宽与门槛两个数，密集根数等细节
+        # 不再重复（状态词里已有 N/6）。字段缺失（旧缓存/降级路径）回落 strategy 原文。
         band_cur, thr_cur = _opt_num(r.get("band_cur")), _opt_num(r.get("thr_cur"))
-        dense = _opt_int(r.get("dense_cnt"))
-        need = _opt_int(r.get("min_squeeze_bars")) or _SQUEEZE_CAP
-        if band_cur is not None and thr_cur is not None and dense is not None:
-            if band_cur <= thr_cur:
-                txt = (f"均线未密集：带宽 {band_cur * 100:.2f}% 已压到门槛 "
-                       f"{thr_cur * 100:.2f}% 以内，连续密集 {dense} 根、"
-                       f"满 {need} 根才具备开仓条件")
-            else:
-                txt = (f"均线未密集：带宽 {band_cur * 100:.2f}% 未压到门槛 "
-                       f"{thr_cur * 100:.2f}% 以内（连续密集 {dense} 根）")
+        if band_cur is not None and thr_cur is not None:
+            txt = f"带宽 {band_cur * 100:.2f}% · 门槛 {thr_cur * 100:.2f}%"
             if why.get("drift"):
                 txt += " ⚠️口径漂移"
             return _whyline(txt, "muted")
@@ -1696,12 +1680,12 @@ def _sym_card(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]] = None,
 
 def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
                last_bar: Dict[str, Any]) -> str:
-    """标的卡末尾的数据源小字行（P2：吸收原「数据源健康」「已处理到」两张表）。
+    """标的卡末尾的数据源小字行（2026-10-29 精简：正常态不渲染，异常才出现）。
 
-    正常：`数据源 hl-candle 正常 · 最后成功 11:03:02 · 已处理到 10-25 04:00`；
-    失败：`数据源 hl-candle 失败（最后错误 HH:MM）`，用 neg 样式醒目（源失败即
-    fail-closed 跳过本轮，这是最该被看见的异常）。字段缺失时如实写「无记录 / —」，
-    绝不编时间。feed 里没这个标的 → 「数据源 无记录」；last_bar 缺 → 「—」。
+    正常：不产生 DOM（正常态静默；信号源固定 hl-candle、fail-closed，正常没话可说）。
+    失败：`数据源 hl-candle 失败（最后错误 HH:MM） · 已处理到 …`，用 neg 样式醒目
+    （源失败即 fail-closed 跳过本轮，这是最该被看见的异常）。字段缺失时如实写
+    「无记录 / —」，绝不编时间。feed 里没这个标的 → 「数据源 无记录」。
     """
     sym = str(r.get("symbol") or "")
     fd = feed_map.get(sym)
@@ -1712,15 +1696,13 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
     # 固定 hl-candle（fail-closed、不换源），空缺时兜底写实名，不算编造。
     src = str(fd.get("source") or "hl-candle")
     if fd.get("ok"):
-        return _whyline(f"数据源 {src} 正常 · "
-                        f"最后成功 {_fmt_dt(fd.get('last_ok_at'), '%H:%M:%S')} · "
-                        f"已处理到 {bar_txt}", "muted")
+        return ""
     err_at = _fmt_dt(fd.get("error_at"), "%H:%M") if fd.get("error_at") else "—"
     return _whyline(f"数据源 {src} 失败（最后错误 {err_at}） · 已处理到 {bar_txt}", "neg")
 
 
 def _symbol_dynamics(p: dict) -> str:
-    """「三标的动态」区块（总览页最顶部，tabs 之后第一个区块，见 _render_body）。
+    """「三标的动态」区块（2026-10-29 起与「仓位」表对换：仓位在最顶，本块在其后）。
 
     合并后这里同时回答「离触发线多远」（距离行）和「卡在哪一步 / 被闸门挡了吗」
     （原因行 / 闸门异常行）—— 原「为什么没开仓」区块已删除。P2 再吸收「数据源健康」
@@ -1747,10 +1729,8 @@ def _symbol_dynamics(p: dict) -> str:
          "<div class=\"card\"><div class=\"grid\">"]
     for r in rows:
         o.append(_sym_card(r, feed_map, last_bar))
-    # 图例放在 grid 之后、card 收尾之前：手机（iOS Safari 无 title 悬停）唯一能看到
-    # ①②③ 口径的地方；无数据时整块不渲染（上方 rows 为空已 return）。
+    # 图例行已按用户要求整段删除（2026-10-29）；口径细节留在 title 悬停里。
     o.append("</div>")
-    o.append(_LEGEND_HTML)
     o.append("</div>")
     return "".join(o)
 
@@ -1915,39 +1895,31 @@ def _span_links(cur: str, k: str = "", refresh: int = 0) -> str:
     return " ".join(parts)
 
 
-def _perf_card_html(p: dict) -> str:
-    """「策略绩效（上线以来）」小卡（P1 功能一）。纯渲染：数字全部来自 payload.perf
-    （_perf_stats 只读聚合），本函数不做 I/O；payload 缺键/坏键一律回落「暂无」。"""
+def _perf_line_html(p: dict) -> str:
+    """「上线以来」一行（2026-10-29 用户要求：原策略绩效整卡精简成这一行，并入盈亏曲线）。
+
+    纯渲染：数字全部来自 payload.perf（_perf_stats 只读聚合）+ account.total_realized
+    （U 对照，全页唯一出处仍是这行）。无已平仓记录 → 只显「暂无」+ U 对照。
+    """
     perf = _as_dict(p.get("perf"))
     n = int(_num(perf.get("n")))
-    o: List[str] = ["<div class='card'><div class='sec'>策略绩效（上线以来）</div>"]
     avg_r = _opt_num(perf.get("avg_r"))
-    if n <= 0 or avg_r is None:
-        # N=0 不除零：没有已平仓记录就是没有，不渲染 0.00% 这种编出来的数。
-        o.append("<div>暂无已平仓记录</div>")
-    else:
-        total_r = _num(perf.get("total_r"))
-        wins = int(_num(perf.get("wins")))
-        win_rate = _num(perf.get("win_rate"))
-        o.append(f"<div>已平仓 <b>{n}</b> 笔"
-                 f"（多 {int(_num(perf.get('long')))} · 空 {int(_num(perf.get('short')))}） · "
-                 f"均R <b class=\"{'pos' if avg_r >= 0 else 'neg'}\">{avg_r:+.2f}</b> · "
-                 f"胜率 {win_rate * 100:.0f}%（赢 {wins} 笔） · "
-                 f"累计 R <b class=\"{'pos' if total_r >= 0 else 'neg'}\">{total_r:+.1f}</b></div>")
-    # U 对照行（P3 R5）：本卡是 R（策略口径）的主场，金额视角给一行交易所口径对照，
-    # 数字与账户卡同源（account.total_realized）——「累计已实现」全页唯一出处就在这行。
     acc = _as_dict(p.get("account"))
     u_txt, u_cls = _sign(acc.get("total_realized"))
-    if u_txt != "—":
-        o.append(f"<div>按金额：<span class='{u_cls}'>累计已实现 {u_txt}</span>"
-                 f"<span class='muted'>（交易所口径，未扣手续费与资金费）</span></div>")
-    # 口径落可见文字（iOS 无悬停，铁律 5）+ 主从说明（P3 R5）：R 是本卡主数字、
-    # U 是对照，两个口径不直接换算 —— 不写清用户会以为数字打架。
-    o.append('<div class="legend">口径：按已平仓记录 · 不含未平仓 · '
-             'R = 策略口径（1R=开仓时计划风险）；U = 账户口径（交易所已实现）'
-             '——两者口径不同，不直接换算</div>')
-    o.append("</div>")
-    return "".join(o)
+    u_seg = (f" · 累计已实现 <b class='{u_cls}'>{u_txt}</b>"
+             if u_txt != "—" else "")
+    if n <= 0 or avg_r is None:
+        # N=0 不除零、不编数；U 对照仍要出现（「累计已实现」全页唯一出处在这行）。
+        return f"<div class=\"legend\">上线以来：暂无已平仓记录{u_seg}</div>"
+    total_r = _num(perf.get("total_r"))
+    wins = int(_num(perf.get("wins")))
+    win_rate = _num(perf.get("win_rate"))
+    return ("<div class=\"legend\">上线以来：已平仓 <b>"
+            f"{n}</b> 笔（多 {int(_num(perf.get('long')))} · 空 {int(_num(perf.get('short')))}） · "
+            f"均R <b class=\"{'pos' if avg_r >= 0 else 'neg'}\">{avg_r:+.2f}</b> · "
+            f"胜率 {win_rate * 100:.0f}%（赢 {wins} 笔） · "
+            f"累计 R <b class=\"{'pos' if total_r >= 0 else 'neg'}\">{total_r:+.1f}</b>"
+            f"{u_seg}</div>")
 
 
 def _dd_line_html(meta: Dict[str, Any]) -> str:
@@ -1972,12 +1944,10 @@ def _dd_line_html(meta: Dict[str, Any]) -> str:
            else "warn" if st == "over_kill"
            else ("muted" if st != "warn" else ""))
     span = f"<span class='{cls}'>{_esc(txt)}</span>" if cls else _esc(txt)
-    # 「等待流水同步」只在真的没判过时出现（执行器写的 hl_dd_wait_note）；正常节奏下
-    # 用固定的口径说明「按流水同步节奏更新」——用户必须知道这条线的分辨率是 30 分钟，
-    # 而不是 5 分钟一轮的 tick（§4.4.1 要求把这个取舍说清）。
+    # 「剔除出入金，峰值以来；按流水同步节奏更新」括注已按用户要求删除（2026-10-29）。
     wait = str(meta.get("dd_wait_note") or "").strip()
     tail = f" · <span class='neg'>{_esc(wait)}</span>" if wait else ""
-    return (f"<div class=\"legend\">策略回撤 {pct_txt}（剔除出入金，峰值以来；按流水同步节奏更新）· "
+    return (f"<div class=\"legend\">策略回撤 {pct_txt} · "
             f"告警线 {_pct_txt(meta.get('dd_warn_pct'))} · "
             f"熔断线 {_pct_txt(meta.get('dd_kill_pct'))} · 当前状态：{span}{tail}</div>")
 
@@ -2041,125 +2011,6 @@ def _render_body(p: dict) -> str:
     if not reachable:
         o.append(f"<div class='banner'>&#9888;&#65039; 未配置 / 读取失败：{_esc(error or '未知原因')}<br>"
                  f"<span class='muted'>交易所侧数据暂不可用；信号 / 下单 / 成交记录见「记录」页。</span></div>")
-
-    # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
-    # 位置由需求钉死：总览页最顶部、tabs 之后第一个区块（在「账户」卡片之前），
-    # 手机打开面板先看到三个标的的状态。距离行 + 原因行 + 闸门异常行都在这一块里 ——
-    # 原来紧跟在后面的「为什么没开仓」表格已合并进来（同一屏两个现价/两套状态词是硬伤）。
-    # 数据由调用方注入 payload（why 由 admin_ui 现算，symbol_state 来自 DB 缓存），
-    # 本函数不做 I/O，逐块兜底：缺哪份数据就只少那几行，绝不弄挂总览页。
-    try:
-        o.append(_symbol_dynamics(p))
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
-
-
-    # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
-    # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」
-    #（默认收起，零 JS）。P3 R5：顶层删「累计已实现」—— 它已并入策略绩效卡
-    #（U 对照行，全页唯一出处），顶层只剩 账户总值 · 可提余额。
-    # 「浮盈浮亏」「资金费（持仓期内）」两行删除：同一数字在仓位表每仓各有一份
-    # （浮盈还带 ROE%，见下），账户级聚合行等于同屏第二遍；空仓时浮盈本来就没有
-    # 可看的，无信息损失。次级项只是搬位置，一项不少、数值口径不变。
-    o.append("<div class='card'><div class='sec'>账户</div>")
-    today_txt, today_cls = _sign(acc.get("today_realized"))
-    fees = _num(acc.get("fees_total"))
-    # 可提口径与旧版逐字一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
-    # （HL 提现固定收 1U 手续费；短说放数字后缀，口径细节在 title 悬停）。
-    wd = _num(acc.get("withdrawable"))
-    if acc.get("unified") and wd <= 0:
-        avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
-        wd_html = f"{_fmt(avail)} U<span class='muted'>（提现收 1U 手续费）</span>"
-        wd_title = "统一账户下的实际可提：现货余额扣除仓位/挂单占用的保证金"
-    else:
-        wd_html = f"{_fmt(wd)} U"
-        wd_title = ""
-    wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
-    o.append("<div class='acct-top'>"
-             f"<span>账户总值 <b>{_fmt(acc.get('equity'))} U</b></span>"
-             f"<span{wd_t}>可提余额 <b>{wd_html}</b></span></div>")
-    o.append("<details class='acct-details'><summary>资金明细</summary>")
-    o.append("<div class='acct-sub'>")
-    o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
-    if acc.get("unified") and not acc.get("spot_ok", True):
-        # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
-        o.append("<span class='neg'>⚠️ 现货余额读取失败：总值/可提不可信（只剩浮盈），不是没钱</span>")
-    if acc.get("unified"):
-        # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
-        # 合约侧占用的就是已用保证金（同一个数），不再单列重复一列。
-        o.append(_asub("资金分布（统一账户）",
-                       f"现货 {_fmt(acc.get('spot_usdc'))} U · 合约占用 {_fmt(acc.get('margin_used'))} U",
-                       title="统一账户下资金分在现货与合约两侧；合约侧占用 = 已用保证金"))
-    if not acc.get("unified"):
-        o.append(_asub("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
-    o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
-    o.append(_asub("今日已实现", today_txt, today_cls,
-                   title="交易所 closedPnl 口径，未扣手续费与资金费"))
-    o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
-    o.append("</div>")
-    o.append("</details>")
-    # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
-    # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
-    o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
-             '可提 = 现货 − 仓位/挂单占用</div>')
-    o.append("</div>")
-
-    # ---------------- 策略绩效（上线以来）----------------
-    # 位置由规格钉死：账户卡之后、盈亏曲线之前（P1 功能一）。渲染失败不弄挂总览页。
-    try:
-        o.append(_perf_card_html(p))
-    except Exception as e:                                        # noqa: BLE001
-        logger.warning("[hl-views] 策略绩效卡渲染失败：%s", e)
-
-    # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
-    # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
-    # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
-    # 流水读不到时**不画任何曲线**，也不退回权益 —— 那条线正是要删掉的误导源。
-    o.append("<h2>盈亏曲线（已剔除出入金）</h2>")
-    o.append("<div class='chart-wrap'>")
-    if curve_meta.get("flows_ok") is False:
-        o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
-        o.append(_pnl_svg([], []))
-        note = str(curve_meta.get("flows_note")
-                   or "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
-        o.append(f"<div class=\"legend\">{_esc(note)}</div>")
-    elif len(shown_pnl) >= 2:
-        # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，
-        # 不另起炉灶 —— span=all 时与 curve.meta 的全期数字逐字相同（首点 pnl=0、
-        # 指数=100），两种口径不会打架。
-        w_pnl = shown_pnl[-1][1] - shown_pnl[0][1]
-        # 峰谷回撤复用 flows 的同一份实现（同一事实一种写法，不复制第二份逻辑）。
-        w_dd = hl_flows._max_drawdown([v for _, v in shown_pnl])
-        dep_span = _as_dict(curve_meta.get("net_deposit_span"))
-        w_dep = (_opt_num(dep_span.get(span)) if span in ("7", "30") else None)
-        if w_dep is None:
-            w_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
-        if len(shown_twr) >= 2 and shown_twr[0][1] > 0:
-            # 区间链式收益：指数末点 ÷ 首点 − 1（窗口内任意一点都是链式乘积，直接相除）。
-            w_twr = (shown_twr[-1][1] / shown_twr[0][1] - 1.0) * 100.0
-            twr_label = "收益指数（区间）"
-        else:
-            w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
-            twr_label = "收益指数"
-        # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
-        o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
-                 f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
-                 f"{w_pnl:+,.2f} U</b></span>"
-                 f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
-        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {w_pnl:+,.2f}U · "
-                 f"净入金 {w_dep:,.2f}U · 最大回撤 {w_dd:,.2f}U · "
-                 f"{twr_label} {w_twr:+.2f}%</div>")
-        o.append(_pnl_svg(shown_pnl, shown_twr))
-        tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
-        o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
-                 f'虚线=收益指数（起点 100，右轴）{tail}</div>')
-    else:
-        o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
-        o.append(_pnl_svg([], []))
-    # 策略回撤（DD Guard）：**任何分支都要有这一行** —— 曲线画不出来（流水坏）时更需要
-    # 告诉人「回撤判据现在可不可信」，而「暂不可用」本身就是一句结论。
-    o.append(_dd_line_html(curve_meta))
-    o.append("</div>")
 
     # ---------------- 仓位 ----------------
     # 窄屏（≤640px）只留 8 个关键列（.hidem 列 display:none，不横向滚动）；被隐藏列
@@ -2230,6 +2081,124 @@ def _render_body(p: dict) -> str:
     o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
              '窄屏隐藏列的数值见各仓下方小字行</div>')
 
+    # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
+    # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」
+    #（默认收起，零 JS）。P3 R5：顶层删「累计已实现」—— 它已并入策略绩效卡
+    #（U 对照行，全页唯一出处），顶层只剩 账户总值 · 可提余额。
+    # 「浮盈浮亏」「资金费（持仓期内）」两行删除：同一数字在仓位表每仓各有一份
+    # （浮盈还带 ROE%，见下），账户级聚合行等于同屏第二遍；空仓时浮盈本来就没有
+    # 可看的，无信息损失。次级项只是搬位置，一项不少、数值口径不变。
+    o.append("<div class='card'><div class='sec'>账户</div>")
+    today_txt, today_cls = _sign(acc.get("today_realized"))
+    fees = _num(acc.get("fees_total"))
+    # 可提口径与旧版一致：统一账户且交易所 withdrawable<=0 时按 现货−占用 现算
+    # （手续费说明已按用户要求删除，2026-10-29；口径细节保留在 title 悬停）。
+    wd = _num(acc.get("withdrawable"))
+    if acc.get("unified") and wd <= 0:
+        avail = max(_num(acc.get("spot_usdc")) - _num(acc.get("spot_hold")), 0.0)
+        wd_html = f"{_fmt(avail)} U"
+        wd_title = "统一账户下的实际可提：现货余额扣除仓位/挂单占用的保证金"
+    else:
+        wd_html = f"{_fmt(wd)} U"
+        wd_title = ""
+    wd_t = f" title='{_esc(wd_title)}'" if wd_title else ""
+    o.append("<div class='acct-top'>"
+             f"<span>账户总值 <b>{_fmt(acc.get('equity'))} U</b></span>"
+             f"<span{wd_t}>可提余额 <b>{wd_html}</b></span></div>")
+    o.append("<details class='acct-details'><summary>资金明细</summary>")
+    o.append("<div class='acct-sub'>")
+    o.append(_asub("钱包地址", _addr_text(acc.get("address"))))
+    if acc.get("unified") and not acc.get("spot_ok", True):
+        # 现货状态读取失败 → equity_total 只剩浮盈，数字完全不可信，必须喊出来
+        o.append("<span class='neg'>⚠️ 现货余额读取失败：总值/可提不可信（只剩浮盈），不是没钱</span>")
+    if acc.get("unified"):
+        # 统一账户：资金分布在「现货」和「合约」两侧 —— 用人话一行说完。
+        # 合约侧占用的就是已用保证金（同一个数），不再单列重复一列。
+        o.append(_asub("资金分布（统一账户）",
+                       f"现货 {_fmt(acc.get('spot_usdc'))} U · 合约占用 {_fmt(acc.get('margin_used'))} U",
+                       title="统一账户下资金分在现货与合约两侧；合约侧占用 = 已用保证金"))
+    if not acc.get("unified"):
+        o.append(_asub("已用保证金", f"{_fmt(acc.get('margin_used'))} U"))
+    o.append(_asub("持仓名义", f"{_fmt(acc.get('notional'))} U"))
+    o.append(_asub("今日已实现", today_txt, today_cls,
+                   title="交易所 closedPnl 口径，未扣手续费与资金费"))
+    o.append(_asub("净手续费（付出）", f"{-fees:+,.2f} U", "neg" if fees > 0 else ""))
+    o.append("</div>")
+    o.append("</details>")
+    # 注脚（可见文字，iOS Safari 无 title 悬停）：账户相关数字的口径收口。
+    # 「已实现」两行的 title 保留作桌面增强，这里给出手机唯一能看到的口径。
+    o.append('<div class="legend">已实现为交易所口径，未扣手续费与资金费 · '
+             '可提 = 现货 − 仓位/挂单占用</div>')
+    o.append("</div>")
+
+    # ---------------- 盈亏曲线（已剔除出入金）+ 收益指数 ----------------
+    # 页面只有这一张图（旧「权益曲线」已删掉，没有开关、没有视图切换）：
+    # 主曲线 = 累计盈亏（U），虚线 = 收益指数 TWR（起点 100，右轴）。
+    # 流水读不到时**不画任何曲线**，也不退回权益 —— 那条线正是要删掉的误导源。
+    o.append("<h2>盈亏曲线（已剔除出入金）</h2>")
+    o.append("<div class='chart-wrap'>")
+    if curve_meta.get("flows_ok") is False:
+        o.append("<div class='chart-head'><span class='muted'>暂无数据</span></div>")
+        o.append(_pnl_svg([], []))
+        note = str(curve_meta.get("flows_note")
+                   or "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
+        o.append(f"<div class=\"legend\">{_esc(note)}</div>")
+    elif len(shown_pnl) >= 2:
+        # 摘要行四个数字**按所选窗口重算**（P1 功能二）：都在同一份曲线序列上切窗，
+        # 不另起炉灶 —— span=all 时与 curve.meta 的全期数字逐字相同（首点 pnl=0、
+        # 指数=100），两种口径不会打架。
+        w_pnl = shown_pnl[-1][1] - shown_pnl[0][1]
+        # 峰谷回撤复用 flows 的同一份实现（同一事实一种写法，不复制第二份逻辑）。
+        w_dd = hl_flows._max_drawdown([v for _, v in shown_pnl])
+        dep_span = _as_dict(curve_meta.get("net_deposit_span"))
+        w_dep = (_opt_num(dep_span.get(span)) if span in ("7", "30") else None)
+        if w_dep is None:
+            w_dep = _opt_num(curve_meta.get("net_deposit")) or 0.0
+        if len(shown_twr) >= 2 and shown_twr[0][1] > 0:
+            # 区间链式收益：指数末点 ÷ 首点 − 1（窗口内任意一点都是链式乘积，直接相除）。
+            w_twr = (shown_twr[-1][1] / shown_twr[0][1] - 1.0) * 100.0
+            twr_label = "收益指数（区间）"
+        else:
+            w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
+            twr_label = "收益指数"
+        # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
+        o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
+                 f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
+                 f"{w_pnl:+,.2f} U</b></span>"
+                 f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
+        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {w_pnl:+,.2f}U · "
+                 f"净入金 {w_dep:,.2f}U · 最大回撤 {w_dd:,.2f}U · "
+                 f"{twr_label} {w_twr:+.2f}%</div>")
+        o.append(_pnl_svg(shown_pnl, shown_twr))
+        tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
+        o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
+                 f'虚线=收益指数（起点 100，右轴）{tail}</div>')
+    else:
+        o.append("<div class='chart-head'><span class='muted'>暂无数据（等执行器落快照）</span></div>")
+        o.append(_pnl_svg([], []))
+    # 策略回撤（DD Guard）：**任何分支都要有这一行** —— 曲线画不出来（流水坏）时更需要
+    # 告诉人「回撤判据现在可不可信」，而「暂不可用」本身就是一句结论。
+    o.append(_dd_line_html(curve_meta))
+    # 「上线以来」一行（原策略绩效整卡，2026-10-29 用户要求精简并入本区块）。
+    try:
+        perf_line = _perf_line_html(p)
+        if perf_line:
+            o.append(perf_line)
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 上线以来统计行渲染失败：%s", e)
+    o.append("</div>")
+
+    # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
+    # 2026-10-29 用户要求与「仓位」表对换：仓位移到最顶，本块跟在盈亏曲线之后。
+    # 距离行 + 原因行 + 闸门异常行都在这一块里 —— 原「为什么没开仓」表格已合并进来。
+    # 数据由调用方注入 payload（why 由 admin_ui 现算，symbol_state 来自 DB 缓存），
+    # 本函数不做 I/O，逐块兜底：缺哪份数据就只少那几行，绝不弄挂总览页。
+    try:
+        o.append(_symbol_dynamics(p))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] 三标的动态区块渲染失败：%s", e)
+
+
     # ---------------- 挂单（按需渲染，P3 R1）----------------
     # 正常态（每仓恰好一条 reduce-only 触发单、无孤儿、无其它挂单）整块不渲染：
     # 止损已由仓位表「止损 ✔️」列唯一表达（顺带消掉止损价在挂单表的第二次出现）。
@@ -2273,8 +2242,8 @@ def _render_body(p: dict) -> str:
     o.append(f"<div class='muted'>交易所 {_esc(base_txt)} · "
              f"{'测试网' if net.get('testnet') else '主网'}</div>")
     # P2：原「数据源健康」「已处理到」两张表已整块删除（不是折叠）—— 每标的数据源
-    # 状态 / 最后成功 / 已处理到，由顶部「三标的动态」卡在该标的名下的小字行唯一承载
-    #（见 _feed_line），同一事实整页一种写法。
+    # 状态由「三标的动态」卡在该标的名下的小字行承载（见 _feed_line，2026-10-29 起
+    # 正常态不渲染、仅源失败时出现）。
     o.append("</div>")
 
     return "".join(o)

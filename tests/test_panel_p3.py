@@ -305,14 +305,16 @@ class TestRealizedSingleSource(BaseCase):
                                reduce_only=True, ts=int(NOW * 1000), created_at=NOW)
         for html in self.both():
             self.assertEqual(html.count("累计已实现"), 1,
-                             "「累计已实现」整页只出现 1 处（绩效卡 U 对照行）")
-            self.assertIn("累计已实现 -14.38 U", html)
-            self.assertIn("（交易所口径，未扣手续费与资金费）", html)
+                             "「累计已实现」整页只出现 1 处（盈亏曲线「上线以来」行）")
+            self.assertRegex(html, "累计已实现 <b class='[^']*'>-14\.38 U</b>")
+            self.assertIn("已实现为交易所口径，未扣手续费与资金费", html,
+                          "口径说明唯一幸存处 = 账户卡注脚")
 
-    def test_ru_legend_visible(self):
+    def test_ru_legend_removed(self):
+        # 2026-10-29 用户要求删除该段口径说明
         for html in self.both():
-            self.assertIn("R = 策略口径（1R=开仓时计划风险）；U = 账户口径（交易所已实现）"
-                          "——两者口径不同，不直接换算", html)
+            self.assertNotIn("两者口径不同，不直接换算", html)
+            self.assertNotIn("R = 策略口径", html)
 
 
 # ---------------------------------------------- 功能一（P4 反向）：锚点导航已删
@@ -337,17 +339,16 @@ class TestOverviewOrderSmoke(BaseCase):
 
     def test_admin_overview_block_order(self):
         html = self.admin()
-        order = ["三标的动态", "<div class='sec'>账户</div>", "策略绩效（上线以来）",
-                 "<h2>盈亏曲线（已剔除出入金）</h2>", "<h2>仓位</h2>", "<h2>执行器</h2>",
+        order = ["<h2>仓位</h2>", "<div class='sec'>账户</div>",
+                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>",
                  "<summary>API 有效期</summary>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"总览块序错乱：{order}")
 
     def test_hl_overview_block_order(self):
         html = self.hl()
-        order = [f"<h1>{PRODUCT}</h1>", "三标的动态", "<div class='sec'>账户</div>",
-                 "策略绩效（上线以来）", "<h2>盈亏曲线（已剔除出入金）</h2>",
-                 "<h2>仓位</h2>", "<h2>执行器</h2>"]
+        order = [f"<h1>{PRODUCT}</h1>", "<h2>仓位</h2>", "<div class='sec'>账户</div>",
+                 "<h2>盈亏曲线（已剔除出入金）</h2>", "三标的动态", "<h2>执行器</h2>"]
         idx = [html.index(m) for m in order]
         self.assertEqual(idx, sorted(idx), f"/hl 块序错乱：{order}")
         self.assertNotIn("<summary>API 有效期</summary>", html)

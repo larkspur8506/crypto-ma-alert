@@ -113,7 +113,7 @@ class BaseCase(unittest.TestCase):
     @staticmethod
     def account_seg(html: str) -> str:
         """账户卡片段（顶层/次级/重复词断言只看这块，避免命中仓位表同名列）。"""
-        return html.split("<div class='sec'>账户</div>", 1)[1].split("策略绩效（上线以来）", 1)[0]
+        return html.split("<div class='sec'>账户</div>", 1)[1].split("<h2>盈亏曲线", 1)[0]
 
     @staticmethod
     def pos_seg(html: str) -> str:
@@ -152,12 +152,13 @@ class TestAccountLayer(BaseCase):
             self.assertNotIn("累计已实现", seg, "P3 R5：账户卡顶层不再有「累计已实现」")
             self.assertIn("-14.38 U", seg, "今日已实现为交易所 closedPnl 口径（负数如实）")
             self.assertIn("824.34 U", seg, "统一账户可提 = 现货 − 仓位/挂单占用")
-            self.assertIn("（提现收 1U 手续费）", seg)
-            # 全页唯一出处：绩效卡 U 对照行
-            perf_seg = html.split("策略绩效（上线以来）", 1)[1]
-            self.assertIn("累计已实现", perf_seg)
-            self.assertIn("累计已实现 -14.38 U", perf_seg,
-                          "U 对照 = 交易所 closedPnl 口径（负数如实）")
+            self.assertNotIn("提现收 1U 手续费", seg, "手续费说明已删（2026-10-29）")
+            self.assertNotIn("（提现收 1U 手续费）", html)
+            # 全页唯一出处：盈亏曲线区块里的「上线以来」行
+            curve_seg = html.split("<h2>盈亏曲线", 1)[1]
+            self.assertIn("累计已实现", curve_seg)
+            self.assertRegex(curve_seg, "累计已实现 <b class='[^']*'>-14\.38 U</b>",
+                             "U 对照 = 交易所 closedPnl 口径（负数如实）")
 
     def test_dedup_rows_gone_from_account_but_position_columns_stay(self):
         self.info._snap = fake_snapshot(positions=[held_position()])
@@ -254,8 +255,8 @@ class TestSymbolCardMerge(BaseCase):
 
     def test_merged_line_present_and_old_tables_gone(self):
         for html in self.both():
-            self.assertRegex(html, r"数据源 hl-candle 正常 · 最后成功 \d{2}:\d{2}:\d{2}"
-                                   r" · 已处理到 \d{2}-\d{2} \d{2}:\d{2}")
+            # 2026-10-29 精简：数据源正常时不再渲染小字行（异常才出现）
+            self.assertNotIn("数据源 hl-candle 正常", html)
             self.assertNotIn("<div class='sec'>数据源健康</div>", html,
                              "「数据源健康」旧表已删（整页 0 处）")
             self.assertNotIn("<div class='sec'>已处理到</div>", html,
