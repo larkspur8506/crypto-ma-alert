@@ -346,8 +346,20 @@ def capture_panel_snapshot(source: str = "", with_why: bool = False) -> bool:
             logger.info("[panel] 快照跳过：未配置钱包地址（面板会回落实时读取）")
             return False
         info = get_hl_info()
+        # 面板状态条的「HL 延迟」本该是「请求交易所不花多少时间」。阶段 B 之后面板渲染不再
+        # 访问交易所，那一次耗时就不存在了 —— 与其显示成「—」或者一个测量不到的 1 ms，
+        # 不如把调度器**这一轮真实读数**的耗时记下来，面板标成「上一轮（N 分钟前）的耗时」。
+        # 范围 = allMids + 账户快照（共 4~5 个只读请求），与旧口径的单次 snapshot 略有出入，
+        # 但同样是「服务器 → Hyperliquid」的真实往返，不含任何渲染开销。
+        t0 = time.time()
         mids = info.all_mids()
         snapshot = info.snapshot(address, mids=mids)
+        if isinstance(snapshot, dict):
+            snapshot["panel_net"] = {
+                "latency_ms": round((time.time() - t0) * 1000.0, 1),
+                "ts": t0,                       # 采样时刻：面板据此说「几分钟前那一轮」
+                "source": source or "scheduler",
+            }
         why_rows = None
         if with_why:
             from app import why as why_mod

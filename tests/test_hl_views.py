@@ -788,3 +788,57 @@ class TestWithdrawableDisplay(BaseCase):
         html = self._html()
         self.assertIn("可提余额", html)
         self.assertIn("88.50", html)
+
+
+class TestLatencyFromSnapshot(BaseCase):
+    """HL 延迟的两条来源必须分得清（阶段 B 之后面板渲染不访问交易所）。
+
+    - 实时读数（/api/hl/status、无快照回落）：延迟 = 本次请求实测，`latency_from_snapshot=False`；
+    - 调度器快照：延迟 = 写入快照时那一轮的实测（`panel_net`），带采样距今多久，
+      `latency_from_snapshot=True` —— 页面据此说明「不是此刻测的」。
+    """
+
+    def _with_panel_net(self, net):
+        snap = dict(self.info._snap)
+        # 读数来自快照时 SnapshotInfo 一定会打上这个年龄标记（面板据此决定显不显示）
+        snap["panel_snapshot_age_s"] = 12.0
+        if net is None:
+            snap.pop("panel_net", None)
+        else:
+            snap["panel_net"] = net
+        self.info._snap = snap
+
+    def test_snapshot_latency_used_with_age(self):
+        self._with_panel_net({"latency_ms": 456.7, "ts": FIXED_NOW - 300.0, "source": "monitor"})
+        n = self.payload()["network"]
+        self.assertTrue(n["latency_from_snapshot"])
+        self.assertAlmostEqual(n["latency_ms"], 456.7)
+        self.assertAlmostEqual(n["latency_age_s"], 300.0)
+
+    def test_live_path_has_no_snapshot_flags(self):
+        n = self.payload()["network"]
+        self.assertFalse(n["latency_from_snapshot"])
+        self.assertIsNone(n["latency_age_s"])
+        self.assertIsInstance(n["latency_ms"], (int, float))
+
+    def test_zero_or_missing_latency_is_unknown(self):
+        for net in (None, {"latency_ms": 0.0, "ts": FIXED_NOW},
+                    {"latency_ms": -3, "ts": FIXED_NOW}, {"ts": FIXED_NOW}):
+            self._with_panel_net(net)
+            n = self.payload()["network"]
+            self.assertFalse(n["latency_from_snapshot"], f"不该认 {net} 为实测值")
+            self.assertIsNone(n["latency_age_s"])
+
+    def test_page_renders_snapshot_latency_and_scope(self):
+        self._with_panel_net({"latency_ms": 456.7, "ts": FIXED_NOW - 300.0})
+        html = render_dashboard(self.payload())
+        self.assertIn("HL 延迟 <b>457 ms</b>", html)
+        self.assertIn("调度器上一轮读 Hyperliquid 的耗时", html)
+        self.assertIn("本次渲染没有访问交易所", html)
+
+    def test_page_without_measurement_shows_dash_not_fake_ms(self):
+        self._with_panel_net({"latency_ms": 0.0, "ts": FIXED_NOW})
+        html = render_dashboard(self.payload())
+        self.assertIn("HL 延迟 <b>—</b>", html)
+        self.assertNotIn("HL 延迟 <b>0 ms</b>", html)
+

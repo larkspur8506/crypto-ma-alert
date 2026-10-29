@@ -262,6 +262,13 @@ class TestWiring(unittest.TestCase):
         row = self.mod.panel_snapshot_store().latest()
         self.assertIsNotNone(row)
         self.assertEqual(row["why"], [{"symbol": "BTC_USDT", "ok": False}])
+        # 快照里必须带上「调度器这一轮读数花了多久」——面板的 HL 延迟只能来自这里
+        # （渲染本身不访问交易所，测不到，也不能编）。
+        net = row["snapshot"].get("panel_net")
+        self.assertIsInstance(net, dict, "快照缺 panel_net：面板就只能显「—」")
+        self.assertIsInstance(net.get("latency_ms"), (int, float))
+        self.assertGreaterEqual(net["latency_ms"], 0.0)
+        self.assertAlmostEqual(net["ts"], row["ts"], delta=5.0)
         self.info.reset()
         with self.TestClient(self.mod.app) as c:
             r = c.get("/admin", params={"k": "snap-tk"})
@@ -269,9 +276,54 @@ class TestWiring(unittest.TestCase):
             self.assertEqual(self.info.total, 0, f"面板应零请求：{self.info.snapshots} 次快照")
             # 状态条要如实标出「数据 X 秒前」
             self.assertIn("数据", r.text)
-            # 快照模式没访问交易所 ⇒ 不能显示一个未实测的网络延迟（曾显示成「1 ms」）
-            self.assertIn("HL 延迟 <b>—</b>", r.text)
-            self.assertNotIn("HL 延迟 <b>0 ms</b>", r.text)
+
+    def _write_latency(self, latency_ms, age_s=300.0):
+        """把最新一行的 panel_net 改成一个确定的采样值（避免测试依赖真实耗时毫秒数）。"""
+        store = self.mod.panel_snapshot_store()
+        row = store.latest()
+        self.assertIsNotNone(row, "先 capture 一行再改")
+        snap = dict(row["snapshot"])
+        if latency_ms is None:
+            snap.pop("panel_net", None)                # 模拟升级前写的老快照
+        else:
+            snap["panel_net"] = {"latency_ms": latency_ms,
+                                 "ts": time.time() - age_s, "source": "monitor"}
+        store.write(snapshot=snap, mids=row["mids"], why=row["why"], source="monitor")
+        return store.latest()
+
+    def test_panel_shows_scheduler_latency_with_age(self):
+        """快照里带实测耗时 ⇒ 状态条显示这个数，并说明是「N 分钟前」那一轮。"""
+        self.assertTrue(self._capture())
+        self._write_latency(456.7, age_s=300.0)
+        self.info.reset()
+        with self.TestClient(self.mod.app) as c:
+            r = c.get("/admin", params={"k": "snap-tk"})
+            self.assertEqual(r.status_code, 200)
+        self.assertIn("HL 延迟 <b>457 ms</b>", r.text, "快照实测值没渲染出来")
+        self.assertIn("5 分钟前", r.text)              # 标题里说清是哪一轮测的
+        self.assertIn("本次渲染没有访问交易所", r.text)
+        self.assertEqual(self.info.total, 0, "显示延迟不许回头去访问交易所")
+
+    def test_latency_hidden_for_old_snapshot_without_panel_net(self):
+        """升级前写的老快照没有 panel_net ⇒ 显「—」，绝不能把渲染耗时当成网络延迟。"""
+        self.assertTrue(self._capture())
+        self._write_latency(None)
+        with self.TestClient(self.mod.app) as c:
+            r = c.get("/admin", params={"k": "snap-tk"})
+            self.assertEqual(r.status_code, 200)
+        self.assertIn("HL 延迟 <b>—</b>", r.text)
+        self.assertNotIn("HL 延迟 <b>0 ms</b>", r.text)
+        self.assertNotIn("HL 延迟 <b>1 ms</b>", r.text)
+
+    def test_status_api_keeps_live_semantics(self):
+        """`/api/hl/status` 走实时读数：延迟是本次请求实测，不属于快照。"""
+        self.assertTrue(self._capture())
+        with self.TestClient(self.mod.app) as c:
+            got = c.get("/api/hl/status", params={"k": "snap-tk"}).json()
+        net = got["network"]
+        self.assertIsInstance(net["latency_ms"], (int, float))
+        self.assertFalse(net["latency_from_snapshot"])
+        self.assertIsNone(net["latency_age_s"])
 
     def test_live_mode_still_shows_latency(self):
         """没有快照（回落实时）时延迟徽章照常给数字 —— 这条防止修上一条修过头。"""

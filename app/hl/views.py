@@ -657,6 +657,23 @@ def status_payload(deps: DashboardDeps) -> dict:
     latency_ms = round((time.time() - t0) * 1000.0, 1)
     reachable = bool(snap is not None and not net_err)
     snap = snap or {}
+    # 读数来自调度器快照时（阶段 B），上面那个 latency_ms 只是「读一次 SQLite」的耗时（毫秒级），
+    # 不是网络延迟。快照里带了调度器写入时实测的那一轮耗时（`panel_net`）就用它，并标记来源 +
+    # 采样距今多久 —— 面板据此说明「这是 N 分钟前那一轮的耗时」，而不是假装刚刚测过。
+    latency_from_snapshot = False
+    latency_age_s: Optional[float] = None
+    panel_net = snap.get("panel_net")
+    stored_ms = _opt_num(panel_net.get("latency_ms")) if isinstance(panel_net, dict) else None
+    if stored_ms is not None and stored_ms > 0:      # ≤0 视为没测出来
+        latency_ms = stored_ms
+        latency_from_snapshot = True
+        sampled = _opt_num(panel_net.get("ts"))
+        if sampled:
+            latency_age_s = round(max(0.0, now - sampled), 1)
+    elif snap.get("panel_snapshot_age_s") is not None:
+        # 读数确实来自快照、但快照里没有采样值（升级前写的老行）⇒ 报「没测」（None），
+        # 不能把上面那次 SQLite 读取的 0~1 ms 当成网络延迟（这正是不显示「1 ms」的原因）。
+        latency_ms = None
     snap_positions: List[dict] = snap.get("positions") or []
     snap_orders: List[dict] = snap.get("open_orders") or []
 
@@ -988,6 +1005,8 @@ def status_payload(deps: DashboardDeps) -> dict:
             "testnet": "testnet" in base_url.lower(),
             "reachable": bool(reachable),
             "latency_ms": latency_ms,
+            "latency_from_snapshot": latency_from_snapshot,
+            "latency_age_s": latency_age_s,
             "error": net_err,
         },
         "account": {
@@ -2004,9 +2023,15 @@ def _render_body(p: dict) -> str:
     o.append(_stuck_badge_html(system))
     lat_txt = f"{latency:.0f} ms" if latency is not None else "—"
     # 这是「服务器 → Hyperliquid」的耗时（容器每次拉账户快照的开销），不是你到面板的网络延迟。
-    o.append(f"<span class='badge' title='oracle1 上的容器请求 Hyperliquid /info 的耗时（含失败重试）；"
-             f"与你的浏览器到本站的延迟无关'>"
-             f"<span class='pos'>&#9679;</span> HL 延迟 <b>{lat_txt}</b></span>")
+    # 快照模式（阶段 B）下本次渲染没访交易所，数字来自调度器上一轮的实测，标题必须说清。
+    if bool(net.get("latency_from_snapshot")):
+        lat_title = "调度器上一轮读 Hyperliquid 的耗时（本次渲染没有访问交易所）；与你的浏览器到本站的延迟无关"
+    else:
+        lat_title = ("oracle1 上的容器请求 Hyperliquid /info 的耗时（含失败重试）；"
+                     "与你的浏览器到本站的延迟无关")
+    o.append(f"<span class='badge' title='{_esc(lat_title)}'>"
+             f"<span class='{('pos' if latency is not None else 'muted')}'>&#9679;</span>"
+             f" HL 延迟 <b>{lat_txt}</b></span>")
     # API 有效期徽章（P3 R3）：唯一常驻出处（原「API 有效期」卡降级为总览末尾的 details）。
     o.append(_agent_badge_html(p.get("agent")))
     o.append(f"<span class='badge'><span class='muted'>&#9679;</span> 更新 "

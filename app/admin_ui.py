@@ -2060,6 +2060,15 @@ button.gray{background:var(--btn-gray)}button.red{background:#b91c1c}
 </style>"""
 
 
+def _age_txt(f: float) -> str:
+    """「X 秒/分钟/小时前」的唯一格式化入口（数据徽章与延迟徽章的标题共用，避免两种写法）。"""
+    if f < 60:
+        return f"{int(f)} 秒前"
+    if f < 3600:
+        return f"{int(f // 60)} 分钟前"
+    return f"{f / 3600:.1f} 小时前"
+
+
 def _panel_age_badge(age: Any) -> str:
     """数据新鲜度徽章（阶段 B）：读数是快照时标出「多旧」；实时读取时返回空串。
 
@@ -2069,13 +2078,7 @@ def _panel_age_badge(age: Any) -> str:
     f = _opt_num(age)
     if f is None or f < 0:
         return ""
-    if f < 60:
-        txt = f"{int(f)} 秒前"
-    elif f < 3600:
-        txt = f"{int(f // 60)} 分钟前"
-    else:
-        txt = f"{f / 3600:.1f} 小时前"
-    return _badge("muted" if f < 600 else "warn", "数据", txt,
+    return _badge("muted" if f < 600 else "warn", "数据", _age_txt(f),
                   "面板读数是调度器最近一轮的读数（每 5 分钟刷新一次），不是此刻的实时值；"
                   "下单/对账/熔断走的始终是实时读数")
 
@@ -2094,12 +2097,20 @@ def _status_strip(p: dict) -> str:
     system = p.get("system") or {}
     net = p.get("network") or {}
     mismatch = bool(system.get("mismatch"))
-    # 读数来自调度器快照时，本次渲染**没有访问交易所** ⇒ 这个延迟数字没被测过。
-    # 显示成「1 ms」会让用户以为网络很好，所以快照模式下显式留空（—）并说明原因。
+    # 读数来自调度器快照时，本次渲染**没有访问交易所** ⇒ 渲染时测到的耗时（毫秒级的 SQLite 读）
+    # 绝不能当成网络延迟显示（曾显示成「1 ms」）。快照里带了调度器那一轮实测的耗时就用它，
+    # 老快照（没有 `panel_net`）则显「—」。
     from_snapshot = _opt_num(p.get("panel_age_s")) is not None
-    lat = None if from_snapshot else _opt_num(net.get("latency_ms"))
-    lat_title = ("读数是调度器快照，本次渲染没有访问交易所 —— 所以这里不显示网络延迟"
-                 if from_snapshot else "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关")
+    lat_from_snapshot = bool(net.get("latency_from_snapshot"))
+    lat = _opt_num(net.get("latency_ms")) if (not from_snapshot or lat_from_snapshot) else None
+    if lat is not None and lat_from_snapshot:
+        age_txt = _opt_num(net.get("latency_age_s"))
+        lat_title = ("调度器上一轮" + (f"（{_age_txt(age_txt)}）" if age_txt is not None else "")
+                     + "读 Hyperliquid 的耗时；本次渲染没有访问交易所，也不是你到面板的延迟")
+    elif from_snapshot:
+        lat_title = "读数是调度器快照，本次渲染没有访问交易所 —— 所以这里不显示网络延迟"
+    else:
+        lat_title = "服务器请求 Hyperliquid 的耗时，与你到面板的延迟无关"
     kill_reason = str(p.get("kill_reason") or "").strip()
     # 熔断触发且原因非空 → 值里带上原因（可见文字）；iOS Safari 无 title 悬停，
     # 原先原因只在 title 里、手机上读不到。未触发时值不变，title 保留。
