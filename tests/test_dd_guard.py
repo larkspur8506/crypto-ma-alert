@@ -830,7 +830,9 @@ class TestV2FlowFreshness(Base):
                              now_fn=lambda: NOW)
         html = render_dashboard(status_payload(deps))
         self.assertIn("等待流水同步", html)
-        self.assertIn("按流水同步节奏更新", html, "30 分钟分辨率必须写在可见文字里")
+        # 2026-10-29 用户要求：固定口径括注「按流水同步节奏更新」已删；
+        # dd_wait_note（真实的「等待流水同步（原因）」）仍是唯一的新鲜度告警出口
+        self.assertNotIn("按流水同步节奏更新", html)
 
 
 class TestV2L1Freshness(Base):

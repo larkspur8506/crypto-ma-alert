@@ -164,7 +164,8 @@ class TestTableHeaders(PanelFieldsBase):
         self.db.mark_feed("BTC_USDT", "binance", True)
         self.db.set_symbol_state("BTC_USDT", price=100.0)   # 让三标的卡渲染出该标的
         html = self.html()
-        self.assertIn("数据源 binance 正常", html)
+        # 2026-10-29 精简：数据源正常时不渲染小字行（异常才出现，见 _feed_line）
+        self.assertNotIn("数据源 binance 正常", html)
         # 旧表整块删除（不是折叠）：两个区块标题整页 0 处
         self.assertNotIn("数据源健康", html)
         self.assertNotIn("<div class='sec'>已处理到</div>", html)
