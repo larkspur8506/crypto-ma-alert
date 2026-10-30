@@ -479,7 +479,8 @@ def _f(v: Any, default: float = 0.0) -> float:
 
 def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, *,
                 log_event: Optional[Callable[..., None]] = None,
-                retries: int = 2) -> dict:
+                retries: int = 2,
+                book_pnl: Optional[Callable[[int], None]] = None) -> dict:
     """到期保护清仓：撤全部挂单 → 逐仓市价平 → 复查无仓。
 
     返回 {"ok": bool, "error": str, "closed": [{coin, sz, px}], "attempts": int,
@@ -491,6 +492,8 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
     - kill 置位不在这里做：调用方（`check_once`）在调本函数**之前**就置好了，
       这样即使本函数第一步就抛异常，也不会留下「没人管的新仓」。
     - 失败重试 `retries` 次（默认 2 → 最多 3 轮）。每轮都重新读快照，不缓存仓位。
+    - `book_pnl`：本地关账后补算流水口径净利的回调（`Executor._record_fill_pnl`），
+      没有就跳过（net_pnl 留空）。
     """
     dry = str(getattr(params, "mode", "") or "").lower() == MODE_DRY
     address = str(getattr(params, "account_address", "") or "")
@@ -529,8 +532,18 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
                 continue
             cancelled = list((res.get("raw") or {}).get("oids") or [])
             cancel_failed = list((res.get("raw") or {}).get("failed") or [])
-            _ev(f"清仓：已撤 {len(cancelled)} 张挂单"
-                + (f"（{len(cancel_failed)} 张没撤掉）" if cancel_failed else ""))
+            if cancel_failed:
+                # 对抗审查（HL 侧 2026-10-30）：部分撤单失败 ≠ 那张单已不在场 ——
+                # 网络抖动/限频的失败单还活着。照常平仓会把它留成孤儿触发单
+                # （人工/外部平仓路径的同款危害：下次开仓被它平掉），且 ✅ 成功文案
+                # 会谎报「已撤掉全部挂单」。fail-closed：整轮重试 —— 已消失的单在
+                # 重试时自然不在 failed 里，重试收敛；到重试耗尽仍失败 → ok=False
+                # （走 cleanup_fail 告警，cancel_failed 明细在结果里）。
+                last_err = (f"撤单部分失败：{len(cancel_failed)} 张没撤掉"
+                            f"（{'、'.join(str(f.get('oid')) for f in cancel_failed[:5])}）")
+                _ev(f"清仓：{last_err}")
+                continue
+            _ev(f"清仓：已撤 {len(cancelled)} 张挂单")
 
         # ---- 2) 读当前仓位（**不缓存**，每轮重读；读不到不算成功）
         try:
@@ -613,7 +626,7 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
         for p in (snap.get("positions") or []):
             c = str((p or {}).get("coin") or "")
             prices.setdefault(c, _f((p or {}).get("mark_px")))
-        booked = _close_local_positions(db, params, still, prices, _ev)
+        booked = _close_local_positions(db, params, still, prices, _ev, book_pnl=book_pnl)
         return {"ok": True, "error": "", "closed": closed, "attempts": attempts,
                 "dry": False, "cancelled": len(cancelled),
                 "closed_local": booked, "cancel_failed": cancel_failed}
@@ -652,7 +665,8 @@ def _entry_issued(db: Any, row: Any) -> bool:
 
 def _close_local_positions(db: Any, params: Any, still_on_exchange: Any,
                           prices: Dict[str, float],
-                          ev: Optional[Callable[..., None]] = None) -> int:
+                          ev: Optional[Callable[..., None]] = None,
+                          book_pnl: Optional[Callable[[int], None]] = None) -> int:
     """把交易所已经没有仓的本地仓位关账（幂等；单行失败只记日志，不否定清仓结论）。
 
     - status='closed'、exit_reason='agent_expiry_cleanup'、auto_closed=1
@@ -690,6 +704,24 @@ def _close_local_positions(db: Any, params: Any, still_on_exchange: Any,
                 ev(f"清仓：本地仓位 #{r['id']} {r['symbol']} 已关账 @ {px:,.2f}")
         except Exception as e:                                    # noqa: BLE001
             logger.warning("[agent] 本地仓位 #%s 关账失败：%s", r["id"], e)
+        else:
+            # 对抗审查 P3（HL 侧 2026-10-30）：清仓关账走的是 db 直写，不走执行器的
+            # _close_local —— 宽限键要在这里补清（否则 configuration 留永久垃圾），
+            # net_pnl 也要补算（statistics 口径不留空）。两步都不否定清仓结论。
+            try:
+                del_fn = getattr(db, "del_config", None)
+                grace_key = f"hl_close_grace:{int(r['id'])}"   # 与 executor.GRACE_KEY_PREFIX 同前缀
+                if callable(del_fn):
+                    del_fn(grace_key)
+                else:
+                    db.set_config(grace_key, "")
+            except Exception as e:                                # noqa: BLE001
+                logger.warning("[agent] 清宽限键失败（忽略）：%s", e)
+            if book_pnl is not None:
+                try:
+                    book_pnl(int(r["id"]))
+                except Exception as e:                            # noqa: BLE001
+                    logger.warning("[agent] 清仓后补算 net_pnl 失败（忽略）：%s", e)
         # 该标的还挂着的单（止损/离场）在交易所已被撤 —— 本地状态同步，别留 resting 幽灵单
         try:
             for o in db.hl_recent_orders(200):

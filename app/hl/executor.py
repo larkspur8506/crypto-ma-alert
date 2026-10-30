@@ -3339,7 +3339,8 @@ class Executor:
             with agent_mod.cleanup_session():
                 self._event(EV_DECISION, f"到期保护清仓开始：{reason}")
                 res = agent_mod.flatten_all(self.db, self.p, self.info, self.ex, self.notifier,
-                                            log_event=self._event)
+                                            log_event=self._event,
+                                            book_pnl=self._record_fill_pnl)
                 self._event(EV_ORDER if res.get("ok") else EV_ERROR,
                             f"到期保护清仓{'完成' if res.get('ok') else '失败'}："
                             f"{res.get('error') or f'{len(res.get('closed') or [])} 个标的已平'}")
