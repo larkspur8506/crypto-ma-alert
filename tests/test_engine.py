@@ -204,3 +204,15 @@ class TestDisplayTime(unittest.TestCase):
         first = engine.format_exit(c, pos, 83829.3, "ma20", 1791864000000, 1).splitlines()[0]
         self.assertIn("10-13 16:00 北京时间收盘", first)
         self.assertNotIn("UTC", first)
+
+    def test_stop_exit_advice_points_to_records(self):
+        """止损提醒的处置行指向交易所/记录页（2026-10-30 PR B：确认页已删、MEXC 字样是更早遗留）。"""
+        c = cfg()
+        pos = type("P", (), {"symbol": "BTC_USDT", "side": -1, "action_label": "空单",
+                             "close_side": "买入平仓", "eff_entry": 82909.3,
+                             "eff_stop": 84060.0})()
+        text = engine.format_exit(c, pos, 84060.0, "stop", 1791864000000, 1)
+        self.assertIn("止损单应已在交易所触发", text)
+        self.assertIn("hl_fills", text)
+        self.assertNotIn("MEXC", text)
+        self.assertNotIn("确认页", text)

@@ -31,7 +31,7 @@
 | `sizing.py` | MEXC 面值/张数换算 | **不动**；新增 `hl/sizing_hl.py`（HL 连续数量） |
 | `market.py` | 行情源（MEXC 合约 → OKX 降级） | **不动**（信号数据源仍用 MEXC，基差极小；HL 的 4h 历史只回溯到 2024-07，不能作为回测证据） |
 | `db.py` | positions / alert_logs / bar_state / feed_health | 新增 4 张表：`hl_orders` / `hl_fills` / `hl_snapshots` / `hl_events`；`positions` 增列 |
-| `main.py` | /admin 状态页 + 确认页 | 新增 `/hl` 监控页 + `/api/hl/*` JSON |
+| `main.py` | /admin 面板（总览+记录+管理卡） | 新增 `/hl` 监控页 + `/api/hl/*` JSON；确认页已于 2026-10-30 移除 |
 | `notify.py` | 企业微信 + Telegram 双通道 | 复用（新增 `kind=hl_*` 告警类型） |
 
 ## 2. 架构

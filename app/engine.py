@@ -213,7 +213,7 @@ def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms:
         # 2026-10-30 PR B：原文「实际成交价与止损价不同就在确认页填真实平仓价」指向
         # 已退役的 /c/{pid} 确认页（死指引），改为指向面板「记录」页的 hl_fills ——
         # 那里才是真实成交价的唯一事实来源。余下文案逐字符不变。
-        advice = (f"止损单应已在交易所触发（{pos.close_side}）：到 MEXC 核对持仓已平、无残留委托；"
+        advice = (f"止损单应已在交易所触发（{pos.close_side}）：到交易所核对持仓已平、无残留委托；"
                   f"实际成交价与止损价不同就按面板「记录」页的 hl_fills 核对")
     else:
         head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
