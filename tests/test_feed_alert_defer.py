@@ -28,7 +28,7 @@ from app import engine, market                                        # noqa: E4
 from app.config import Config                                         # noqa: E402
 from app.db import DB                                                 # noqa: E402
 from app.market import FeedError                                      # noqa: E402
-from tests.test_admin_ui import BaseCase, PARAMS_OK, TOKEN            # noqa: E402
+from tests.test_admin_ui import BaseCase, TOKEN                      # noqa: E402
 from tests.test_strategy import (trend_then_flat, flat_bar)           # noqa: E402
 
 SYM = "BTC_USDT"
@@ -190,23 +190,20 @@ class TestThresholdValidation(BaseCase):
         cfg.apply_db({"feed_alert_delay_s": "0"})
         self.assertEqual(cfg.feed_alert_delay_s, 0.0, "显式 0（旧行为）合法")
 
-    def test_panel_save_and_roundtrip(self):
-        # 非法值 → 400 且不写库
-        r = self.post("/admin/params", **self.params_form(feed_alert_delay_s="7201"))
-        self.assertEqual(r.status_code, 400)
-        self.assertIsNone(self.db.conn.execute(
-            "SELECT value FROM configuration WHERE key='feed_alert_delay_s'"
-        ).fetchone())
-        # 合法值 → 303 重定向，DB 落键，Config 装配读回生效
-        r = self.post("/admin/params", **self.params_form(feed_alert_delay_s="600"))
-        self.assertEqual(r.status_code, 303)
-        cfg = Config().apply_db(self.db.get_config())
-        self.assertEqual(cfg.feed_alert_delay_s, 600.0)
-        # 显式 0 = 立即推，同样可保存
-        r = self.post("/admin/params", **self.params_form(feed_alert_delay_s="0"))
-        self.assertEqual(r.status_code, 303)
-        cfg = Config().apply_db(self.db.get_config())
-        self.assertEqual(cfg.feed_alert_delay_s, 0.0)
+    def test_db_write_roundtrip(self):
+        """2026-10-30 面板精简：参数页 POST 已删除，写入只剩 DB 直改一条路。
+
+        这条钉的是**读侧口径不变**：DB 里写什么，Config 装配就生效什么
+        （runbook 的容器内 sqlite 直改依赖这一条）。
+        """
+        self.db.set_config("feed_alert_delay_s", 600.0)
+        self.assertEqual(Config().apply_db(self.db.get_config()).feed_alert_delay_s, 600.0)
+        # 显式 0 = 立即推，同样是合法生效值
+        self.db.set_config("feed_alert_delay_s", 0.0)
+        self.assertEqual(Config().apply_db(self.db.get_config()).feed_alert_delay_s, 0.0)
+        # 越界值写进 DB 也照样被装配层拒收（保留默认 1800）
+        self.db.set_config("feed_alert_delay_s", 7201.0)
+        self.assertEqual(Config().apply_db(self.db.get_config()).feed_alert_delay_s, 1800.0)
 
 
 class TestRetryExcludesPending(_Base):
@@ -234,18 +231,8 @@ class TestRetryExcludesPending(_Base):
         self.assertEqual(pend, 0, "pending 行保持未推送状态")
 
 
-class TestParamsPageRendering(BaseCase):
-    """清单 8 + 记录页映射：新字段词面/白话说明可见；kind 中文映射双入口生效。"""
-
-    def test_params_tab_renders_new_field(self):
-        html = self.body("/admin", tab="params")
-        self.assertIn("数据源异常提醒延迟（秒，0=立即）", html)
-        self.assertIn("持续未恢复超过这么久才推送", html)
-        self.assertIn("滤掉交易所例行维护这类分钟级抖动", html)
-        # /hl 旧地址兼容入口仍在（302 → /admin），双入口同一份面板
-        r = self.client.get("/hl", params={"k": TOKEN}, follow_redirects=False)
-        self.assertEqual(r.status_code, 302)
-        self.assertTrue(r.headers["location"].startswith("/admin"))
+class TestRecordsKindMapping(BaseCase):
+    """记录页映射：kind 中文映射双入口生效（原「参数页词面」一条随页面删除）。"""
 
     def test_records_show_pending_kind_in_chinese(self):
         # 主记录页 + /admin/list/alerts 子页都用 _ALERT_KIND_TXT（同一份映射）

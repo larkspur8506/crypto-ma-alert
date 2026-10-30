@@ -22,7 +22,6 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from app.admin_ui import _dd_threshold_fields, _parse_dd_thresholds
 from app.config import Config
 from app.db import DB
 from app.hl import MODE_LIVE
@@ -293,7 +292,12 @@ class TestUnavailableEventThrottle(Base):
 
 # ------------------------------------------------ 4. 矛盾阈值（低5）
 class TestContradictoryThresholdsVisible(Base):
-    """矛盾阈值拒收后，用户必须在**面板上**看见「你填的值没生效」。"""
+    """DB 里存着矛盾阈值时，装配层（apply_db）必须拒收、保留原值。
+
+    2026-10-30 面板精简：面板不再有阈值输入框（也没有「你填的值没生效」这类
+    表单提示），写入只剩 DB 直改一条路 —— 所以这条守卫整体落到装配层：
+    apply_db 是**唯一**的执行口径，矛盾值绝不能进内存配置。
+    """
 
     def _cfg(self, warn: float = 0.30, kill: float = 0.40) -> Config:
         cfg = Config()
@@ -302,13 +306,6 @@ class TestContradictoryThresholdsVisible(Base):
         cfg.hl_dd_kill_pct = kill
         return cfg
 
-    def test_parse_rejects_with_explicit_message(self):
-        cfg = self._cfg()
-        out, msg = _parse_dd_thresholds("0.45", "0.35", cfg)
-        self.assertEqual(out, {}, "自相矛盾 → 两条都不写库（保留原值，语义不改）")
-        self.assertIn("没生效", msg)
-        self.assertIn("自相矛盾", msg)
-
     def test_apply_db_keeps_old_values(self):
         """装配层同样拒收：内存里保留原值（不是把矛盾值吃进去）。"""
         cfg = self._cfg()
@@ -316,18 +313,12 @@ class TestContradictoryThresholdsVisible(Base):
         self.assertAlmostEqual(cfg.hl_dd_warn_pct, 0.30, places=6)
         self.assertAlmostEqual(cfg.hl_dd_kill_pct, 0.40, places=6)
 
-    def test_field_shows_live_values_and_reject_rule(self):
-        """输入框下方常驻小字：当前生效值 + 「自相矛盾会被拒收、不生效」。"""
-        html = _dd_threshold_fields(self._cfg(), {})
-        self.assertIn("当前生效：告警 30% / 熔断 40%", html)
-        self.assertIn("自相矛盾", html)
-        self.assertIn("不生效", html)
-
-    def test_field_warns_when_db_pair_is_contradictory(self):
-        """DB 里真存着矛盾值时：明说「你填的值没生效，已按档位默认线执行」。"""
-        html = _dd_threshold_fields(self._cfg(warn=0.45, kill=0.35), {})
-        self.assertIn("自相矛盾", html)
-        self.assertIn("你填的值没生效", html)
+    def test_apply_db_accepts_consistent_override(self):
+        """一致的一对覆盖值照旧生效（删 UI 不许改变生效语义）。"""
+        cfg = self._cfg()
+        cfg.apply_db({"hl_dd_warn_pct": "0.35", "hl_dd_kill_pct": "0.45"})
+        self.assertAlmostEqual(cfg.hl_dd_warn_pct, 0.35, places=6)
+        self.assertAlmostEqual(cfg.hl_dd_kill_pct, 0.45, places=6)
 
 
 # ------------------------------------------------ 5. dd kill 期间补挂止损（回归 v2 高3）

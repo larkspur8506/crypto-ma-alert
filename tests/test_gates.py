@@ -434,34 +434,6 @@ class TestThresholdReadFromConfig(unittest.TestCase):
         self.assertEqual(_churn_max(type("C", (), {})()), 5)
         self.assertEqual(_churn_max(type("C", (), {"hl_churn_max": -2})()), 5)
 
-    def test_panel_param_parse(self):
-        """面板「保存全部参数」：带了就写、没带/留空就保持原值、越界报错。"""
-        from app.admin_ui import _parse_params
-        base = {"equity": "1000", "risk_pct": "0.02", "leverage": "5",
-                "stop_min": "0.015", "stop_max": "0.08", "short_regime_ma": "200",
-                "equity_mode": "follow", "equity_min": "20"}
-        # ① 带了 → 写
-        vals, errs = _parse_params({**base, "hl_churn_max": "3"})
-        self.assertEqual(errs, [])
-        self.assertEqual(vals.get("hl_churn_max"), 3)
-        # ② 没带（老书签/curl）→ 不写（**不能**刷成 0 = 悄悄关掉熔断）
-        vals, errs = _parse_params(dict(base))
-        self.assertEqual(errs, [])
-        self.assertNotIn("hl_churn_max", vals)
-        # ③ 留空 → 保持原值
-        vals, errs = _parse_params({**base, "hl_churn_max": ""})
-        self.assertEqual(errs, [])
-        self.assertNotIn("hl_churn_max", vals)
-        # ④ 0 是合法值（显式关闭）
-        vals, errs = _parse_params({**base, "hl_churn_max": "0"})
-        self.assertEqual(errs, [])
-        self.assertEqual(vals.get("hl_churn_max"), 0)
-        # ⑤ 非数字 / 越界 → 报错，不写库
-        for bad in ("abc", "100000"):
-            vals, errs = _parse_params({**base, "hl_churn_max": bad})
-            self.assertTrue(errs, f"{bad} 应被拒")
-            self.assertNotIn("hl_churn_max", vals)
-
 
 if __name__ == "__main__":
     unittest.main()

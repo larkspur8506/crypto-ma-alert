@@ -472,96 +472,25 @@ class TestReviewFillTarget(unittest.TestCase):
             self.assertAlmostEqual(rev["target_risk_u"], 10.0, places=6, msg=repr(bad))
 
 
-# ================================================================ 2/面板
-try:
-    from tests.test_admin_ui import TOKEN as PANEL_TOKEN
-    from tests.test_admin_ui import BaseCase as _PanelBase
-except ImportError:                       # pragma: no cover - fastapi 未装
-    _PanelBase = None
+# ================================================================ 2/读路径
+# 2026-10-30 面板精简：开关页与 /admin/switch/strategy 已删除，「空单风险减半」在页面
+# 上不再有旋钮（连同影响预览一起删）。DB 里的值照旧生效 —— 这条钉住读路径没被删坏。
+class TestShortRiskHalfReadPath(unittest.TestCase):
+    def test_db_value_still_drives_sizing(self):
+        from app import sizing
+        on = Config().apply_db({"short_risk_half": "1"})
+        self.assertTrue(on.short_risk_half, "DB 写 1 → 生效开")
+        self.assertAlmostEqual(sizing.effective_risk_pct(0.02, -1, on.short_risk_half), 0.01,
+                               msg="开 = 空单按半额")
+        off = Config().apply_db({"short_risk_half": "0"})
+        self.assertFalse(off.short_risk_half, "DB 写 0 → 生效关")
+        self.assertAlmostEqual(sizing.effective_risk_pct(0.02, -1, off.short_risk_half), 0.02,
+                               msg="关 = 空单全额")
+        # '0' 是字符串真值也不能被当成开（老 fail-dangerous 口径回归）
+        self.assertFalse(Config().apply_db({"short_risk_half": "0"}).short_risk_half)
 
 
-@unittest.skipIf(_PanelBase is None, "fastapi 未安装")
-class TestPanelSwitch(_PanelBase):
-    """开关页：渲染 + 独立 POST（写库 / 事件旧→新 / 缺字段不变 / '0' 是关）。"""
-
-    def test_switch_rendered_next_to_short_toggle(self):
-        html = self.body(tab="switch")
-        self.assertIn("空单风险减半", html)
-        self.assertIn("name='short_risk_half'", html)
-        self.assertIn("<input type='hidden' name='short_risk_half' value='0'>", html)
-        self.assertIn("0.5 倍", html)                    # 白话说明里写清倍率
-        self.assertIn("多单不变", html)
-        self.assertIn("只影响开仓", html)
-        # 与「允许做空」相邻（同一张卡、紧跟其后），而不是跑到参数页
-        self.assertLess(html.index("允许做空"), html.index("空单风险减半"))
-        self.assertLess(html.index("空单风险减半"), html.index("到期前自动清仓"))
-        # 默认关：不出现 checked
-        self.assertNotRegex(html, r"name='short_risk_half' value='1' checked")
-
-    def test_post_on_writes_db_and_event_with_old_new(self):
-        self.assertFalse(self._cfg().short_risk_half)
-        r = self.post("/admin/switch/strategy", short_risk_half="1")
-        self.assertEqual(r.status_code, 303)
-        self.assertIn("tab=switch", r.headers["location"])
-        self.assertIn(f"k={PANEL_TOKEN}", r.headers["location"])
-        self.assertEqual(str(self.db.get_config_str("short_risk_half")), "1")
-        self.assertTrue(self._cfg().short_risk_half)
-        msgs = [e["message"] for e in self.db.hl_recent_events(5, kind="decision")]
-        self.assertTrue(any("空单风险减半=关→开" in m for m in msgs), msgs)
-        # 页面回显：checkbox 变 checked
-        html = self.body(tab="switch")
-        self.assertRegex(html, r"name='short_risk_half' value='1' checked")
-        # 再关一次：事件记「开→关」
-        r = self.post("/admin/switch/strategy", short_risk_half="0")
-        self.assertEqual(r.status_code, 303)
-        self.assertEqual(str(self.db.get_config_str("short_risk_half")), "0")
-        self.assertFalse(self._cfg().short_risk_half, "'0' 必须是关")
-        msgs = [e["message"] for e in self.db.hl_recent_events(5, kind="decision")]
-        self.assertTrue(any("空单风险减半=开→关" in m for m in msgs), msgs)
-
-    def test_partial_post_keeps_value(self):
-        self.db.set_config("short_risk_half", 1)
-        r = self.post("/admin/switch/strategy", enable_shorts="1")
-        self.assertEqual(r.status_code, 303)
-        self.assertEqual(str(self.db.get_config_str("short_risk_half")), "1",
-                         "没提交这个键时必须保持原值")
-
-    def test_bare_checkbox_multivalue_reads_last(self):
-        """浏览器语义：hidden 的 0 先发、勾选的 1 后发 → 取最后一个 = 开。"""
-        r = self.client.post(
-            "/admin/switch/strategy",
-            content=f"k={PANEL_TOKEN}&short_risk_half=0&short_risk_half=1",
-            headers={"content-type": "application/x-www-form-urlencoded"},
-            follow_redirects=False)
-        self.assertEqual(r.status_code, 303)
-        self.assertTrue(self._cfg().short_risk_half)
-        self.assertTrue(any("空单风险减半=关→开" in e["message"]
-                            for e in self.db.hl_recent_events(5, kind="decision")))
-
-    def test_params_page_cannot_toggle_it(self):
-        """参数页批量表单不许碰这个键（否则「保存全部参数」会静默改风险政策）。"""
-        self.db.set_config("short_risk_half", 1)
-        form = self.params_form()
-        form["short_risk_half"] = "0"
-        r = self.post("/admin/params", **form)
-        self.assertEqual(r.status_code, 303)
-        self.assertEqual(str(self.db.get_config_str("short_risk_half")), "1",
-                         "参数 POST 不该改 short_risk_half")
-
-    def test_params_preview_splits_long_short_when_on(self):
-        """M2：开关打开时「改动影响预览」必须区分多单/空单风险。
-
-        预览行的基数是「生效基数」（跟随实时权益 → 100.68 取整 100U），
-        风险 2% → 多单 2.00U / 空单 1.00U。关闭时只印一个数（与改动前一致）。
-        """
-        html = self.body(tab="params")
-        self.assertIn("单笔风险 2.00U", html)
-        self.assertNotIn("多单 2.00U", html)          # 关闭时不拆分
-        self.db.set_config("short_risk_half", 1)
-        html = self.body(tab="params")
-        self.assertIn("单笔风险 多单 2.00U", html)
-        self.assertIn("空单 1.00U", html)
-        self.assertIn("名义 多 133U/空 67U", html)     # 名义/保证金同样分方向
+# ================================================================ 面板影响预览（M2）
 
 
 # ================================================================ 关闭态 golden 矩阵（M3）
@@ -828,49 +757,6 @@ class TestConfirmPostMixedState(unittest.TestCase):
 
 
 # ================================================================ 面板影响预览（M2）
-class TestImpactPreviewSplit(unittest.TestCase):
-    """参数页「改动影响预览」：开关打开时必须把多单/空单的风险分开写。
-
-    原来只有一句「单笔风险 20.00U」—— 开关开着他照着开空实际只有 10U。
-    """
-
-    def test_off_keeps_the_single_number(self):
-        from app.admin_ui import _impact_line, impact
-        line = _impact_line(impact(cfg(short_risk_half=False), 89_000.0))
-        self.assertIn("单笔风险 20.00U", line)
-        self.assertNotIn("多单", line)                 # 关闭时不拆分，文案与原来一致
-
-    def test_on_splits_long_and_short(self):
-        from app.admin_ui import _impact_line, impact
-        d = impact(cfg(short_risk_half=True), 89_000.0)
-        self.assertAlmostEqual(d["risk_u"], 20.0, places=6)
-        self.assertAlmostEqual(d["risk_u_short"], 10.0, places=6)
-        self.assertAlmostEqual(d["notional_short"], d["notional"] / 2, places=6)
-        self.assertAlmostEqual(d["margin_short"], d["margin"] / 2, places=6)
-        line = _impact_line(d)
-        self.assertIn("单笔风险 多单 20.00U", line)
-        self.assertIn("空单 10.00U", line)
-        self.assertIn("名义 多", line)
-        self.assertEqual(line.count("20.00U"), 1, "同一个数字不重复")
-        self.assertEqual(line.count("10.00U"), 1, "同一个数字不重复")
-        for bad in ("scale", "系数", "倍率", "SHORT_HALF", "risk_pct"):
-            self.assertNotIn(bad, line)                # 白话，不引入黑话
-
-    def test_param_hints_split_too(self):
-        """字段旁的小字（基数 / 单笔风险 两处）同样不能只写一个数。"""
-        from app.admin_ui import _preview_hint
-        c_on = cfg(short_risk_half=True)
-        for key in ("risk_pct", "equity"):
-            hint = _preview_hint(key, c_on, 1000.0, 1000.0, None, None)
-            self.assertIn("多单 20.00U", hint, key)
-            self.assertIn("空单 10.00U", hint, key)
-            self.assertNotIn("单笔风险 20.00U", hint, key)     # 不能只剩全额那一个数
-        c_off = cfg(short_risk_half=False)
-        for key in ("risk_pct", "equity"):
-            hint = _preview_hint(key, c_off, 1000.0, 1000.0, None, None)
-            self.assertIn("单笔风险 20.00U", hint, key)        # 关闭时与原来一致
-            self.assertNotIn("多单", hint, key)
-
 
 
 if __name__ == "__main__":

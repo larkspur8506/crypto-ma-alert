@@ -704,44 +704,6 @@ class TestOrder(Base):
                          "流水同步必须早于回撤判断（否则用最长 30 分钟前的流水算回撤）")
 
 
-# ---------------------------------------------------------------- 附：面板阈值输入（§6）
-class TestAdminThresholds(Base):
-    """「策略与保护」页的两个阈值输入框：留空不改、越界/自相矛盾两条一起拒收。
-
-    这里只测纯函数与渲染片段（不搭 FastAPI app）：路由层只是把这两个函数接上，
-    它的表单语义（缺字段=不变）已由 test_admin_ui 的既有用例覆盖。
-    """
-
-    CFG = type("C", (), {"risk_pct": 0.02, "hl_dd_warn_pct": 0.0, "hl_dd_kill_pct": 0.0})
-
-    def test_empty_inputs_write_nothing(self):
-        from app.admin_ui import _parse_dd_thresholds
-        self.assertEqual(_parse_dd_thresholds("", "", self.CFG), ({}, ""),
-                         "留空 = 保持原值，绝不能把空串写成 0")
-        self.assertEqual(_parse_dd_thresholds(None, None, self.CFG), ({}, ""))
-
-    def test_parse_valid_pair(self):
-        from app.admin_ui import _parse_dd_thresholds
-        vals, msg = _parse_dd_thresholds("0.35", "0.45", self.CFG)
-        self.assertEqual(vals, {"hl_dd_warn_pct": 0.35, "hl_dd_kill_pct": 0.45})
-        self.assertEqual(msg, "")
-
-    def test_parse_rejects_inconsistent_or_out_of_range(self):
-        from app.admin_ui import _parse_dd_thresholds
-        for warn, kill in (("0.45", "0.40"), ("0.30", "0.30"), ("1.2", "0.40"), ("abc", "0.40")):
-            vals, msg = _parse_dd_thresholds(warn, kill, self.CFG)
-            self.assertEqual(vals, {}, f"{warn}/{kill} 应被拒收（两条都不写）")
-            self.assertTrue(msg)
-
-    def test_fields_show_override_not_auto_value(self):
-        from app.admin_ui import _dd_threshold_fields
-        html = _dd_threshold_fields(self.CFG, {})
-        self.assertIn("name='hl_dd_warn_pct'", html)
-        self.assertIn("name='hl_dd_kill_pct'", html)
-        self.assertIn("value=''", html, "自动档位时输入框必须留空（否则一保存就变显式覆盖）")
-        self.assertIn("告警 30% / 熔断 40%", html, "当前生效值要写在小字里（risk_pct=2% 档）")
-
-
 # ================================================================ 9. v2 回归（对抗审查 9 条）
 # 规格 §0.2 / §9 第 9 组。**关键**：v1 的用例全是「先把流水写进库再跑一轮」，正好绕过
 # 高1 那条缺陷 —— 这里的用例必须模拟「流水还没同步」（闸门内、接口失败、账本后到）。
@@ -908,18 +870,6 @@ class TestV2ManualUnkill(Base):
         self.assertFalse(self.db.hl_kill(), f"解除后立刻又熔断 = 人工解形同虚设：{alerts}")
         self.assertAlmostEqual(res["dd"], 0.0, places=6)
 
-    def test_reset_baseline_button_keeps_kill(self):
-        """高2b：重置基线**不**解除 kill（两条独立动作）。"""
-        self.set_state_dd(0.31)
-        self.dd_round(1000.0)
-        self.assertTrue(self.db.hl_kill())
-        before = self.state()
-        r = self._client().post("/admin/switch/dd_reset", data={"k": self.TOKEN})
-        self.assertEqual(r.status_code, 303)
-        self.assertTrue(self.db.hl_kill(), "重置回撤基线不许顺手解除 kill")
-        self.assertAlmostEqual(self.state()["peak_index"], before["index"], places=6)
-        self.assertIn("回撤基线已重置", unquote(r.headers.get("location", "")))
-
     def test_unkill_manual_origin_does_not_touch_peak(self):
         """非 dd 来源的 kill 被解除时**不许**动回撤基线（那等于替用户绕过熔断）。"""
         self.set_state_dd(0.31)
@@ -929,8 +879,15 @@ class TestV2ManualUnkill(Base):
         self.assertAlmostEqual(self.state()["peak_index"], 100.0, places=6)
 
     def test_reset_without_state_reports_instead_of_crashing(self):
-        r = self._client().post("/admin/switch/dd_reset", data={"k": self.TOKEN})
+        """DD 熔断态但回撤状态读不到 → 解除要成功、且如实报告「基线没重置」。
+
+        （2026-10-30 面板精简后没有独立的「重置回撤基线」按钮了，这条 fail-soft
+        路径只剩「解除 DD 熔断」一个入口 —— 覆盖点不变，改走 kill。）
+        """
+        self.db.hl_set_kill(True, "回撤熔断", origin="dd")
+        r = self._client().post("/admin/switch/kill", data={"on": "0", "k": self.TOKEN})
         self.assertEqual(r.status_code, 303)
+        self.assertFalse(self.db.hl_kill(), "基线重置失败不许把解除也卡住")
         self.assertIn("还没有回撤锚点", unquote(r.headers.get("location", "")))
 
 
@@ -1161,12 +1118,16 @@ class TestV2BootstrapLatest(Base):
 
 
 class TestV2ThresholdSingleSource(Base):
-    """低4：阈值范围规则只有一处真相（app/hl/dd.py），三处入口结论一致。"""
+    """低4：阈值范围规则只有一处真相（app/hl/dd.py），各入口结论一致。
+
+    2026-10-30 面板精简：参数页的两个阈值输入框与它们的解析函数已删除，
+    入口从三处收到两处（dd.thresholds 基准 + Config.apply_db 装配 + main._dd_pct）。
+    现值只能靠 DB 直改写入，所以 apply_db 与 dd 的一致性比之前更要紧。
+    """
 
     CFG = type("C", (), {"risk_pct": 0.02, "hl_dd_warn_pct": 0.0, "hl_dd_kill_pct": 0.0})
 
-    def test_three_entry_points_agree(self):
-        from app.admin_ui import _parse_dd_thresholds
+    def test_entry_points_agree(self):
         from app.config import Config
         from app.main import _dd_pct
         cases = [("0.35", "0.45", True), ("0.02", "0.40", False), ("0.45", "0.40", False),
@@ -1175,8 +1136,6 @@ class TestV2ThresholdSingleSource(Base):
             with self.subTest(warn=warn, kill=kill):
                 th = hl_dd.thresholds(0.02, float(warn), float(kill))
                 self.assertEqual(not th["rejected"], ok, "dd.thresholds 是基准")
-                vals, msg = _parse_dd_thresholds(warn, kill, self.CFG)
-                self.assertEqual(bool(vals), ok, f"面板判据必须与 dd 一致：{msg}")
                 c = Config()
                 c.apply_db({"hl_dd_warn_pct": warn, "hl_dd_kill_pct": kill})
                 self.assertEqual((c.hl_dd_warn_pct, c.hl_dd_kill_pct) != (0.0, 0.0), ok,

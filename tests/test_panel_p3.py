@@ -125,9 +125,15 @@ class BaseCase(unittest.TestCase):
 
     @staticmethod
     def executor_seg(html: str) -> str:
-        """「执行器」卡片段（到下一个 <h2> 或页尾为止）。"""
+        """「执行器」卡片段（到下一个 <h2> /「API 有效期」卡 / 页尾为止）。
+
+        2026-10-30：总览页尾新增「管理」卡（含 kill 的「熔断」字样），它跟在
+        「API 有效期」之后 —— 段末必须切在 API 有效期卡之前，否则执行器卡的
+        「卡内 0 处」断言会把后面几张卡的内容算进来。
+        """
         seg = html.split("<h2>执行器</h2>", 1)[1]
-        return seg.split("<h2>", 1)[0]
+        seg = seg.split("<h2>", 1)[0]
+        return seg.split("<details class='card agent-card'", 1)[0]
 
 
 class FakeInfo:

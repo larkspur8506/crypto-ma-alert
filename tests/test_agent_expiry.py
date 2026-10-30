@@ -1097,87 +1097,12 @@ class TestPanelAndWiring(unittest.TestCase):
         self.assertIn("self._op_lock", body)
         self.assertIn("flatten_all", body)
 
-    def test_cleanup_switch_moved_to_switch_page(self):
-        """2026-10-19：清仓开关从参数页迁到开关页「策略与保护」卡。
+    def test_fallback_clear_endpoint_only_write_path(self):
+        """M3 语义在精简后只剩「清除兜底」：它真的把 DB 里的兜底值清掉。
 
-        参数页只留手工兜底有效期（hl_agent_valid_until_ms）；agent_expiry_cleanup
-        的复选框、hidden 兜底都必须出现在开关页，且状态反映 cfg。
-        参数 POST 不再接受这个键（否则「保存全部参数」又能悄悄关掉它）。
+        2026-10-30：参数页与它的手工兜底输入框已删除（防陈旧兜底值误平仓），
+        「设置」走容器内 sqlite 直改；「清除」保留，且必须是唯一能删脏值的入口。
         """
-        try:
-            from fastapi import FastAPI
-            from fastapi.testclient import TestClient
-        except ImportError:                                       # pragma: no cover
-            self.skipTest("fastapi 未安装")
-        from app.admin_ui import AdminDeps, build_admin_router
-        from app.config import Config
-        from app.hl.views import DashboardDeps
-
-        tmp = tempfile.TemporaryDirectory()
-        try:
-            db = DB(str(Path(tmp.name) / "p.db"))
-            cfg_fn = lambda: Config().apply_db(db.get_config())
-            hl = DashboardDeps(db=db, config_fn=cfg_fn, info=None,
-                               address_fn=lambda: "", mode_fn=lambda: "off",
-                               base_url_fn=lambda: "https://api.hyperliquid.xyz")
-            deps = AdminDeps(db=db, config_fn=cfg_fn, hl_deps=hl,
-                             mode_fn=lambda: "off", token_fn=lambda: "tk")
-            app = FastAPI()
-            app.include_router(build_admin_router(deps))
-            c = TestClient(app)
-            html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
-            self.assertIn("hl_agent_valid_until_ms", html)
-            self.assertNotIn("name='agent_expiry_cleanup'", html,
-                             "参数页不该再有清仓开关")
-            sw = c.get("/admin", params={"k": "tk", "tab": "switch"}).text
-            self.assertIn("策略与保护", sw)
-            self.assertIn("agent_expiry_cleanup", sw)
-            self.assertIn("到期前自动清仓", sw)
-            # 默认开 → 复选框必须有 checked
-            self.assertRegex(sw, r"name='agent_expiry_cleanup' value='1' checked")
-            # H3：复选框前必须有同名 hidden 兜底（未勾选时提交 0）
-            self.assertRegex(
-                sw, r"<input type='hidden' name='agent_expiry_cleanup' value='0'>"
-                    r"<label class='chk'><input type='checkbox' name='agent_expiry_cleanup'")
-            base = {"equity": "100", "risk_pct": "0.02", "leverage": "5",
-                    "stop_min": "0.015", "stop_max": "0.1", "short_regime_ma": "200",
-                    "equity_mode": "follow", "equity_min": "20", "k": "tk"}
-            # 1) 参数 POST 带这个键也不算数（参数页已不接受它）
-            r = c.post("/admin/params", data=dict(base, agent_expiry_cleanup="0"),
-                       follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
-            self.assertIsNone(db.get_config_str("agent_expiry_cleanup") or None,
-                              "参数 POST 不该再写 agent_expiry_cleanup")
-            # 2) 开关页：未勾选（浏览器只提交 hidden=0）→ DB=0、生效=关
-            r = c.post("/admin/switch/strategy", data={"agent_expiry_cleanup": "0",
-                                                       "k": "tk"},
-                       follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
-            self.assertIn("0", str(db.get_config_str("agent_expiry_cleanup")))
-            self.assertFalse(A.cleanup_switch(db, Config()),
-                             "取消勾选后必须真的关掉（H3：以前永远关不掉）")
-            sw2 = c.get("/admin", params={"k": "tk", "tab": "switch"}).text
-            self.assertNotRegex(sw2, r"name='agent_expiry_cleanup' value='1' checked")
-            self.assertIn("当前 关", sw2)
-            # 3) 勾选（浏览器提交 hidden=0 + checkbox=1，顺序即文档顺序）→ DB=1
-            r = c.post("/admin/switch/strategy",
-                       content="k=tk&agent_expiry_cleanup=0&agent_expiry_cleanup=1",
-                       headers={"content-type": "application/x-www-form-urlencoded"},
-                       follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
-            self.assertIn("1", str(db.get_config_str("agent_expiry_cleanup")))
-            self.assertTrue(A.cleanup_switch(db, Config()))
-            # 4) 字段完全缺失（脚本/旧书签）→ 保持原值，绝不静默改动
-            r = c.post("/admin/switch/strategy", data={"k": "tk"},
-                       follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
-            self.assertIn("1", str(db.get_config_str("agent_expiry_cleanup")),
-                          "缺字段时不许把清仓开关改掉")
-        finally:
-            tmp.cleanup()
-
-    def test_params_save_keeps_manual_fallback(self):
-        """M3 回归：参数页留空保存不会抹掉手工兜底有效期（要清空走显式按钮）。"""
         try:
             from fastapi import FastAPI
             from fastapi.testclient import TestClient
@@ -1200,22 +1125,16 @@ class TestPanelAndWiring(unittest.TestCase):
             app = FastAPI()
             app.include_router(build_admin_router(deps))
             c = TestClient(app)
-            base = {"equity": "100", "risk_pct": "0.02", "leverage": "5",
-                    "stop_min": "0.015", "stop_max": "0.1", "short_regime_ma": "200",
-                    "equity_mode": "follow", "equity_min": "20",
-                    "hl_agent_valid_until_ms": "", "k": "tk"}
-            r = c.post("/admin/params", data=dict(base), follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
+            # 兜底有值 → 总览「管理」卡渲染清除按钮
+            html = c.get("/admin", params={"k": "tk"}).text
+            self.assertIn("action='/admin/hl/agent/fallback/clear'", html)
+            # 参数页的写入口彻底没了
+            r = c.post("/admin/params", data={"hl_agent_valid_until_ms": "1840000000000",
+                                              "k": "tk"}, follow_redirects=False)
+            self.assertEqual(r.status_code, 404)
             self.assertEqual(str(db.get_config_str("hl_agent_valid_until_ms")),
-                             "1830000000000",
-                             "留空保存把手工兜底值抹掉了（M3）")
-            # 填新值仍然生效
-            r = c.post("/admin/params",
-                       data=dict(base, hl_agent_valid_until_ms="1840000000000"),
-                       follow_redirects=False)
-            self.assertEqual(r.status_code, 303)
-            self.assertEqual(str(db.get_config_str("hl_agent_valid_until_ms")), "1840000000000")
-            # 显式清除按钮才清空
+                             "1830000000000", "删掉的端点绝不能再写这个键")
+            # 清除按钮才清空
             r = c.post("/admin/hl/agent/fallback/clear", data={"k": "tk"},
                        follow_redirects=False)
             self.assertEqual(r.status_code, 303)
@@ -1224,7 +1143,12 @@ class TestPanelAndWiring(unittest.TestCase):
         finally:
             tmp.cleanup()
 
-    def test_params_rejects_bad_manual_until(self):
+    def test_params_endpoint_gone_so_bad_values_cannot_be_written(self):
+        """参数页的兜底值输入框删除后，非法值从**页面**再也写不进去。
+
+        原用例钉的是「面板填 not-a-number 被 400 拒收」；现在连端点都没有，
+        所以断言更强的结论：POST /admin/params → 404，DB 保持干净。
+        """
         try:
             from fastapi import FastAPI
             from fastapi.testclient import TestClient
@@ -1252,7 +1176,7 @@ class TestPanelAndWiring(unittest.TestCase):
                 "equity_mode": "follow", "equity_min": "20",
                 "hl_agent_valid_until_ms": "not-a-number", "k": "tk"},
                 follow_redirects=False)
-            self.assertEqual(r.status_code, 400)
+            self.assertEqual(r.status_code, 404)
             self.assertIsNone(db.get_config_str("hl_agent_valid_until_ms") or None)
         finally:
             tmp.cleanup()

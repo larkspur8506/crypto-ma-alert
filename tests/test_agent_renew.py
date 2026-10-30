@@ -437,7 +437,7 @@ class TestRenewPanel(Base):
         return TestClient(app)
 
     def test_overview_has_status_card(self):
-        """状态卡（地址/到期日/剩余/状态词）在总览 —— 只把「更新 API」表单留参数页。"""
+        """状态卡（地址/到期日/剩余/状态词）在总览；续期表单在总览「管理」卡（2026-10-30）。"""
         A.write_state(self.db, {"address": "0xc1ee4519ce893070c83cf90b324c6c8e5484be22",
                                 "valid_until_ms": NOW_MS + 100 * DAY_MS,
                                 "days_left": 100, "checked_ms": NOW_MS,
@@ -451,12 +451,20 @@ class TestRenewPanel(Base):
         self.assertIn("到期前自动清仓", html)
         # P3 R3：状态卡降级为总览末尾 <details>（100 天 → 默认收起）
         self.assertIn("<details class='card agent-card'><summary>API 有效期</summary>", html)
-        # 状态卡里不再有写操作入口（续期表单已迁参数页）
-        self.assertNotIn("action='/admin/hl/agent/renew'", html)
+        # 状态卡本身只有读数；写操作（续期表单）在页尾「管理」卡里，不在这张卡内
+        seg = html.split("<details class='card agent-card'")[1].split("</details>", 1)[0]
+        self.assertNotIn("action='/admin/hl/agent/renew'", seg)
+        self.assertIn("action='/admin/hl/agent/renew'", html,
+                      "续期表单仍要在总览（参数页删除后搬到「管理」卡）")
 
-    def test_params_tab_has_renew_block(self):
-        """「更新 API（续期）」折叠表单在参数页：原生 <details>，无地址/状态行。"""
-        html = self._client().get("/admin", params={"k": "tk", "tab": "params"}).text
+    def test_management_card_has_renew_block(self):
+        """「更新 API（续期）」折叠表单在总览「管理」卡：原生 <details>，无状态行。
+
+        2026-10-30 面板精简：参数页删除，续期表单搬回总览页尾的管理卡
+        （表单 action / 字段 / 步骤文案一字未改）。
+        """
+        html = self._client().get("/admin", params={"k": "tk", "tab": "overview"}).text
+        self.assertIn("<div class='sec'>管理</div>", html)
         self.assertIn("更新 API（续期）", html)
         # 折叠表单：原生 <details class="msgdetails">
         self.assertIn('<details class="msgdetails"><summary>在 HL 网页续期后粘贴新私钥',
@@ -465,7 +473,9 @@ class TestRenewPanel(Base):
         self.assertIn("type='password' name='privkey'", html)
         self.assertIn("More → API", html)
         self.assertIn("同名 Hermes", html)
-        self.assertNotIn("代理钱包地址", html)
+        # 表单在管理卡里，状态卡（代理钱包地址）是另一张卡
+        seg = html.split("action='/admin/hl/agent/renew'")[0]
+        self.assertNotIn("代理钱包地址", seg.rsplit("<div class='card", 1)[-1])
 
     def test_card_position_at_end_of_pages(self):
         """状态卡在总览末尾（「系统」卡之后）；续期表单在参数页保存按钮之后。"""
@@ -480,10 +490,10 @@ class TestRenewPanel(Base):
         # 2026-10-29 与仓位表对换：三标的动态在账户卡之后（仓位表移到最顶）
         if "三标的动态" in ov:
             self.assertGreater(ov.index("三标的动态"), ov.index("账户</div>"))
-        # 参数页：续期小区块在「保存全部参数」之后
-        html = c.get("/admin", params={"k": "tk", "tab": "params"}).text
-        self.assertLess(html.index("保存全部参数"), html.index("更新 API（续期）"))
-        self.assertNotIn("<h2>API 有效期</h2>", html)
+        # 「管理」卡（含续期表单）也在总览末尾：API 有效期之后、页脚主题切换之前
+        self.assertLess(ov.index("<summary>API 有效期</summary>"), ov.index("<div class='sec'>管理</div>"))
+        self.assertLess(ov.index("<div class='sec'>管理</div>"), ov.index("主题："))
+        self.assertNotIn("<h2>API 有效期</h2>", ov)
 
     def test_state_word_mapping(self):
         """L4：用精确锚点断言（「状态」那一行的 `<span class='v'>`），不再用恒真的 assertIn。"""
