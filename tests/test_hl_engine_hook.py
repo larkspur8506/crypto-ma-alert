@@ -175,7 +175,10 @@ class TestEntryHook(Base):
         from app.hl.executor import ExecParams, Executor
         from tests.test_hl_executor import FakeExchange, FakeInfo
 
-        p = ExecParams(mode=MODE_DRY, account_address="0xabc", private_key="", equity=1000.0)
+        p = ExecParams(mode=MODE_DRY, account_address="0xabc", private_key="", equity=1000.0,
+                       # 本文件测的是引擎钩子的布线（dry 不许吞信号），不建模信号时效；
+                       # 时效闸由 tests/test_hl_signal_age.py 专测。
+                       max_signal_age_min=0)
         ex = Executor(self.db, p, FakeInfo(), FakeExchange(dry_run=True), notifier=self.notifier)
         evs, _ = self._entry_event()
         stub = self.walk_stub({"BTC_USDT": evs})
