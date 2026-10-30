@@ -122,6 +122,36 @@ GRACE_KEY_PREFIX = "hl_close_grace:"
 GRACE_DEFAULT_S = 900.0          # 15 分钟（用户拍板）：≈ 3 个 tick 的时滞余量
 GRACE_MIN_S, GRACE_MAX_S = 300.0, 3600.0
 
+# --------------------------------------------------- 信号时效闸（与 Lighter 对齐）
+# 语义：开仓前校验「信号 bar 收盘 → 现在」的年龄，超上限就拒绝追单。年龄按
+# bar 开盘时刻 + 一个 4h 周期折算收盘，闭区间（== 上限放行，> 上限才拦）。
+# 为什么需要（2026-10-30 Lighter 侧偏差的形状）：那一轮仓位槽被幽灵仓占着，槽空出来
+# 后执行器拿一根已经收盘几小时的 bar 建仓 —— 决策价格是几小时前的结构，止损/目标都
+# 已经失去意义。只拦开仓：平仓/止损/监控一律不读这个参数（离场绝不能因为信号旧而延后）。
+SIGNAL_AGE_DEFAULT_MIN = 30      # 默认 30 分钟；0 = 关闭（永远不拦）
+SIGNAL_BAR_MS = 4 * 3600 * 1000  # 策略周期（4h bar）
+
+
+def parse_max_signal_age_min(raw) -> int:
+    """把 env 原值解析成信号时效上限（分钟）。
+
+    空 / 非数字 / 负数 一律退回默认 30 —— fail-closed：一个读坏的字符串不该把闸门
+    悄悄关掉（与 ``_churn_max`` / ``_grace_seconds`` 同一条理由）。`0` 是**显式**关闭
+    （与 Lighter 侧同义，便于「先观察一轮再上闸」）。小数字符串按截断处理（"30.9" → 30）。
+    """
+    try:
+        s = str(raw).strip().strip('"').strip("'")
+    except Exception:                                            # noqa: BLE001
+        return SIGNAL_AGE_DEFAULT_MIN
+    if not s:
+        return SIGNAL_AGE_DEFAULT_MIN
+    try:
+        n = int(float(s))
+    except (TypeError, ValueError):
+        return SIGNAL_AGE_DEFAULT_MIN
+    return n if n >= 0 else SIGNAL_AGE_DEFAULT_MIN
+
+
 # 第三段 escalated：1 = 这个仓**已经升级过**（problem + mismatch），宽限期到此结束。
 # 为什么需要它（对抗审查 M1）：超时那一轮以前直接**删键**，下一轮键不存在 → 又走
 # 「第一次进入宽限」→ 再等满 900s → 再升级 → 删键。结果是 mismatch/closing 每 15 分钟
@@ -271,6 +301,11 @@ class ExecParams:
     max_notional_mult: float = 0.0
     max_total_notional_mult: float = 0.0
     max_orders_per_day: int = 4
+    # 信号时效闸（feat/signal-age-gate，与 Lighter 侧同一份策略、同一个闸门）：
+    # 「信号 bar 收盘 → 现在」超过这么多分钟就**拒绝开仓**。默认 30；`0` = 关闭；
+    # 负数/脏值由 parse_max_signal_age_min 退回 30。只被 _entry_gates 读 ——
+    # 平仓/止损/监控一概不看它。
+    max_signal_age_min: int = SIGNAL_AGE_DEFAULT_MIN
     max_fail_streak: int = 3
     max_daily_loss_pct: float = 0.05
     deadman_minutes: int = 30
@@ -1837,9 +1872,23 @@ class Executor:
         return False
 
     # ------------------------------------------------------------ 闸门
-    def _entry_gates(self, symbol: str, plan, snap: dict, equity: Optional[float] = None) -> List[str]:
+    def _entry_gates(self, symbol: str, plan, snap: dict, equity: Optional[float] = None,
+                     bar_ms: Optional[int] = None) -> List[str]:
         p = self.p
         bad: List[str] = []
+        # ⓪ 信号时效闸（feat/signal-age-gate，与 Lighter 侧对齐）：这个信号是几小时前
+        #    收盘的 bar 推出来的，价格早已跑开 —— 此时建仓等于按历史结构下今天的单，
+        #    止损/目标的距离都失去意义。**只拦开仓**；bar_ms=None 表示调用方不提供
+        #    （历史调用/单测），不检查。闭区间：正好等于上限放行，超过才拦。
+        if bar_ms is not None and p.max_signal_age_min > 0:
+            try:
+                closed_at = float(bar_ms) / 1000.0 + SIGNAL_BAR_MS / 1000.0
+                age_min = (time.time() - closed_at) / 60.0
+            except (TypeError, ValueError):
+                age_min = None
+            if age_min is not None and age_min > p.max_signal_age_min:
+                bad.append(f"信号 bar 已收盘 {age_min:.0f} 分钟"
+                           f"（上限 {p.max_signal_age_min} 分钟），拒绝追单")
         # ① coin 映射（第一道显性闸门）：未注册/未配置 → 拒绝开仓。
         #    没有映射就没法定位交易所标的，影子模式也不能静默走「猜一个前缀」的旧路。
         coin = self._coin_or_none(symbol)
@@ -2035,7 +2084,7 @@ class Executor:
                                                                       False))),
                                       self.p.leverage, side=side,
                                       min_notional=self.p.min_notional)
-        gates = self._entry_gates(symbol, plan, snap, equity=eff_equity)
+        gates = self._entry_gates(symbol, plan, snap, equity=eff_equity, bar_ms=bar_ms)
         if gates:
             self.db.hl_record_intent(symbol, coin, bar_ms, PURPOSE_ENTRY, side, plan.sz,
                                      px=mid, status=ST_SKIPPED)

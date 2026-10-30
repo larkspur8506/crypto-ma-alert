@@ -26,6 +26,7 @@
 | `HL_MAX_SLIPPAGE_PCT` | IOC 限价偏离上限 | 0.003 |
 | `HL_MAX_NOTIONAL_MULT` / `HL_MAX_TOTAL_NOTIONAL_MULT` | 单标的/总名义 ÷ 权益 | 1.5 / 2.5 |
 | `HL_MAX_ORDERS_PER_DAY` | 当日下单次数上限 | 4 |
+| `HL_MAX_SIGNAL_AGE_MIN` | 信号时效闸：信号 bar 收盘超过这么多分钟就**拒绝开仓**（只拦开仓，离场/止损不读）。`0` = 关闭，负数/脏值退回 30 | 30 |
 | `HL_MAX_FAIL_STREAK` | 近 1h 失败多少次自动 kill | 3 |
 | `HL_MAX_DAILY_LOSS_PCT` | 当日亏损熔断线 | 0.05 |
 | `HL_DEADMAN_MINUTES` | 死手开关窗口（每分钟自动续期） | 30 |

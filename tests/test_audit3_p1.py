@@ -174,7 +174,9 @@ class P3Base(unittest.TestCase):
         self.ex = FakeExchange()
         self.p = ExecParams(mode=self.mode, account_address="0xabc", private_key="0xkey",
                             equity=1000.0, equity_min=20.0, risk_pct=0.02, leverage=5.0,
-                            code_rev="audit3")
+                            code_rev="audit3",
+                            # 本文件不建模信号时效；时效闸由 tests/test_hl_signal_age.py 专测。
+                            max_signal_age_min=0)
 
     def tearDown(self):
         self.tmp.cleanup()
