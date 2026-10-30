@@ -283,7 +283,7 @@ def _agent_badge_html(agent: Any) -> str:
         return _strip_badge("muted", "API", "—", "API 授权有效期未知（每个整点自动检查）")
     cls = "neg" if days <= 7 else ("warn" if days <= 14 else "pos")
     return _strip_badge(cls, "API", f"{days} 天",
-                        "API 授权剩余有效期；≤3 天且有仓位时自动清仓（「开关」页可关）")
+                        "API 授权剩余有效期；≤3 天且有仓位时自动清仓（关闭走 runbook §6.H 的 DB 直改）")
 
 
 def _orders_normal(positions: List[dict], orders: List[dict]) -> bool:
