@@ -20,7 +20,9 @@
 兼容（见 docs/ADMIN_MERGE_PLAN.md 第 2 节「保留」）：
 - ``/hl``、``/admin/rules`` 两个旧 GET → 302 到总览；``/admin/logs`` → 记录页
   （书签/已发消息里的链接不断；被删的 POST 端点一律 404，不设兼容层）
-- ``/api/hl/*`` 四个 JSON 接口、``/c/{pid}`` 确认页完全不动
+- ``/api/hl/*`` 四个 JSON 接口完全不动；``/c/{pid}`` 人工确认页与签名链接机制已在
+  2026-10-30 PR B 随人工确认/补录流一并退役（执行器自动开仓后它再无入口），
+  真实成交一律在本面板「记录」页按 ``hl_fills`` 核对
 
 面板只读交易逻辑：不改 ``app/strategy.py``、``app/hl/executor.py``、``app/hl/exchange.py``。
 所有依赖走 :class:`AdminDeps` 注入，便于单测用假实现。

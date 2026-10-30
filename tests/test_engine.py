@@ -53,7 +53,11 @@ class TestWalk(unittest.TestCase):
         self.assertAlmostEqual(pos.stop_price, ind["ma_min"][i])
         self.assertIn("做多信号", engine.format_entry(c, events[0].sig, events[0].order, 1))
         self.assertIn("逐仓 5x", engine.format_entry(c, events[0].sig, events[0].order, 1))
-        self.assertIn("/c/1?a=view&t=", engine.format_entry(c, events[0].sig, events[0].order, 1))
+        # 2026-10-30 PR B：卡片不再带 /c/{pid} 确认链接（确认页已退役）—— 正文照旧
+        _txt = engine.format_entry(c, events[0].sig, events[0].order, 1)
+        self.assertNotIn("/c/", _txt)
+        self.assertNotIn("确认页", _txt)
+        self.assertIn("离场：收到本系统提醒后 4 小时内市价平仓", _txt)
 
     def test_old_signal_is_missed_not_tradeable(self):
         bars, i = entry_setup()
@@ -123,20 +127,6 @@ class TestWalk(unittest.TestCase):
         events, _ = engine.walk(c, "BTC_USDT", bars2, ind2, sq2, pos, latest, latest, latest)
         self.assertEqual(events[0].reason, "stop")
         self.assertAlmostEqual(events[0].exit_price, pos.actual_stop)
-
-
-class TestTokens(unittest.TestCase):
-    def test_sign_verify_roundtrip(self):
-        tok = engine.sign_token("s3cret", 42, "open")
-        self.assertTrue(engine.verify_token("s3cret", 42, "open", tok))
-        self.assertFalse(engine.verify_token("s3cret", 42, "ignore", tok))
-        self.assertFalse(engine.verify_token("other", 42, "open", tok))
-
-    def test_confirm_url(self):
-        c = cfg()
-        url = engine.confirm_url(c, 7, "open")
-        self.assertTrue(url.startswith("https://ma.example.com/c/7?a=open&t="))
-        self.assertTrue(engine.verify_token(c.token_secret, 7, "open", url.split("t=")[1]))
 
 
 class TestPersistence(unittest.TestCase):

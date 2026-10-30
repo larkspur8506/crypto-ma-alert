@@ -453,7 +453,7 @@ class TestMobileNoJs(BaseCase):
         self.assertLess(html.index("apple-touch-icon"), html.index("</head>"))
 
     def test_page_renders_home_screen_icons(self):
-        """_page() 本身（不经 HTTP）也要带 icon 链接 —— 确认页/HL 页共用同一份常量。"""
+        """_page() 本身（不经 HTTP）也要带 icon 链接 —— 面板/HL 页共用同一份常量。"""
         import app.admin_ui as admin_mod
         html = bytes(admin_mod._page("tk", "overview", "", "<div>x</div>").body).decode()
         self.assertIn("rel='apple-touch-icon'", html)
@@ -565,9 +565,11 @@ class TestFullAppWiring(unittest.TestCase):
         for p in ("/health", "/admin", "/admin/switch/kill",
                   "/admin/hl/agent/renew", "/admin/hl/agent/fallback/clear",
                   "/admin/rules", "/admin/logs", "/admin/tick",
-                  "/admin/hl/kill", "/c/{pid}",
+                  "/admin/hl/kill",
                   "/hl", "/api/hl/status", "/api/hl/equity", "/api/hl/snapshot"):
             self.assertIn(p, paths, f"路由 {p} 未注册")
+        # 2026-10-30 PR B：人工确认页退役 —— 路由不该再存在（防止被顺手加回）
+        self.assertNotIn("/c/{pid}", paths, "确认页已删除")
         # 2026-10-30 面板精简：这几个写端点的**全部方法**都不该再存在（一律 404/405）
         spec = mod.app.openapi().get("paths", {})
         for gone in ("/admin/params", "/admin/switch/mode", "/admin/switch/strategy",
@@ -658,21 +660,8 @@ class TestFullAppWiring(unittest.TestCase):
         self.assertEqual(mod.current_config().equity_min, 55.0)
         self.assertEqual(mod.hl_params().equity_mode, "fixed")
 
-    def test_confirm_page_untouched(self):
-        mod = self._mod()
-        pid = mod.db.create_position(symbol="BTC_USDT", signal_bar_ms=1_700_000_200_000,
-                                     status="open", side=1, entry_price=100_000.0,
-                                     stop_price=97_000.0, stop_dist=0.03, contracts=6,
-                                     coin_qty=0.0006, notional=60.0, risk_u=18.0,
-                                     equity_at_entry=1000.0)
-        tok = mod.engine.sign_token(mod.config.token_secret, pid, "view")
-        with TestClient(mod.app) as c:
-            r = c.get(f"/c/{pid}", params={"a": "view", "t": tok})
-            self.assertEqual(r.status_code, 200)
-            self.assertIn("持仓中", r.text)
-            # P3 命名同步：确认页 title 用「双均线交易台」，工程名/旧面板头不再出现
-            self.assertIn("双均线交易台", r.text)
-            self.assertNotIn("crypto-ma-alert", r.text)
+    # 2026-10-30 PR B：test_confirm_page_untouched（GET /c/{pid} 渲染「双均线交易台」）
+    # 随确认页删除 —— 页面不存在了，标题一致性由面板/HL 页自己的用例钉住。
 
     def test_health_still_reports_hl_mode(self):
         # 无 k 的 /health 不再暴露 hl_mode/hl_kill（公网站点）；带 k 才给
