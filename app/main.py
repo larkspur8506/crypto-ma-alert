@@ -111,7 +111,8 @@ def hl_private_key() -> str:
 
 def hl_params():
     """从 env + DB 组装 ExecParams。私钥 DB > env（面板可热切换），其余读 env/配置。"""
-    from app.hl.executor import DEFAULT_COIN_MAP, ExecParams
+    from app.hl.executor import (DEFAULT_COIN_MAP, SIGNAL_AGE_DEFAULT_MIN, ExecParams,
+                                 parse_max_signal_age_min)
     try:
         coin_map = json.loads(_env("HL_COIN_MAP", "")) or dict(DEFAULT_COIN_MAP)
     except ValueError:
@@ -176,6 +177,10 @@ def hl_params():
         max_notional_mult=f("HL_MAX_NOTIONAL_MULT", 0.0),
         max_total_notional_mult=f("HL_MAX_TOTAL_NOTIONAL_MULT", 0.0),
         max_orders_per_day=int(f("HL_MAX_ORDERS_PER_DAY", 4)),
+        # 信号时效闸（与 Lighter 侧对齐）：空/脏值/负数 → 30（不静默关保护），0 = 关闭。
+        # 解析在 executor.parse_max_signal_age_min 里，和 _churn_max 同一个理由。
+        max_signal_age_min=parse_max_signal_age_min(
+            _env("HL_MAX_SIGNAL_AGE_MIN", str(SIGNAL_AGE_DEFAULT_MIN))),
         max_fail_streak=int(f("HL_MAX_FAIL_STREAK", 3)),
         max_daily_loss_pct=f("HL_MAX_DAILY_LOSS_PCT", 0.05),
         deadman_minutes=int(f("HL_DEADMAN_MINUTES", 30)),

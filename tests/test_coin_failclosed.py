@@ -116,7 +116,9 @@ class _FakeInfo:
 
 def _executor(mode=MODE_LIVE, coin_map=None, db=None):
     p = ExecParams(mode=mode, account_address="0xabc", private_key="0xkey",
-                   equity=1000.0, risk_pct=0.02, leverage=5.0, code_rev="testrev")
+                   equity=1000.0, risk_pct=0.02, leverage=5.0, code_rev="testrev",
+                   # 本文件不建模信号时效；时效闸由 tests/test_hl_signal_age.py 专测。
+                   max_signal_age_min=0)
     if coin_map is not None:
         p.coin_map = coin_map
     return Executor(db or _tmp_db(), p, _FakeInfo(), _FakeExchange(),

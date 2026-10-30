@@ -220,7 +220,9 @@ class Base(unittest.TestCase):
         self.info = FakeInfo()
         self.ex = FakeExchange()
         self.p = ExecParams(mode=MODE_LIVE, account_address="0xabc", private_key="0xkey",
-                            equity=1000.0, risk_pct=0.02, leverage=5.0, code_rev="testrev")
+                            equity=1000.0, risk_pct=0.02, leverage=5.0, code_rev="testrev",
+                            # 本文件不建模信号时效；时效闸由 tests/test_hl_signal_age.py 专测。
+                            max_signal_age_min=0)
         Executor._size_strikes.clear()
 
     def tearDown(self):

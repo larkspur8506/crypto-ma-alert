@@ -175,7 +175,13 @@ class Base(unittest.TestCase):
             setattr(self.p, k, v)
         return Executor(self.db, self.p, self.info, self.ex, notifier=self.notifier)
 
-    def add_signal(self, symbol="BTC_USDT", side=1, entry=83000.0, stop=80600.0, bar_ms=1791912000000):
+    def add_signal(self, symbol="BTC_USDT", side=1, entry=83000.0, stop=80600.0,
+                   bar_ms=None):
+        # bar_ms 默认取「刚刚收盘」的 4h bar：执行器有信号时效闸（默认只放行 bar 收盘
+        # 后 30 分钟内的信号，见 tests/test_hl_signal_age.py）。写死一个历史 bar 会让
+        # 本文件所有开仓用例都被闸门拦住、测不到各自的真实目标。
+        if bar_ms is None:
+            bar_ms = int(time.time() * 1000) - 5 * 60 * 1000 - DAY_MS
         return self.db.create_position(symbol=symbol, signal_bar_ms=bar_ms, side=side,
                                        entry_price=entry, stop_price=stop,
                                        stop_dist=abs(entry - stop) / entry, contracts=1,
@@ -326,9 +332,10 @@ class TestEntryLive(Base):
 
     def test_daily_order_limit(self):
         self.p.max_orders_per_day = 1
-        pid1 = self.add_signal(bar_ms=1791900000000)
+        now_ms = int(time.time() * 1000)          # 两根都要「新鲜」，否则先被时效闸拦掉
+        pid1 = self.add_signal(bar_ms=now_ms - DAY_MS - 5 * 60 * 1000)
         self.executor().on_entry(pid1)
-        pid2 = self.add_signal(bar_ms=1791912000000)
+        pid2 = self.add_signal(bar_ms=now_ms - DAY_MS - 6 * 60 * 1000)
         self.assertTrue(self.executor().on_entry(pid2))
         skipped = [r for r in self.orders("entry") if r["status"] == "skipped"]
         self.assertEqual(len(skipped), 1)

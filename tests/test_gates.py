@@ -41,7 +41,10 @@ class Base(unittest.TestCase):
         self.info = FakeInfo()
         self.ex = FakeExchange()
         self.p = ExecParams(mode=MODE_LIVE, account_address="0xabc", private_key="0xkey",
-                            equity=1000.0, code_rev="testrev")
+                            equity=1000.0, code_rev="testrev",
+                            # 本文件测的是闸门/静置/熔断的布线，不建模信号时效；
+                            # 时效闸（默认 30 分钟）由 tests/test_hl_signal_age.py 专测。
+                            max_signal_age_min=0)
         self._reset_gate_state()
 
     def tearDown(self):
