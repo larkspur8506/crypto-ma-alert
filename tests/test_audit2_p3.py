@@ -1,48 +1,21 @@
 """第二轮审计 P3 回归测试（展示层）。
 
 覆盖：
-1. 参数 Tab 表单：所有输入控件都在 <form> 内（提交不再空 body）。
-2. 可提余额精简文案 + title 悬停。
-3. views 时间为北京时间（无 " UTC" 后缀）。
-4. 数量精度 _fmt_sz（0.00095 不显示 0.00）。
-5. 下单记录/成交/信号三张表（2026-10-18 起只在记录页）标的列用 HL 名。
-6. 成交方向列翻译 Open Long/Close Short。
-7. keyform 成功页不再拼「已存在/拒绝覆盖」矛盾文案。
-8. main.py 重定向 k= 已 urlencode。
+1. 可提余额精简文案 + title 悬停。
+2. views 时间为北京时间（无 " UTC" 后缀）。
+3. 数量精度 _fmt_sz（0.00095 不显示 0.00）。
+4. 下单记录/成交/信号三张表（2026-10-18 起只在记录页）标的列用 HL 名。
+5. 成交方向列翻译 Open Long/Close Short。
+6. keyform 成功页不再拼「已存在/拒绝覆盖」矛盾文案。
+7. main.py 重定向 k= 已 urlencode。
+
+（原「参数 Tab 表单控件必须在 <form> 内」一条随参数页删除，2026-10-30 面板精简。）
 """
 import os
 import sys
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-class TestParamsFormWrapsInputs(unittest.TestCase):
-    def test_form_before_fields_and_close_after(self):
-        from app.admin_ui import render_params, AdminDeps
-        # 最小 deps：渲染参数页只需要这些
-        class D:
-            get_all = staticmethod(lambda: {})
-            def __getattr__(self, k):
-                raise AttributeError(k)
-        import app.admin_ui as A
-        html = A.render_params(None, A._blank_cfg() if hasattr(A, "_blank_cfg") else None, {}, 80000.0) \
-            if False else None
-        # 直接用现有测试基建太重 —— 静态断言源码结构：
-        src = open(A.__file__, encoding="utf-8").read()
-        body = src[src.index("def render_params"):]
-        body = body[:body.index("\ndef ")]
-        form_open = body.index("<form method='post' action='/admin/params' id='params-form'>")
-        first_field = body.index("_num_field(")
-        form_close = body.index("</form>")
-        self.assertLess(form_open, first_field,
-                        "form 必须开在所有输入控件之前（否则提交空 body → 400）")
-        self.assertLess(first_field, form_close, "按钮必须在 form 内")
-
-    def test_num_input_required(self):
-        import app.admin_ui as A
-        src = open(A.__file__, encoding="utf-8").read()
-        self.assertIn("required name='{_esc(key)}'", src)
 
 
 class TestViewsDisplay(unittest.TestCase):

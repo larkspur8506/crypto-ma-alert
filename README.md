@@ -83,7 +83,9 @@ uvicorn app.main:app --port 8000
 把「提醒 → 人工下单」升级为「提醒 → 自动下单 + 挂止损」，**默认 `off`（行为与旧版完全一致）**。
 
 - **三模式**：`off` / `dry`（影子，只算单落库不下单）/ `live`（真实下单）。DB 里的 `hl_exec_mode` 优先于环境变量。
-- **监控面板**：`/hl?k=<ADMIN_TOKEN>`（价格、仓位、浮盈浮亏、权益曲线、执行器事件、kill switch），JSON 版 `/api/hl/status`。
+- **监控面板**：`/admin?k=<ADMIN_TOKEN>`（两个页签：总览 / 记录；总览页尾「管理」卡是唯一的写入口 ——
+  拉闸·解除、更新 API（续期）、清除手工兜底）。改参数/开关/模式不再有页面入口，见
+  `docs/HL_RUNBOOK.md` §6.H（容器内 sqlite 直改）。旧地址 `/hl` 仍 302 到总览，JSON 版 `/api/hl/status`。
 - **fail-closed**：缺 SDK/凭据、止损挂失败、对账不一致、当日亏损超阈值、连续失败 —— 任一情况都**拒绝下单或自动停手**并推送。
 - **可审计**：每一单先写 `hl_orders` 意图（幂等键 `symbol+bar_ms+purpose`，cloid 由它派生），成交落 `hl_fills`，决策落 `hl_events`。
 - **私钥**：只用 agent wallet（**不能提币**），只从 env 读，永不落库、永不进日志。
@@ -97,7 +99,7 @@ app/market.py     HL K 线（实盘主源，与下单同场所）+ 诊断降级�
 app/sizing.py     以损定仓 → MEXC 张数 / 名义 / 保证金 / 强平价
 app/engine.py     walk() 纯状态机 + 提醒文案 + tick + 心跳/周报（executor 钩子）
 app/notify.py     企业微信 + Telegram 双通道（重试 / 分段 / 成功后才去重）
-app/main.py       FastAPI + APScheduler + 状态页/确认页/参数页/HL 面板
+app/main.py       FastAPI + APScheduler + 确认页/HL 面板/面板路由装配
 app/hl/info.py       只读客户端（纯 stdlib，不需 SDK/私钥）
 app/hl/exchange.py   唯一 import 官方 SDK 的写路径（下单/撤单/杠杆/死手开关）
 app/hl/executor.py   状态机：闸门 → 意图 → 下单 → 挂止损 → 对账 → 熔断

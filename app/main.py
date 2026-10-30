@@ -1,12 +1,17 @@
 """FastAPI 应用：定时检查 + 合并管理面板 + 确认页（签名链接，无需登录）。
 
-面板入口（合并版，见 docs/ADMIN_MERGE_PLAN.md 第 2 节）：
-    GET /admin?k=<ADMIN_TOKEN>&tab=overview|params|switch|records
-    POST /admin/params、/admin/switch/mode、/admin/switch/notify、/admin/switch/kill
-旧地址兼容：/hl、/admin/rules、/admin/logs 的 GET 全部 302 到对应 Tab；
-           /admin/rules 的 POST 保留（继续写 DB，老书签的表单还能提交）。
-保留不动：/c/{pid} 确认页、/api/hl/* 四个 JSON 接口、/admin/hl/mode 与 /admin/hl/kill
-          （runbook 里的 curl 还在用）、/admin/tick。
+面板入口（2026-10-30 面板精简后只剩两个页签，见 docs/ADMIN_MERGE_PLAN.md 第 2 节）：
+    GET /admin?k=<ADMIN_TOKEN>&tab=overview|records
+    POST /admin/switch/kill（拉闸/解除，页面入口在总览「管理」卡）、
+         /admin/hl/kill（同一动作的 curl 口径）、
+         /admin/hl/agent/renew、/admin/hl/agent/fallback/clear（总览「管理」卡）
+旧地址兼容：/hl、/admin/rules、/admin/logs 的 GET 全部 302 到对应 Tab。
+已删除（一律 404，不设兼容层）：POST /admin/rules、/admin/params、
+          /admin/switch/mode、/admin/switch/strategy、/admin/switch/notify、
+          /admin/switch/dd_reset、/admin/hl/mode —— 改参数/开关/模式/回撤基线
+          现在只有「DB 直改」或「改代码走 PR」两条路。
+保留不动：/c/{pid} 确认页、/api/hl/* 四个 JSON 接口、/admin/tick（部署验收 curl 用，
+          页面不渲染按钮）。
 """
 from __future__ import annotations
 
@@ -909,7 +914,7 @@ def _mount_admin_ui() -> None:
     from app.admin_ui import build_admin_router
     try:
         app.include_router(build_admin_router(_admin_deps()))
-        logger.info("已挂载合并管理面板 /admin（四 Tab）")
+        logger.info("已挂载管理面板 /admin（总览 + 记录）")
     except Exception as e:                                           # noqa: BLE001
         logger.warning("挂载合并管理面板失败：%s", e)
 
@@ -918,63 +923,6 @@ def _mount_admin_ui() -> None:
 _mount_admin_ui()
 _mount_hl_views()
 _mount_hl_keyform()
-
-
-# ---------------------------------------------------------------- 旧参数表单兼容
-# 新表单走 POST /admin/params；这条留给老书签/老代码（比如还没删的 curl），
-# 口径不变：仍然只写 DB 的五个数字字段。
-
-@app.post("/admin/rules")
-def admin_rules_post(request: Request, equity: str = Form(...), risk_pct: str = Form(...),
-                     leverage: str = Form(...), stop_min: str = Form(...), stop_max: str = Form(...),
-                     enable_long: Optional[str] = Form(None),
-                     enable_shorts: Optional[str] = Form(None),
-                     heartbeat_push: Optional[str] = Form(None),
-                     agent_expiry_cleanup: Optional[str] = Form(None),
-                     short_regime_ma: Optional[str] = Form(None), k: str = Form("")):
-    _require_admin(request, k or None)
-    # 2026-10-19 审查中危回归：**先全部校验、后统一写库**。旧实现边校验边写，
-    # short_regime_ma 非法时 400 返回，但前面的数字和方向开关已经落库（半截写）。
-    nums: dict = {}
-    for key, val in [("equity", equity), ("risk_pct", risk_pct), ("leverage", leverage),
-                     ("stop_min", stop_min), ("stop_max", stop_max)]:
-        try:
-            nums[key] = float(val)
-        except ValueError:
-            raise HTTPException(400, f"{key} 不是数字")
-    ma = None
-    if short_regime_ma is not None:            # 缺字段 = 保持原值（与下方开关同口径）
-        try:
-            ma = int(float(short_regime_ma))
-        except ValueError:
-            raise HTTPException(400, "short_regime_ma 不是数字")
-    # ---- 校验全部通过，开始写库 ----
-    for key, num in nums.items():
-        # 存成 JSON 数字（不是字符串），避免 json.dumps 加引号让 apply_db 解析失败
-        db.set_config(key, num)
-    if ma is not None:
-        db.set_config("short_regime_ma", ma)
-    # 复选框（2026-10-19 事故回归）：**缺字段 = 保持原值**，显式传 0 才关。
-    # 旧语义「不传 = 0」就是那次把线上方向开关静默关掉的向量 —— 老书签/curl
-    # 只想改数字时，方向开关绝不能被顺手清掉。显式值与 app.admin_ui._TRUTHY
-    # 同口径解析：字符串 "0" 是真值，绝不能写 `1 if v else 0`（把「关」写成「开」）。
-    from app.admin_ui import _TRUTHY
-
-    def _flag_like(v: Optional[str]) -> int:
-        return 1 if str(v if v is not None else "").strip().lower() in _TRUTHY else 0
-
-    if enable_long is not None:
-        db.set_config("enable_long", _flag_like(enable_long))
-    if enable_shorts is not None:
-        db.set_config("enable_shorts", _flag_like(enable_shorts))
-    if heartbeat_push is not None:
-        db.set_config("heartbeat_push", _flag_like(heartbeat_push))
-    # 老书签的表单里没有这个复选框：**不传 = 保持原值**（不能按「未勾选」清成 0，
-    # 否则老页面一提交就把到期保护静默关掉）。显式传 0 才关。
-    if agent_expiry_cleanup is not None:
-        from app.hl.agent import cleanup_enabled
-        db.set_config("agent_expiry_cleanup", 1 if cleanup_enabled(agent_expiry_cleanup) else 0)
-    return RedirectResponse(f"/admin?tab=params&k={_urlquote(str(k))}", status_code=303)
 
 
 # ---------------------------------------------------------------- 确认页
@@ -1357,24 +1305,9 @@ def admin_tick(request: Request, k: Optional[str] = None):
     return {"sent": len(sent), "messages": sent}
 
 
-# ---------------------------------------------------------------- HL 模式 / kill（runbook 的 curl 在用）
-@app.post("/admin/hl/mode")
-def admin_hl_mode(request: Request, mode: str = Form("off"), k: str = Form("")):
-    """切换执行器模式（off/dry/live）。live 要求已配置地址与私钥。"""
-    _require_admin(request, k or None)
-    if mode not in ("off", "dry", "live"):
-        raise HTTPException(400, "mode 只能是 off/dry/live")
-    if mode == "live":
-        p = hl_params()
-        if not p.account_address or not p.private_key:
-            raise HTTPException(400, "未配置 HL_ACCOUNT_ADDRESS / HL_PRIVATE_KEY，不能进 live")
-    db.set_config("hl_exec_mode", mode)
-    db.hl_log_event("decision", f"人工切换执行器模式 → {mode}")
-    if mode != "live":
-        # 人工路径（含「切出 live」这种收尾动作）→ origin='manual'：永不被自动解除。
-        db.hl_set_kill(False, "", origin="manual")
-    return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)
-
+# ---------------------------------------------------------------- kill（runbook 的 curl 在用）
+# 2026-10-30 面板精简：同段的 /admin/hl/mode（切模式）已删除 —— 切模式只剩
+# DB 直改（docs/HL_RUNBOOK.md 的应急条目）。kill 这条 curl 口径保留。
 
 @app.post("/admin/hl/kill")
 def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
@@ -1385,7 +1318,8 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
 
     【v2·高2】解除**回撤熔断**（origin=='dd'）时，必须在本请求内把回撤基线（peak_index）
     重置为当前 index：否则下一轮 DD 仍是 31% → 立刻又置 kill，「人工解」形同虚设。
-    这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条）。
+    这条 curl 入口与面板 `/admin/switch/kill` 同一口径（runbook 用的是这条；
+    面板上的按钮在总览页尾「管理」卡）。
     """
     _require_admin(request, k or None)
     want = on in ("1", "true", "on")
@@ -1401,4 +1335,4 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
             db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
-    return RedirectResponse(f"/admin?tab=switch&k={_urlquote(str(k))}", status_code=303)
+    return RedirectResponse(f"/admin?tab=overview&k={_urlquote(str(k))}", status_code=303)

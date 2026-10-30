@@ -1,9 +1,13 @@
 """DB 覆盖参数的解析回归（`Config.apply_db`）。
 
-历史 bug（2026-10-14 发现，直接影响实盘规模）：`/admin/rules` 把 equity / risk_pct /
-leverage / stop_min / stop_max 以**字符串**写库，`set_config` 走 `json.dumps` →
+历史 bug（2026-10-14 发现，直接影响实盘规模）：旧面板（`/admin/rules`，2026-10-30 随
+参数页删除）把 equity / risk_pct / leverage / stop_min / stop_max 以**字符串**写库，`set_config` 走 `json.dumps` →
 存成 `'"100"'`（带引号）；`apply_db` 里 `float('"100"')` 抛 ValueError，被
 `except (TypeError, ValueError): continue` **静默吞掉** → 面板上改这些参数永远不生效。
+
+2026-10-30 面板精简后，DB 里的这些键**只能靠容器内 sqlite 直改**写入（runbook），
+所以「写进去的形态五花八门 → apply_db 必须都能认」这条比以前更要紧：直改 SQL 的人
+不会替你把值 json.dumps 成数字。
 
 之所以长期没被发现：默认 env（ACCOUNT_EQUITY=1000）与 DB 里的 "1000" 数值相同，
 看起来「一切正常」；一旦两者不同（比如测试期把资金改成 100）就会静默按旧值跑，
@@ -58,7 +62,7 @@ class TestApplyDbTypes(unittest.TestCase):
         self.assertEqual(c.equity, before)
 
     def test_config_write_then_read_roundtrip(self):
-        """写库（模拟 /admin/rules 的新写法：存数字）→ 读回 → 生效值正确。"""
+        """写库（模拟容器内 sqlite 存数字）→ 读回 → 生效值正确。"""
         for k, v in (("equity", 100.0), ("risk_pct", 0.02), ("leverage", 5.0),
                      ("stop_min", 0.015), ("stop_max", 0.10)):
             self.db.set_config(k, v)

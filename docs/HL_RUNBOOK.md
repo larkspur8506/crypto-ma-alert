@@ -6,11 +6,13 @@
 
 | 模式 | 行为 | 切换方式 |
 | --- | --- | --- |
-| `off`（默认） | 只提醒，不碰交易所 | 面板 `POST /admin/hl/mode` 或 `HL_EXEC_MODE=off` |
-| `dry` | 每轮算单、落库 `hl_orders(status=planned)`、不下单 | 同上选 `dry` |
-| `live` | 真实下单 + 挂止损 + 对账 | 同上选 `live`（要求已配 `HL_ACCOUNT_ADDRESS` + `HL_PRIVATE_KEY`） |
+| `off`（默认） | 只提醒，不碰交易所 | 容器内 sqlite 直改 `hl_exec_mode`（§6.H）或 `HL_EXEC_MODE=off` |
+| `dry` | 每轮算单、落库 `hl_orders(status=planned)`、不下单 | 同上一行，值改成 `dry` |
+| `live` | 真实下单 + 挂止损 + 对账 | 同上一行，值改成 `live`（要求已配 `HL_ACCOUNT_ADDRESS` + `HL_PRIVATE_KEY`） |
 
-**回滚 = 面板上把模式切回 `off`**（或 `docker compose up -d` 后不带 HL env）。数据卷与 HL 侧仓位不受影响。
+**回滚 = 把 DB 里的 `hl_exec_mode` 改回 `off`**（§6.H 的一行 sqlite；或 `docker compose up -d` 后不带 HL env）。
+数据卷与 HL 侧仓位不受影响。2026-10-30 面板精简后**页面上没有切模式的控件了**（面板只显示当前生效模式），
+切模式只有「DB 直改」和「改 env 重建」两条路。
 
 ## 2. 需要的环境变量（写进 1Panel compose，600 权限）
 
@@ -34,7 +36,8 @@
 | `HL_CHURN_MAX` | 同一 coin-side 10 分钟内撤单/改价重挂达这次数就停手（0 = 关闭熔断）。DB `hl_churn_max` 优先 | 5 |
 | `HL_FILL_CLOSE` | 交易所侧已平仓时按成交价自动关账（见 §6 B 前的「止损已成交」小节）。DB `hl_fill_close` 优先 | `1`（开） |
 
-改 env 必须 `docker compose up -d` 重建（容器不热读 env）；改 `hl_exec_mode` / kill 走面板或 DB，立即生效。
+改 env 必须 `docker compose up -d` 重建（容器不热读 env）；改 `hl_exec_mode`（DB 直改，§6.H）/ kill（面板「管理」卡或
+`POST /admin/hl/kill`）立即生效，无需重启。
 
 ## 3. 上线顺序（严格按序，每步验收）
 
@@ -57,11 +60,8 @@ curl -s "$BASE/health"                            # 含 hl_mode / hl_kill
 curl -s "$BASE/api/hl/status?k=$K" | python3 -m json.tool | head -40   # 面板数据源
 curl -s "$BASE/hl?k=$K" -o /tmp/hl.html           # 监控面板
 
-# 切换模式（form 编码；切 live 时若无凭据会被 400 拒绝 —— 这是故意的）
-curl -s -X POST -d "mode=dry&k=$K" "$BASE/admin/hl/mode"
-curl -s -X POST -d "mode=off&k=$K" "$BASE/admin/hl/mode"
-
-# kill switch（on=1 暂停自动交易，仍允许人工平仓；解除用 on=0）
+# 切换模式：面板已无入口（2026-10-30 精简），走容器内 sqlite —— 见 §6.H
+# kill switch（on=1 暂停自动交易，仍允许人工平仓；解除用 on=0；面板总览页尾「管理」卡同名按钮）
 curl -s -X POST -d "on=1&k=$K" "$BASE/admin/hl/kill"
 curl -s -X POST -d "on=0&k=$K" "$BASE/admin/hl/kill"
 
@@ -126,8 +126,8 @@ wrapper: /opt/data/scripts/hl-watch/hl_watch.py
 ## 5.5 写路径真单冒烟（切 live 前 / 改过写路径后）
 
 ```bash
-# 1) 先把模式切 off（避免看守把这张冒烟仓判成「本地无记录的人工单」→ 拉 kill）
-curl -s -X POST -d "mode=off&k=$ADMIN_TOKEN" "$BASE/admin/hl/mode"
+# 1) 先把模式切 off（避免看守把这张冒烟仓判成「本地无记录的人工单」→ 拉 kill）：
+#    面板已无切模式入口，走 §6.H 的一行 sqlite（hl_exec_mode=off）
 # 2) 跑冒烟：约 12 USDC 名义，开仓 → 挂止损 → 核对 → 撤止损 → 平仓，≈5 秒、成本 ≈0.01 USDC
 cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-alert python -'
 # 3) 看 ⑧ has_stop=True、⑫ 仓位/挂单归零，再切回 dry 或 live
@@ -149,7 +149,7 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 #### 止损/人工已在交易所平仓（`hl_fill_close`，默认开）
 对账发现「本地有仓、交易所无仓」时，**先**用本轮已同步的 `hl_fills` 自证仓位已平：成交必须是开仓后（`opened_at−120s` 起）、`reduce_only`/`Close` 腿、合计数量落在「持仓量（`hl_sz`，回落 `actual_contracts`）± 1 tick」区间内（**低于** = 只平了一部分；**高于** = 窗口里混进了不属于这仓的成交，账不可归因）。全部满足才按**加权成交均价**关账（`exit_reason` = 全部成交出自 `hl_stop_oid` → `stop`，否则 `exchange`）、把对应挂单落 `filled`、推一条提醒，且**不** kill；任一条件不满足（无成交/数量不足或超额/精度不可知/oid 不明）完全退回旧行为（mismatch + kill）。
 `exit_reason=exchange`（人工/外部平掉，止损单没成交）时，执行器会顺手撤掉该 symbol 仍 `resting/sent` 的止损类挂单（`stop` / `stop:fix` / `exit:rehang`，只撤有明确 oid 的行）并落 `cancelled` —— 否则那张孤儿 reduce-only 单会把下一次开仓平掉。撤单失败：行保持 `resting` + `hl_events` 记 error + 推一条告警，需人工到 HL 撤单。
-面板「策略与保护」可关掉该开关（DB `hl_fill_close=0`）：**两条路径一起**回到旧行为 —— 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效（mismatch 行直接让出接管权，引擎走人工提醒流）。关掉后止损成交只能人工补录，别指望 4h 收盘的 `on_exit` 代关。
+该开关只能靠 DB 直改关掉（`hl_fill_close=0`，面板已无开关页；写法见 §6.H）：**两条路径一起**回到旧行为 —— 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效（mismatch 行直接让出接管权，引擎走人工提醒流）。关掉后止损成交只能人工补录，别指望 4h 收盘的 `on_exit` 代关。
 两条容易踩的边界（对抗审查后收紧）：① **挂单落 `filled` 只认 oid 相等** —— 成交里没有 oid（升级前已同步的老成交恒为 NULL）时一行都不改，只记一条 `hl_events`（候选来自 `hl_recent_orders` 的跨 bar 扫描，「恰好一行」也可能是别的仓那张没成交的止损）；② `on_exit` 的止损关账**必须有 `Close` 腿**，只有开仓腿时 `_last_fill_px` 返回 `None`（不再拿开仓价冒充成交价）→ mismatch 行让出接管权、不关账；同一轮对账里一批成交只归一个仓（tid 已消耗即 fail-closed）。
 
 ### B2. 数量对账不一致（`hl_events` 有「数量对账」/「持仓数量对账不一致」）
@@ -179,7 +179,7 @@ strike，再解除 kill 即可。
 看到这条说明「本地记的价/量」与「交易所流水」有出入，去面板「记录」页按 `hl_fills` 核对；
 `pnl_source`：`fills` = 已算（有出入场腿）、`no_exit_fills` = 平仓成交还没同步（净额留空）、
 `no_fills` = 查不到任何成交（人工流/未同步）。
-「开关」页「策略与保护 → 记录页净额改用流水口径」（`hl_pnl_from_fills`，**默认关**）只决定
+「记录页净额改用流水口径」（`hl_pnl_from_fills`，**默认关**，只能 DB 直改，见 §6.H）只决定
 记录页要不要显示「净额（流水）」列，不改变入库行为 —— 打开后如果数字可疑，关回去即可。
 
 ### B4. 闸门拦截 / churn 熔断（`hl_events` 有「动作被闸门拦下」/「churn 熔断」）
@@ -224,15 +224,72 @@ strike，再解除 kill 即可。
 
 ### G. API 钱包（agent）快到期 / 已失效
 有效期最长 180 天、默认 90 天，到期那一刻执行器**开仓、平仓、撤单全部被拒**（而本地记录看着一切正常）。
-- 系统行为：每小时 :11 检查一次，剩余 ≤14 天开始提醒（≤7 天升级文案，独立 kind 所以升级不会被去重压住）；≤3 天且开关开 → **先置 kill → 撤全部挂单 → 逐仓市价平 → 复查无仓 → 本地仓位同步关账**；已过期（毫秒精确，`now >= validUntil`）→ 置 kill + 每 24h 提醒。面板「参数」页末尾「API 有效期」卡片可看状态（数据来自 DB 缓存，不现调接口）。
+- 系统行为：每小时 :11 检查一次，剩余 ≤14 天开始提醒（≤7 天升级文案，独立 kind 所以升级不会被去重压住）；≤3 天且开关开 → **先置 kill → 撤全部挂单 → 逐仓市价平 → 复查无仓 → 本地仓位同步关账**；已过期（毫秒精确，`now >= validUntil`）→ 置 kill + 每 24h 提醒。面板总览末尾「API 有效期」卡可看状态（数据来自 DB 缓存，不现调接口）。
 - 到期当天不再「整天算过期」：只要 `validUntil` 还没到，当天仍走清仓/重试档（还有几个小时可以平仓）。
-- 授权里 `validUntil` 为空 = **不限期**：面板显示「不限期」，不告警、不清仓，也不会拿「参数」页的手工兜底值去算（那是陈旧值，曾导致误平仓）。
-- 续期（唯一正确姿势）：**HL 网页 → More → API**，用**同名 `Hermes`** 生成新 API 钱包（有效期选 180 天）→ 复制新私钥 → 面板「API 有效期」卡片里展开「更新 API」→ 粘贴 → 校验并保存。保存后下一轮 tick 自动用新私钥（`hl_params()` 每轮重建执行器），**无需重启**。
+- 授权里 `validUntil` 为空 = **不限期**：面板显示「不限期」，不告警、不清仓，也不会拿 DB 里的手工兜底值（`hl_agent_valid_until_ms`）去算（那是陈旧值，曾导致误平仓）。
+- 续期（唯一正确姿势）：**HL 网页 → More → API**，用**同名 `Hermes`** 生成新 API 钱包（有效期选 180 天）→ 复制新私钥 → 面板总览页尾「管理」卡 → 展开「在 HL 网页续期后粘贴新私钥」→ 粘贴 → 校验并保存。保存后下一轮 tick 自动用新私钥（`hl_params()` 每轮重建执行器），**无需重启**。
 - 校验失败的原因都在 400 文案里：格式不对 / 名字不是刚好 `Hermes` / 地址与粘贴的不一致（说明网页上还没授权成功）/ 授权已过期 / 就是当前这把。**首次配置**（库里还没有私钥）跳过「同一把」检查。
-- 手工兜底：接口查不到同名授权时，到「参数」页「API 有效期」组填毫秒时间戳（`hl_agent_valid_until_ms`）。**留空保存 = 保持原值**（不动它）；要清空点该页的「清除兜底」按钮。
-- 关掉自动清仓：「开关」页「策略与保护」把「到期前自动清仓」取消勾选（原样保存即生效；识别不了的值一律按「开」——漏清仓的代价比提前平仓大）。
+- 手工兜底：接口查不到同名授权时才用（`hl_agent_valid_until_ms`）。**页面已不提供「设置」入口**（防陈旧兜底值误平仓，资金路径类教训 #4），要设置走 §6.H 的 sqlite 一行；**清空**走总览「管理」卡里的「清除兜底」按钮（仅当库里有值时才渲染）。
+- 关掉自动清仓：DB 直改 `agent_expiry_cleanup=0`（写法见 §6.H；识别不了的值一律按「开」——漏清仓的代价比提前平仓大）。
 - 执行器处于 `off`（只提醒）时：不会清仓，面板状态显示「未自动清仓（执行器 off）」，并推一条「请自行决定是否手动处理」（7 天节流一次，不会每小时刷）。
-- **清完仓后恢复交易**：先续期并更新 API，再到「开关」页解除 kill —— 清仓本身不清 kill（故意的）。**本地仓位已在清仓时自动关账（`exit_reason=agent_expiry_cleanup`、`auto_closed=1`），不需要手工改库**；对账不会再报 mismatch，解 kill 后不会被重新拉回去。若真实成交价与参考价有差异，到「记录」页按 `hl_fills` 核对，需要的话在确认页覆盖。
+- **清完仓后恢复交易**：先续期并更新 API，再到面板总览「管理」卡解除 kill —— 清仓本身不清 kill（故意的）。**本地仓位已在清仓时自动关账（`exit_reason=agent_expiry_cleanup`、`auto_closed=1`），不需要手工改库**；对账不会再报 mismatch，解 kill 后不会被重新拉回去。若真实成交价与参考价有差异，到「记录」页按 `hl_fills` 核对，需要的话在确认页覆盖。
+
+
+### H. 改参数 / 开关 / 模式 / 回撤峰值（面板已无入口）
+
+2026-10-30 面板精简（PR feat/panel-slim）：参数页、开关页、切模式、重置回撤峰值这些
+**写入口整体删除**（连同它们的 POST 端点），页面上只剩三个写动作：拉闸 / 解除（总览
+页尾「管理」卡）、更新 API（续期）、清除手工兜底。
+配置的**读取**一行没改 —— `configuration` 表照旧优先于 env，改完下一轮 tick 就生效，
+**不需要重启**。所以要改这些值只剩两条路：
+
+1. **改代码走 PR**（改默认值 / 加新键 / 改校验规则）；
+2. **容器内直改 DB**（临时改某个生效值）—— 下面这一行是唯一推荐写法。
+
+```bash
+# 把 <KEY> 与 <值> 换掉。关键：set_config 存的是 json.dumps 的结果，直改 DB 必须一样
+#   字符串 → 带引号（"off" / "1830000000000"）；数字 → 100；布尔开关 → 1 / 0
+ssh oracle1 'sudo -n docker exec crypto-ma-alert python - <<PY
+import sqlite3, json, time
+c = sqlite3.connect("/app/data/crypto_ma.db")
+c.execute("INSERT INTO configuration(key,value,updated_at) VALUES(?,?,?) "
+          "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+          ("<KEY>", json.dumps(<值>), time.time()))
+c.commit()
+print(c.execute("SELECT key,value FROM configuration WHERE key=?", ("<KEY>",)).fetchall())
+PY'
+```
+
+常用值（照抄改值）：
+
+| 目的 | KEY | 值（`json.dumps` 之前写什么） |
+| --- | --- | --- |
+| 切到只通知 / 影子 / 实盘 | `hl_exec_mode` | `"off"` / `"dry"` / `"live"` |
+| 关掉到期前自动清仓 | `agent_expiry_cleanup` | `0` |
+| 设手工兜底有效期（接口查不到授权时用） | `hl_agent_valid_until_ms` | `"1830000000000"`（毫秒，字符串） |
+| 改单笔风险 | `risk_pct` | `0.02`（数字；`"0.02"` 也认 —— apply_db 两种都吃） |
+| 关掉记录页「净额（流水）」列 | `hl_pnl_from_fills` | `0` |
+| 关掉「交易所已平仓自动关账」 | `hl_fill_close` | `0` |
+
+改完自检：`curl -s "$BASE/api/hl/status?k=$K" | python3 -m json.tool | head -20`（mode / kill
+与预期一致），再看面板总览「管理」卡的只读模式徽章。
+
+**重置回撤峰值**（原「重置回撤基线」按钮已删）：正常情况不需要单独重置 ——
+「解除 **DD 熔断**」会在同一个请求里自动把峰值改成当前指数（否则下一轮立刻又熔断）。
+只在确需单独挪基线时（例如自动档位判据被人为改动）用容器内 python：
+
+```bash
+ssh oracle1 'sudo -n docker exec crypto-ma-alert python - <<PY
+from app.db import DB
+from app.hl import dd
+db = DB("/app/data/crypto_ma.db")
+print(dd.reset_peak(db))
+PY'
+```
+
+注意：单独重置峰值**不解除** kill（两条动作互相独立），重置后回撤从 0% 重新计量。
+`hl_agent_valid_until_ms` 只建议**设置成真实值或清空**，别填猜测值 —— 陈旧/填错的兜底
+有效期会让执行器按错误的到期日动作（资金路径类教训 #4），所以面板上只留了「清除」。
 
 
 ## 7. 备份 / 恢复

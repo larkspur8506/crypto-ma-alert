@@ -159,7 +159,10 @@ class TestShortStateMachine(unittest.TestCase):
 
 
 class TestConfigOverrides(unittest.TestCase):
-    """做空开关必须能从 /admin/rules 热改（DB 覆盖 env，不重启）。"""
+    """做空开关必须能被 DB 覆盖 env（不重启即生效）。
+
+    2026-10-30 面板精简：写入口只剩容器内 sqlite 直改（runbook），读侧口径不变。
+    """
 
     def setUp(self):
         from app.config import Config
