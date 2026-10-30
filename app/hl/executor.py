@@ -147,7 +147,9 @@ def parse_max_signal_age_min(raw) -> int:
         return SIGNAL_AGE_DEFAULT_MIN
     try:
         n = int(float(s))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # OverflowError："inf"/"1e999" 这类 float 解析得了但转 int 会炸的值 ——
+        # 按「读坏」处理退回默认，别让一个脏 env 把装配链路崩掉（2026-10-30 复审）。
         return SIGNAL_AGE_DEFAULT_MIN
     return n if n >= 0 else SIGNAL_AGE_DEFAULT_MIN
 
@@ -2092,6 +2094,12 @@ class Executor:
                         data={"plan": plan.__dict__})
             if self.p.live:
                 self._alert(f"【HL执行】{coin} 信号被闸门拒绝（未下单）：\n- " + "\n- ".join(gates))
+            else:
+                # dry 影子也必须把「实盘会被拒」说出来（2026-10-30 复审 P3）：静默吞掉
+                # 会让影子期误以为这笔放行了。不发人工卡是有意的——实盘同样被拒，
+                # 没有可执行的人工动作。
+                self._alert(f"【HL影子】{coin} 若为实盘，开仓会被闸门拒绝：\n- "
+                            + "\n- ".join(gates) + "\n（dry 模式：未下任何单）")
             return True
 
         status = ST_PLANNED if not self.p.live else ST_INTENT

@@ -17,7 +17,7 @@ from pathlib import Path
 from unittest import mock
 
 from app.db import DB
-from app.hl import MODE_LIVE
+from app.hl import MODE_DRY, MODE_LIVE
 from app.hl.executor import (SIGNAL_AGE_DEFAULT_MIN, ExecParams, Executor,
                              parse_max_signal_age_min)
 
@@ -111,6 +111,16 @@ class TestParseKnob(unittest.TestCase):
         self.assertEqual(parse_max_signal_age_min('"20"'), 20)
         self.assertEqual(parse_max_signal_age_min("30.9"), 30)
 
+    def test_infinite_falls_back_to_default(self):
+        """'inf'/'1e999'：float 解析得了、int() 转 OverflowError —— 按读坏处理退回 30。
+
+        2026-10-30 复审补的边角：原实现只捕 TypeError/ValueError，一个
+        HL_MAX_SIGNAL_AGE_MIN=inf 会把 hl_params 装配链路整个崩掉。
+        """
+        self.assertEqual(parse_max_signal_age_min("inf"), 30)
+        self.assertEqual(parse_max_signal_age_min("1e999"), 30)
+        self.assertEqual(parse_max_signal_age_min("-inf"), 30)
+
 
 class TestSignalAgeGate(Base):
     def test_stale_bar_blocks_entry(self):
@@ -132,6 +142,17 @@ class TestSignalAgeGate(Base):
         self.enter_at(210, max_signal_age_min=0)
         self.assertEqual(self.orders("entry")[0]["status"], "filled")
         self.assertFalse([e for e in self.events() if "拒绝追单" in str(e["message"])])
+
+    def test_dry_gate_rejection_still_alerts(self):
+        """dry 影子也必须把「实盘会被拒」推出来（2026-10-30 复审 P3）。
+
+        旧实现只在 live 下 _alert：影子期闸门拒绝是静默的（事件落了库但零推送），
+        会误以为这笔放行了。不发人工卡是有意的——实盘同样被拒，没有人工动作可做。
+        """
+        self.enter_at(210, mode=MODE_DRY)
+        self.assertTrue(any("闸门拒绝" in m for m in self.notifier.messages),
+                         "dry 下闸门拒绝也要推送")
+        self.assertFalse(self.order_calls())
 
     def test_boundary_exactly_30_allowed(self):
         self.enter_at(30)
