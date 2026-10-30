@@ -249,7 +249,7 @@ strike，再解除 kill 即可。
 ```bash
 # 把 <KEY> 与 <值> 换掉。关键：set_config 存的是 json.dumps 的结果，直改 DB 必须一样
 #   字符串 → 带引号（"off" / "1830000000000"）；数字 → 100；布尔开关 → 1 / 0
-ssh oracle1 'sudo -n docker exec crypto-ma-alert python - <<PY
+ssh oracle1 'sudo -n docker exec -i crypto-ma-alert python - <<PY
 import sqlite3, json, time
 c = sqlite3.connect("/app/data/crypto_ma.db")
 c.execute("INSERT INTO configuration(key,value,updated_at) VALUES(?,?,?) "
@@ -279,7 +279,7 @@ PY'
 只在确需单独挪基线时（例如自动档位判据被人为改动）用容器内 python：
 
 ```bash
-ssh oracle1 'sudo -n docker exec crypto-ma-alert python - <<PY
+ssh oracle1 'sudo -n docker exec -i crypto-ma-alert python - <<PY
 from app.db import DB
 from app.hl import dd
 db = DB("/app/data/crypto_ma.db")

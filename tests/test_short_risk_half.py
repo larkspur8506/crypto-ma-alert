@@ -491,5 +491,273 @@ class TestShortRiskHalfReadPath(unittest.TestCase):
 
 
 # ================================================================ 面板影响预览（M2）
+
+
+# ================================================================ 关闭态 golden 矩阵（M3）
+# 固定输入 → 固定输出。数值与文案取自**跨树 diff 的一次性脚本**实测结果：
+# 同一套固定 cfg 在两棵 worktree（origin/main 与本分支）各跑一遍 engine.walk，
+# stdout 逐字节相同（diff 无输出）后才落到这里。脚本本身不入库 —— 常驻的
+# 是这份矩阵：以后谁动了 risk_pct 口径、面值、floor 或文案，这里立刻红灯，
+# 效果等同于重跑一次跨树 diff。
+GOLDEN_OFF = {
+    ("BTC_USDT", -1): dict(
+        contracts=34475, coin_qty=3.4475000000000002,
+        notional=428.007125, margin=85.60142499999999,
+        risk_u=19.999809374999987, stop_dist=0.04672774869109945,
+        entry=124.14999999999999, stop=129.95125,
+        text="\n".join([
+            '【双均线】BTC_USDT 做空信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 124）',
+            '止损触发价：130（距离 4.67%，在价格上方）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 428 USDT → 点【开空】',
+            '      （核对持仓价值 ≈ 428U，约 34475 张）',
+            '止损单：计划委托，触发价 130，买入平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：20.0U（权益 1,000U × 2%），保证金(5x) 86U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),
+    ("BTC_USDT", 1): dict(
+        contracts=36918, coin_qty=3.6918,
+        notional=499.1313600000001, margin=99.82627200000002,
+        risk_u=19.999636052864886, stop_dist=0.04006888297474413,
+        entry=135.20000000000002, stop=129.7826870218146,
+        text="\n".join([
+            '【双均线】BTC_USDT 做多信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 135）',
+            '止损触发价：130（距离 4.01%）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 499 USDT → 点【开多】',
+            '      （核对持仓价值 ≈ 499U，约 36918 张）',
+            '止损单：计划委托，触发价 130，卖出平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：20.0U（权益 1,000U × 2%），保证金(5x) 100U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),
+    ("ETH_USDT", -1): dict(
+        contracts=344, coin_qty=3.44,
+        notional=427.07599999999996, margin=85.4152,
+        risk_u=19.956299999999985, stop_dist=0.04672774869109945,
+        entry=124.14999999999999, stop=129.95125,
+        text="\n".join([
+            '【双均线】ETH_USDT 做空信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 124）',
+            '止损触发价：130（距离 4.67%，在价格上方）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 427 USDT → 点【开空】',
+            '      （核对持仓价值 ≈ 427U，约 344 张）',
+            '止损单：计划委托，触发价 130，买入平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：20.0U（权益 1,000U × 2%），保证金(5x) 85U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),
+    ("ETH_USDT", 1): dict(
+        contracts=369, coin_qty=3.69,
+        notional=498.88800000000003, margin=99.7776,
+        risk_u=19.989884889504154, stop_dist=0.04006888297474413,
+        entry=135.20000000000002, stop=129.7826870218146,
+        text="\n".join([
+            '【双均线】ETH_USDT 做多信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 135）',
+            '止损触发价：130（距离 4.01%）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 499 USDT → 点【开多】',
+            '      （核对持仓价值 ≈ 499U，约 369 张）',
+            '止损单：计划委托，触发价 130，卖出平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：20.0U（权益 1,000U × 2%），保证金(5x) 100U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),
+    ("SOL_USDT", -1): dict(
+        contracts=34, coin_qty=3.4000000000000004,
+        notional=422.11, margin=84.422,
+        risk_u=19.724249999999987, stop_dist=0.04672774869109945,
+        entry=124.14999999999999, stop=129.95125,
+        text="\n".join([
+            '【双均线】SOL_USDT 做空信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 124）',
+            '止损触发价：130（距离 4.67%，在价格上方）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 422 USDT → 点【开空】',
+            '      （核对持仓价值 ≈ 422U，约 34 张）',
+            '止损单：计划委托，触发价 130，买入平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：19.7U（权益 1,000U × 2%），保证金(5x) 84U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),
+    ("SOL_USDT", 1): dict(
+        contracts=36, coin_qty=3.6,
+        notional=486.7200000000001, margin=97.34400000000002,
+        risk_u=19.502326721467465, stop_dist=0.04006888297474413,
+        entry=135.20000000000002, stop=129.7826870218146,
+        text="\n".join([
+            '【双均线】SOL_USDT 做多信号（4h 收盘 01-21 02:13 北京时间）',
+            '入场：市价（当前 135）',
+            '止损触发价：130（距离 4.01%）',
+            '下单：逐仓 5x / 市价 / 单位选 USDT / 输入 487 USDT → 点【开多】',
+            '      （核对持仓价值 ≈ 487U，约 36 张）',
+            '止损单：计划委托，触发价 130，卖出平仓，触发参考=最新成交价',
+            '止盈：不设',
+            '风险：19.5U（权益 1,000U × 2%），保证金(5x) 97U',
+            '离场：收到本系统提醒后 4 小时内市价平仓',
+            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
+        ])),}
+
+
+class TestOffGoldenMatrix(unittest.TestCase):
+    """开关关闭时 BTC/ETH/SOL × 多/空 六条 golden（逐字节一致的最低保障）。
+
+    文档口径：跨树 diff 用一次性脚本（不进仓），**仓内以本矩阵为准**。
+    """
+
+    def _cfg(self):
+        c = cfg()                       # equity 1000 / risk_pct 2% / 5x / stop 1.5%~10%
+        c.token_secret = "s"            # 与跨树 diff 脚本同一套固定外部输入
+        c.base_url = "https://x"
+        return c
+
+    def _run(self, symbol, side, half=False):
+        bars, ind, sq, i = _short_setup() if side == -1 else _long_setup()
+        c = self._cfg()
+        c.short_risk_half = half
+        events, _ = engine.walk(c, symbol, bars, ind, sq, None, i, i, i)
+        self.assertEqual(len(events), 1, events)
+        self.assertEqual(events[0].kind, "entry")
+        return c, events[0]
+
+    def test_six_rows_match_pre_change_golden(self):
+        for (symbol, side), g in GOLDEN_OFF.items():
+            with self.subTest(symbol=symbol, side=side):
+                c, ev = self._run(symbol, side)
+                o = ev.order
+                self.assertEqual(ev.sig.side, side)
+                self.assertEqual(o.symbol, symbol)
+                self.assertEqual(o.contracts, g["contracts"])
+                self.assertFalse(o.below_minimum)
+                for field, key in (("coin_qty", "coin_qty"), ("notional", "notional"),
+                                   ("margin", "margin"), ("risk_u", "risk_u"),
+                                   ("stop_dist", "stop_dist"),
+                                   ("entry_price", "entry"), ("stop_price", "stop")):
+                    self.assertAlmostEqual(getattr(o, field), g[key], places=9,
+                                           msg=f"{symbol}/{side}:{field}")
+                # 提醒卡文案全文（含确认链接签名：token_secret / base_url / pid 固定）
+                self.assertEqual(engine.format_entry(c, ev.sig, o, 1), g["text"])
+
+    def test_matrix_really_distinguishes_the_switch(self):
+        """矩阵必须能区分开关状态，否则「关闭时一致」就是空断言。"""
+        for symbol, side in (("BTC_USDT", -1), ("ETH_USDT", -1), ("SOL_USDT", -1)):
+            with self.subTest(symbol=symbol):
+                _c, ev = self._run(symbol, side, half=True)
+                self.assertNotEqual(ev.order.contracts, GOLDEN_OFF[(symbol, side)]["contracts"])
+        for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT"):
+            with self.subTest(symbol=symbol):
+                _c, ev = self._run(symbol, 1, half=True)          # 多单永不变
+                self.assertEqual(ev.order.contracts, GOLDEN_OFF[(symbol, 1)]["contracts"])
+
+
+# ================================================================ H1 混合态（真链路）
+try:
+    from fastapi.testclient import TestClient as _TestClient
+except ImportError:                       # pragma: no cover - fastapi 未装
+    _TestClient = None
+
+
+@unittest.skipIf(_TestClient is None, "fastapi 未安装")
+class TestConfirmPostMixedState(unittest.TestCase):
+    """H1：**建行与确认之间切换开关**，体检目标必须还是建行时的计划风险。
+
+    走 main.confirm_post 全链路，因为「参数没被传进去」是单测测不出来的：只测
+    engine.review_fill(target_risk_u=...) 的话，删掉 main.py 那行接线照样绿，
+    线上却继续拿新政策去审旧单 —— 全额空单被判「+102%，应开 41 张」，或半额
+    空单被判「-50%，应开双倍」。两个方向都是反向建议，所以两个方向各钉一条。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="mixed_")
+        self._env = {k: os.environ.get(k) for k in
+                     ("DB_PATH", "ENABLE_SCHEDULER", "TOKEN_SECRET", "BASE_URL",
+                      "DRY_RUN", "SHORT_RISK_HALF")}
+        os.environ.update({"DB_PATH": os.path.join(self.tmp, "mixed.db"),
+                           "ENABLE_SCHEDULER": "false",
+                           "TOKEN_SECRET": "mixed-secret",
+                           "BASE_URL": "https://mixed.example",
+                           "DRY_RUN": "true"})
+        os.environ.pop("SHORT_RISK_HALF", None)
+        import app.main as main_mod
+        self.mod = importlib.reload(main_mod)
+        # 不依赖进程级 env 的读取时序（app.config 早已被别的用例导入过）
+        self.mod.config.token_secret = "mixed-secret"
+        self.mod.config.base_url = "https://mixed.example"
+        self.db = self.mod.db
+
+    def tearDown(self):
+        try:
+            self.db.conn.close()
+        except Exception:                                              # noqa: BLE001
+            pass
+        for k, v in self._env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    # ---- 夹具
+
+    def _pending_short(self, contracts, risk_u, bar_ms):
+        """建行时写入的**计划**口径：contracts 张 / risk_u 计划风险。"""
+        return self.db.create_position(
+            symbol="BTC_USDT", signal_bar_ms=bar_ms, side=-1,
+            entry_price=83_000.0, stop_price=85_400.0, stop_dist=0.0289,
+            contracts=contracts, coin_qty=contracts * 0.0001,
+            notional=contracts * 0.0001 * 83_000.0, risk_u=risk_u,
+            equity_at_entry=1000.0)
+
+    def _confirm(self, pid, contracts):
+        tok = engine.sign_token(self.mod.config.token_secret, pid, "open")
+        with _TestClient(self.mod.app) as c:
+            return c.post(f"/c/{pid}", data={
+                "a": "open", "t": tok, "actual_entry": "83000", "fill_amount": "",
+                "actual_contracts": str(contracts), "actual_stop": "85400",
+                "stop_placed": "1"})
+
+    # ---- 两个方向
+
+    def test_full_size_row_then_switch_on_is_not_told_to_halve(self):
+        pid = self._pending_short(84, 20.16, 1_791_900_000_000)   # 建行时开关=关（全额）
+        self.db.set_config("short_risk_half", 1)                  # 确认前把开关打开
+        r = self._confirm(pid, 84)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("偏离目标", r.text, "全额空单不该被按半额目标审判")
+        self.assertNotIn("+102%", r.text)
+        self.assertNotIn("若要正好", r.text, "不能建议把满额空单砍成半额")
+        self.assertIn("与目标一致", r.text)
+
+    def test_half_row_then_switch_off_is_not_told_to_double(self):
+        pid = self._pending_short(42, 10.08, 1_791_900_400_000)   # 建行时开关=开（半额）
+        self.db.set_config("short_risk_half", 0)                  # 确认前把开关关掉
+        r = self._confirm(pid, 42)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("偏离目标", r.text, "半额空单不该被按全额目标审判")
+        self.assertNotIn("-50%", r.text)
+        self.assertNotIn("若要正好", r.text, "不能建议开双倍张数")
+        self.assertIn("与目标一致", r.text)
+
+    def test_target_comes_from_the_row_not_from_current_config(self):
+        """反证接线：同一行按 84 张确认，计划风险 20.16U —— 若目标被现算成 10U，
+        就会冒出「偏离目标」。这里额外把当前配置改成「无减半」，目标也不该变。"""
+        pid = self._pending_short(84, 20.16, 1_791_900_600_000)
+        self.db.set_config("short_risk_half", 0)
+        self.db.set_config("risk_pct", 0.05)        # 当前配置 5% → 现算会是 50U
+        r = self._confirm(pid, 84)
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("若要正好", r.text)
+        self.assertIn("与目标一致", r.text)
+
+
+# ================================================================ 面板影响预览（M2）
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

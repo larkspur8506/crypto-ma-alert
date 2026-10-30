@@ -1517,6 +1517,9 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     else:
         o.append("<div class='hint'>当前未触发。触发后执行器不再开新仓。</div>")
     o.append("<form method='post' action='/admin/switch/kill'>"
+             # hidden k：拉闸是应急动作，不允许因 cookie 被禁/30 天过期而 401
+             # （同卡的 renew/clear 都带 k，这里补齐同一种风格——审查 m1）。
+             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
              f"<button class='{'red' if not kill else 'gray'}' type='submit' name='on' value='1'>"
              "触发（暂停开仓）</button>"
              f"<button class='{'gray' if kill else 'red'}' type='submit' name='on' value='0'>"
