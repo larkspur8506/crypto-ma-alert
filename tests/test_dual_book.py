@@ -6,9 +6,8 @@
 `hl_status` 置为非空）。读侧统一走 `app.posfields`：
 
 ① 历史 MEXC 行：面板 / 心跳仍读原字段（**钉住**，防收敛改动误伤人工流）
-② HL 仓行：面板信号表 + 确认页摘要读 actual_*（真实币量 / 真实成交价）
-③ `update_fill` 对 HL 仓拒绝（确认页 400 + GET edit_open 400 + DB ValueError），
-   MEXC 仓的「修改开仓记录」照旧可用
+② HL 仓行：面板信号表 + 心跳读 actual_*（真实币量 / 真实成交价）
+③ `update_fill` 对 HL 仓拒绝（DB ValueError；确认页的 400 那两条随 PR B 退役）
 ④ 执行器在成交确认点把**实际生效基数**写回 `positions.equity_at_entry`
 """
 from __future__ import annotations
@@ -131,28 +130,28 @@ class TestPanelSignalTable(unittest.TestCase):
         self.assertEqual(self.db.position_by_id(hl["id"])["contracts"], 85)
 
 
-# ---------------------------------------------------------------- 测试 ① / ② / ③ 确认页
+# ---------------------------------------------------------------- 测试 ③ DB 守卫 + 心跳口径
+# 2026-10-30 PR B：本段原有的 /c/{pid} 确认页用例（HL 摘要读 actual_*、MEXC 摘要保留
+# 「修改开仓记录」、edit_open 表单 400、修改 POST 400、review_fill 取 equity_at_entry
+# 作基数）随确认页与人工资讯流一并删除 —— 它们钉的页面与 review_fill 都不存在了。
+# 保留 DB 层守卫（绕过路由也拦得住）与心跳文案（双口径读侧仍在线上跑）。
 
-class TestConfirmPageDualBook(unittest.TestCase):
-    """确认页（app/main.py）：HL 仓读 actual_* + 修改入口收口。"""
+class TestDualBookDbGuardAndHeartbeat(unittest.TestCase):
+    """`db.update_fill` 对 HL 仓的守卫 + 心跳文案的数量口径（读侧收敛仍在）。"""
 
     def setUp(self):
         try:
             import fastapi                                              # noqa: F401
-            from fastapi.testclient import TestClient
         except ImportError:                                            # pragma: no cover
             self.skipTest("fastapi 未安装（本地环境），CI 里会跑")
         self.tmp = tempfile.mkdtemp()
         os.environ["DB_PATH"] = os.path.join(self.tmp, "confirm.db")
         os.environ["ENABLE_SCHEDULER"] = "false"
         os.environ["ADMIN_TOKEN"] = "dual-admin"
-        os.environ["TOKEN_SECRET"] = "dual-secret"
-        os.environ["BASE_URL"] = "https://dual.example"
         os.environ["DRY_RUN"] = "true"
         mod = importlib.import_module("app.main")
         importlib.reload(mod)
         self.mod = mod
-        self.TestClient = TestClient
 
     def tearDown(self):
         import shutil
@@ -176,70 +175,12 @@ class TestConfirmPageDualBook(unittest.TestCase):
                                      equity_at_entry=100.0)
         return pid
 
-    def _token(self, pid, action):
-        return self.mod.engine.sign_token(self.mod.config.token_secret, pid, action)
-
-    # ---- ② HL 仓摘要页读 actual_*
-
-    def test_hl_summary_shows_actual_and_hides_edit(self):
-        pid = self._hl_closed()
-        with self.TestClient(self.mod.app) as c:
-            r = c.get(f"/c/{pid}", params={"a": "view", "t": self._token(pid, "view")})
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("3,010.00", r.text)                     # actual_entry
-        self.assertIn("2,910.00", r.text)                     # actual_stop
-        self.assertIn("0.031 币量", r.text)                    # actual_contracts
-        self.assertNotIn("400 币量", r.text, "不能显示 MEXC 张数")
-        self.assertNotIn("修改开仓记录", r.text, "HL 仓必须隐藏修改开仓入口")
-        self.assertIn("hl_fills", r.text, "要有去向面板核对的引导")
-
-    def test_mexc_summary_keeps_edit_button(self):
-        pid = self._mexc_open()
-        with self.TestClient(self.mod.app) as c:
-            r = c.get(f"/c/{pid}", params={"a": "view", "t": self._token(pid, "view")})
-        self.assertEqual(r.status_code, 200)
-        self.assertIn("6 张", r.text)
-        self.assertIn("修改开仓记录", r.text, "MEXC 人工仓的修改入口必须保留")
-
-    # ---- ③ update_fill 对 HL 仓收口
-
-    def test_hl_edit_form_and_post_rejected(self):
-        pid = self._hl_closed()
-        tok_open = self._token(pid, "edit_open")
-        with self.TestClient(self.mod.app) as c:
-            r = c.get(f"/c/{pid}", params={"a": "edit_open", "t": tok_open})
-            self.assertEqual(r.status_code, 400, "HL 仓不应给出修改开仓表单")
-            r2 = c.post(f"/c/{pid}", data={"a": "open", "edit": "1",
-                                           "t": self._token(pid, "open"),
-                                           "actual_entry": "3999", "actual_stop": "3800",
-                                           "actual_contracts": "999"})
-            self.assertEqual(r2.status_code, 400, "HL 仓的修改开仓 POST 必须 400")
-        row = self.mod.db.position_by_id(pid)
-        self.assertAlmostEqual(row["actual_entry"], 3_010.0, msg="HL 仓数据不得被写脏")
-        self.assertAlmostEqual(row["actual_contracts"], 0.031)
-        self.assertAlmostEqual(row["equity_at_entry"], 100.0)
-
     def test_hl_update_fill_db_layer_raises(self):
-        """db 层双保险：直接调 update_fill 也要拒绝（路由绕过也拦得住）。"""
+        """db 层双保险：直接调 update_fill 也要拒绝（任何未来的调用方绕过界面也拦得住）。"""
         pid = self._hl_closed()
         with self.assertRaises(ValueError):
             self.mod.db.update_fill(pid, 3_999.0, 999, 3_800.0, True)
         self.assertAlmostEqual(self.mod.db.position_by_id(pid)["actual_entry"], 3_010.0)
-
-    def test_mexc_edit_still_works(self):
-        """MEXC 人工仓的「修改开仓记录」照旧可用（不能被双口径改动误伤）。"""
-        pid = self._mexc_open()
-        with self.TestClient(self.mod.app) as c:
-            r = c.post(f"/c/{pid}", data={"a": "open", "edit": "1",
-                                          "t": self._token(pid, "open"),
-                                          "actual_entry": "101000", "actual_stop": "98000",
-                                          "actual_contracts": "6"})
-            self.assertEqual(r.status_code, 200)
-        row = self.mod.db.position_by_id(pid)
-        self.assertAlmostEqual(row["actual_entry"], 101_000.0)
-        self.assertAlmostEqual(row["actual_stop"], 98_000.0)
-
-    # ---- ② 心跳文案（engine 的 positions 量字段读者）
 
     def test_heartbeat_dual_book(self):
         cfg = type("C", (), {"alert_prefix": "", "symbols": ["BTC_USDT", "ETH_USDT"]})()
@@ -250,19 +191,7 @@ class TestConfirmPageDualBook(unittest.TestCase):
         txt = engine.heartbeat_text(self.mod.db, cfg)
         self.assertIn("ETH_USDT: 持仓中 0.031 币量 @ 3,010", txt)
         self.assertNotIn("400 张", txt, "HL 仓不能按 MEXC 张数报")
-
-    # ---- review_fill 的下单基数来自 equity_at_entry
-
-    def test_review_fill_uses_row_equity_base(self):
-        pid = self._hl_closed()
-        row = self.mod.db.position_by_id(pid)
-        base = posfields.equity_base(row, self.mod.config.equity)
-        self.assertAlmostEqual(base, 100.0)
-        m_cfg = self.mod.current_config()
-        rev = engine.review_fill(m_cfg, row["symbol"], row["entry_price"], row["contracts"],
-                                 3_010.0, 2_910.0, 0.031, equity=base)
-        self.assertAlmostEqual(rev["equity"], 100.0, msg="体检基数必须是实际生效基数")
-        self.assertAlmostEqual(rev["target_risk_u"], 100.0 * m_cfg.risk_pct)
+        self.assertEqual(pid, self.mod.db.recent_positions(1)[0]["id"])
 
 
 # ---------------------------------------------------------------- 测试 ④ equity 写回

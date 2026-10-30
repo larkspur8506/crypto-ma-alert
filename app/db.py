@@ -418,7 +418,7 @@ class DB:
         if cur.rowcount == 0:
             # INSERT OR IGNORE 被 UNIQUE(symbol, signal_bar_ms) 忽略时，lastrowid
             # 残留同连接上一次成功 INSERT 的 id（可能是别的表）——直接返回会拿到
-            # 跨表的陈旧 id（确认链接 404 / on_entry 操作错仓）。必须回查真实行。
+            # 跨表的陈旧 id（后续查询 404 / on_entry 操作错仓）。必须回查真实行。
             row = self.conn.execute(
                 "SELECT id FROM positions WHERE symbol=? AND signal_bar_ms=?",
                 (kw["symbol"], kw["signal_bar_ms"])).fetchone()
@@ -437,7 +437,7 @@ class DB:
 
         `equity_at_entry`：**可选**的实际生效基数写回（双口径收敛）。引擎建行时写的是
         配置 equity（如 1000U），HL 执行器按生效基数（如 100U）成交后在确认点覆盖它，
-        这样 review_fill 的「权益的 X%」等读者自然读到真实基数。不传 = 行为不变。
+        这样面板/心跳的「权益的 X%」等读者自然读到真实基数。不传 = 行为不变。
         """
         sets = ("UPDATE positions SET status='open', actual_entry=?, actual_contracts=?, "
                 "actual_stop=?, stop_placed=?, opened_at=?")
@@ -457,14 +457,18 @@ class DB:
         """修改已确认的开仓数据（用户发现录错）。仓位已平仓时按新数据重算 R 倍数。
 
         **只服务 MEXC 人工流**：HL 仓（`hl_status` 非空）的真实成交在交易所侧，
-        本地改正会与 `hl_fills`/交易所持仓脱节（表单里的「张数/成交金额换算」是
-        MEXC 面值口径，写进去就是脏数据）→ 直接拒绝，让用户去面板核对。
+        本地改正会与 `hl_fills`/交易所持仓脱节（张数/成交金额换算是 MEXC 面值口径，
+        写进去就是脏数据）→ 直接拒绝，让用户去面板核对。
+
+        2026-10-30 PR B：确认页退役后本方法在生产路径上已无调用方（`main.confirm_post`
+        已删除）。保留是因为它是「本地记录改正」的唯一 DB 层入口，含 HL 守卫与 R 重算，
+        删掉要连带删守卫测试；真要启用应接在记录页/运维脚本上，而不是回到人工确认流。
         """
         p = self.position_by_id(pid)
         if not p:
             return
         if posfields.is_hl(p):
-            raise ValueError("HL 执行器管理的仓位不支持在确认页修改开仓记录，"
+            raise ValueError("HL 执行器管理的仓位不支持本地修改开仓记录，"
                              "请到面板「记录」页按 hl_fills 核对真实成交")
         risk = abs(actual_entry - actual_stop)
         sets = "actual_entry=?, actual_contracts=?, actual_stop=?, stop_placed=?"

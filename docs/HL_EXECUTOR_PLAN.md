@@ -31,7 +31,7 @@
 | `sizing.py` | MEXC 面值/张数换算 | **不动**；新增 `hl/sizing_hl.py`（HL 连续数量） |
 | `market.py` | 行情源（MEXC 合约 → OKX 降级） | **不动**（信号数据源仍用 MEXC，基差极小；HL 的 4h 历史只回溯到 2024-07，不能作为回测证据） |
 | `db.py` | positions / alert_logs / bar_state / feed_health | 新增 4 张表：`hl_orders` / `hl_fills` / `hl_snapshots` / `hl_events`；`positions` 增列 |
-| `main.py` | /admin 状态页 + 确认页 | 新增 `/hl` 监控页 + `/api/hl/*` JSON |
+| `main.py` | /admin 面板（总览+记录+管理卡） | 新增 `/hl` 监控页 + `/api/hl/*` JSON；确认页已于 2026-10-30 移除 |
 | `notify.py` | 企业微信 + Telegram 双通道 | 复用（新增 `kind=hl_*` 告警类型） |
 
 ## 2. 架构
@@ -62,7 +62,8 @@
 2. **只读与写路径分离**：`info.py` 无凭据，`exchange.py` 是唯一持私钥、唯一能下单的模块。
    除它以外的任何代码不得 import 签名库。
 3. **单一写者**：`positions.hl_*` 列与 `hl_orders` / `hl_fills` 只由执行器写；
-   人工确认页（`/c/{pid}`）只在执行器关闭时生效（模式互斥，避免双写）。
+   人工确认页（`/c/{pid}`）已于 2026-10-30 PR B 退役 —— 执行器自动开仓后它再无入口，
+   现在 `positions` 的开/平仓只有执行器与引擎两条写路径（改库属应急，见 runbook §6.H）。
 
 ## 2.5 参考系统（GitHub 调研，2026-10-13 用 GitHub API 实测）
 

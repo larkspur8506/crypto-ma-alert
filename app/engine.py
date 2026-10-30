@@ -14,8 +14,6 @@
 from __future__ import annotations
 
 import datetime as dt
-import hashlib
-import hmac
 import logging
 import os
 import re
@@ -24,9 +22,7 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Sequence, Tuple
 
 from app import market, posfields, strategy
-from app.sizing import SPECS as CONTRACT_SPECS
 from app.sizing import effective_risk_pct
-from app.sizing import metrics as sizing_metrics
 from app.sizing import size_order
 
 logger = logging.getLogger(__name__)
@@ -119,22 +115,6 @@ class Alert:
     text: str
 
 
-# ---------------------------------------------------------------- 签名链接
-
-def sign_token(secret: str, position_id: int, action: str) -> str:
-    msg = f"{position_id}:{action}".encode()
-    return hmac.new(secret.encode(), msg, hashlib.sha256).hexdigest()[:32]
-
-
-def verify_token(secret: str, position_id: int, action: str, token: str) -> bool:
-    return hmac.compare_digest(sign_token(secret, position_id, action), token or "")
-
-
-def confirm_url(cfg, position_id: int, action: str = "view") -> str:
-    base = (cfg.base_url or "").rstrip("/")
-    return f"{base}/c/{position_id}?a={action}&t={sign_token(cfg.token_secret, position_id, action)}"
-
-
 # ---------------------------------------------------------------- 文案
 
 def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool = False,
@@ -193,127 +173,11 @@ def format_entry(cfg, sig: strategy.Signal, order, position_id: int, stale: bool
         # 离场是 executor.on_exit 的活（自动挂止损/自动平仓 + 成交回报），
         # 人工模式的「4 小时内自己市价平仓」在这个模式下是误导，整行不出现。
         lines.append(f"离场：收到本系统提醒后 4 小时内市价平仓")
-    lines += [
-        f"确认开仓：{confirm_url(cfg, position_id)}",
-    ]
+    # 2026-10-30 PR B：卡片不再附「确认开仓：<签名链接>」一行 —— /c/{pid} 确认页
+    # 已随人工确认/补录流退役（执行器自动开仓后它再无入口），留着就是死链。
+    # 提醒正文（入场/止损/风险/离场）逐字符不变：off/dry 逃生口仍要收到信号。
+    # position_id 保留在签名里：调用点与测试不用改，将来要挂「查看记录」链接还用得上。
     return "\n".join(lines)
-
-
-def validate_stop_side(side: int, entry: float, stop: float) -> Optional[str]:
-    """校验止损价在正确一侧：做多必须低于入场、做空必须高于入场。返回错误文案或 None。
-
-    确认流里用户手填的止损价必须过这一关——做空填成下方止损会静默污染 R 统计，
-    而且实盘上那个止损单方向是反的（等于没有保护）。
-    """
-    if side == 1 and stop >= entry:
-        return f"做多的止损价必须低于入场价（你填的是 入场 {entry:,.2f} / 止损 {stop:,.2f}）"
-    if side == -1 and stop <= entry:
-        return f"做空的止损价必须高于入场价（你填的是 入场 {entry:,.2f} / 止损 {stop:,.2f}）"
-    return None
-
-
-def review_fill(cfg, symbol: str, suggested_entry: float, suggested_contracts: int,
-                entry: float, stop: float, contracts: int, source: str = "contracts",
-                equity: Optional[float] = None, side: Optional[int] = None,
-                target_risk_u: Optional[float] = None) -> dict:
-    """确认开仓后按**真实成交**做一次风险体检（纯计算，不落库）。
-
-    为什么需要：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额
-    （N = 风险U ÷ 止损距离）。用户晚入场时成交价会漂，同一批张数的
-    止损距离与实际风险就都变了：
-
-    - 做空晚入场（价格已涨）→ 止损更近、风险变小、更容易被噪音扫掉；
-    - 做多晚入场（价格已跌）→ 止损更远、**实际风险超过目标**。
-
-    所以必须在成交后回算一次并把偏差讲清楚，而不是让用户以为
-    「填了提醒里的金额 = 风险就是 2%」。
-
-    `equity`：这行的**下单基数**（positions.equity_at_entry；HL 仓由执行器写回
-    实际生效基数，MEXC 行是建行时的配置值）。不传则退回 `cfg.equity`（行为不变）。
-
-    `side`：这行的方向（+1/-1）。传了才会按「空单风险减半」折算目标风险 ——
-    否则体检会把一笔**本来就该只有一半风险**的空单判成「偏离目标 -50%」，还会
-    建议你「要正好 20U 就该开双倍张数」，那正是这个开关要防的事。
-    不传（老脚本/测试）按多单口径 ⇒ 不折算 ⇒ 与改动前完全一致。
-
-    `target_risk_u`：这一行**建行时**的计划风险额（`positions.risk_u`）。传了就直接
-    用它当目标，不再按「当前配置 × 当前开关」现算。
-    为什么必须能传：开关是**可随时改的**，「建行」与「确认」之间用户可能切换开关
-    （半额空单建好 → 关开关再确认；或全额空单建好 → 开开关再确认）。用现算口径会
-    拿新的政策去审一笔按旧政策下的单：
-      - 全额仓（20U）+ 开关开 → 目标算成 10U → 判「偏离 +102%」并建议「只开 41 张」
-        → 用户照做就把一个正常的满额空单砍成半额；
-      - 半额仓（10U）+ 开关关 → 目标算成 20U → 判「-50%」并建议「开双倍」。
-    这条路径（main.confirm_post）永远传它；不传（老脚本）保持原有现算行为。
-    """
-    contract_size = CONTRACT_SPECS[symbol][0]
-    m = sizing_metrics(symbol, entry, stop, contracts, cfg.leverage)
-    base = float(equity) if equity else cfg.equity
-    planned = None
-    try:
-        planned = float(target_risk_u) if target_risk_u is not None else None
-    except (TypeError, ValueError):
-        planned = None
-    # 建行时的计划风险是唯一事实来源（>0 才可信，0/脏值退回现算口径）
-    target = planned if (planned is not None and planned > 0) else \
-        base * effective_risk_pct(cfg.risk_pct, 1 if side is None else side,
-                                  getattr(cfg, "short_risk_half", False))
-    drift = (entry - suggested_entry) / suggested_entry if suggested_entry else 0.0
-    notes: List[str] = []
-
-    if abs(drift) >= 0.005:
-        notes.append(
-            f"成交价 {entry:,.2f} 比信号价 {suggested_entry:,.2f} "
-            f"{'高' if drift > 0 else '低'} {abs(drift) * 100:.2f}%"
-            f"（信号价是提醒那一刻的参考价，偏差来自延迟入场）")
-
-    if not (cfg.stop_min - 1e-9 <= m["stop_dist"] <= cfg.stop_max + 1e-9):
-        notes.append(
-            f"止损距离 {m['stop_dist'] * 100:.2f}% 已超出 {cfg.stop_min * 100:g}%~"
-            f"{cfg.stop_max * 100:g}% 的验证区间 —— 这笔的风险几何与回测口径不一致")
-
-    dev = (m["risk_u"] - target) / target if target else 0.0
-    if abs(dev) >= 0.2:
-        notes.append(
-            f"实际风险 {m['risk_u']:.1f}U（基数 {base:,.0f}U 的 "
-            f"{m['risk_u'] / base * 100:.1f}%）偏离目标 {target:.0f}U {dev * 100:+.0f}%")
-        if m["risk_unit"] > 0:
-            want = int(target / (m["risk_unit"] * contract_size))
-            cap = int((target / cfg.stop_min) / entry / contract_size) if entry > 0 else 0
-            extra = (f"；止损距离低于 {cfg.stop_min * 100:g}% 下限，"
-                     f"系统名义上限（风险U/下限）只能到 {cap} 张，超了就是隐性加杠杆"
-                     if want > cap else "")
-            notes.append(f"若要正好 {target:.0f}U 风险应开 {want} 张（本次 {contracts} 张）{extra}")
-
-    if source == "amount" and suggested_contracts and contracts < suggested_contracts * 0.6:
-        notes.append(
-            f"按金额换算出的 {contracts} 张明显少于建议 {suggested_contracts} 张 —— 核对一下"
-            f"填的是不是成交记录里的『成交金额（仓位价值）』；保证金 × {cfg.leverage:.0f} 才是名义")
-
-    return {"level": "warn" if notes else "ok", "notes": notes, "contracts": contracts,
-            "source": source, "entry": entry, "stop": stop, "drift": drift,
-            "target_risk_u": target, "equity": base, **m}
-
-
-def regime_note(side: int, price: float, ma200: float) -> dict:
-    """确认页的 MA200 提示（短文案）。
-
-    做空有趋势过滤（信号 bar 收盘 < MA200）：若成交前价格已回到 MA200 上方，
-    过滤条件事实上已失效 —— 历史统计这类做空均R −0.26（n=44）、胜率 25%。
-    做多没有这条过滤，只在价格跌破 MA200 时提示「质量偏弱」（历史仍为正期望）。
-    """
-    if ma200 <= 0:
-        return {"level": "muted", "text": ""}
-    dev = (price / ma200 - 1) * 100
-    if side == -1:
-        if price > ma200:
-            return {"level": "warn",
-                    "text": f"⚠️ 当前价 {price:,.0f} 在 MA200 上方 {dev:+.2f}% —— 做空趋势过滤已失效"}
-        return {"level": "ok", "text": f"当前价 {price:,.0f} 在 MA200 下方 {dev:+.2f}%（过滤成立）"}
-    if price < ma200:
-        return {"level": "warn",
-                "text": f"⚠️ 当前价 {price:,.0f} 在 MA200 下方 {dev:+.2f}% —— 做多趋势质量偏弱"}
-    return {"level": "ok", "text": f"当前价 {price:,.0f} 在 MA200 上方 {dev:+.2f}%（趋势配合）"}
 
 
 def format_missed(cfg, sig: strategy.Signal, executor_managed: bool = False) -> str:
@@ -346,17 +210,20 @@ def format_exit(cfg, pos: PositionState, exit_price: float, reason: str, bar_ms:
     # 止损是**交易所已成交**的事件，不能再说「4 小时内市价平仓」——照做等于反手开新仓。
     if reason == "stop":
         head = "止损补报" if stale else "止损提醒"
-        advice = (f"止损单应已在交易所触发（{pos.close_side}）：到 MEXC 核对持仓已平、无残留委托；"
-                  f"实际成交价与止损价不同就在确认页填真实平仓价")
+        # 2026-10-30 PR B：原文「实际成交价与止损价不同就在确认页填真实平仓价」指向
+        # 已退役的 /c/{pid} 确认页（死指引），改为指向面板「记录」页的 hl_fills ——
+        # 那里才是真实成交价的唯一事实来源。余下文案逐字符不变。
+        advice = (f"止损单应已在交易所触发（{pos.close_side}）：到交易所核对持仓已平、无残留委托；"
+                  f"实际成交价与止损价不同就按面板「记录」页的 hl_fills 核对")
     else:
         head = "⚠️ 补报·若还没平仓请立即市价平仓" if stale else "离场提醒"
         advice = f"建议：4 小时内市价平仓（{pos.close_side}）；平仓后确认委托列表已空（撤掉残留止损单）"
+    # 2026-10-30 PR B：不再附「确认平仓：<签名链接>」一行（确认页已退役，死链）。
     return "\n".join([
         f"{cfg.alert_prefix}{pos.symbol} {pos.action_label} {head}（{fmt_bar_close(bar_ms)} {TZ_LABEL}收盘）",
         f"原因：{why}",
         f"参考离场价：{fmt_money(exit_price)}（本次约 {r:+.2f}R，持仓约 {bars_held * 4} 小时）",
         advice,
-        f"确认平仓：{confirm_url(cfg, position_id, 'close')}",
     ])
 
 

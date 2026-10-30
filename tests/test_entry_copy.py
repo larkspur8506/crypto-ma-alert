@@ -77,8 +77,7 @@ MANUAL_ENTRY = "\n".join([
     "止盈：不设",
     "风险：20.0U（权益 1,000U × 2%），保证金(5x) 17U",
     "离场：收到本系统提醒后 4 小时内市价平仓",
-    "确认开仓：https://ma.example.com/c/7?a=view&t=7bcaf67ba67b0cf70145b1019e74376c",
-])
+])   # 2026-10-30 PR B：末行「确认开仓：<签名链接>」随确认页退役一并删除
 
 MISSED_TAIL_MANUAL = "该信号已超过一根 4h，入场价已变、风险几何失效，不建议追。仅作记录。"
 MISSED_TAIL_MANAGED = "该信号已超过一根 4h，入场价已变、风险几何失效，系统不会自动追补。仅作记录。"
@@ -119,7 +118,6 @@ class TestManagedEntryCopy(unittest.TestCase):
             "止损单：计划委托，触发价 80,600，卖出平仓，触发参考=最新成交价",
             "止盈：不设",
             "风险：单笔 2.00% 权益（实际以 HL 开仓回报为准）",
-            "确认开仓：https://ma.example.com/c/7?a=view&t=7bcaf67ba67b0cf70145b1019e74376c",
         ])
 
     def test_manual_exit_advice_not_present(self):

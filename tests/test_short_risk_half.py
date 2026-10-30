@@ -409,69 +409,6 @@ class TestExecutorBelowMinimum(_ExecutorHarness):
         self.assertNotEqual(inst.orders("entry")[0]["status"], "skipped")
 
 
-# ================================================================ 确认页风险体检
-class TestReviewFillTarget(unittest.TestCase):
-    """确认开仓后的「风险体检」目标值也必须按生效后口径算。
-
-    否则一笔本来就该只有一半风险的空单会被判成「偏离目标 -50%」，还会建议
-    「要正好 20U 就开双倍张数」—— 那正是这个开关要防的事。
-    """
-
-    def test_short_target_uses_effective_pct(self):
-        c = cfg(short_risk_half=True)
-        # 42 张 × 0.0001 × 2400U = 10.08U ≈ 1000U×1%
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 42, 83_000.0, 85_400.0, 42,
-                                 "contracts", side=-1)
-        self.assertAlmostEqual(rev["target_risk_u"], 10.0, places=6)
-        self.assertEqual(rev["notes"], [], "半额空单不该被判成偏离目标")
-
-    def test_long_target_unchanged(self):
-        c = cfg(short_risk_half=True)
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 84, 83_000.0, 80_600.0, 84,
-                                 "contracts", side=1)
-        self.assertAlmostEqual(rev["target_risk_u"], 20.0, places=6)
-        self.assertEqual(rev["notes"], [])
-
-    def test_switch_off_matches_old_target(self):
-        c = cfg(short_risk_half=False)
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 84, 83_000.0, 85_400.0, 84,
-                                 "contracts", side=-1)
-        self.assertAlmostEqual(rev["target_risk_u"], 20.0, places=6)
-
-    def test_no_side_keeps_pre_change_behaviour(self):
-        """不传 side（老脚本/测试）⇒ 按多单口径 ⇒ 与改动前完全一致。"""
-        c = cfg(short_risk_half=True)
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 42, 83_000.0, 85_400.0, 42,
-                                 "contracts")
-        self.assertAlmostEqual(rev["target_risk_u"], 20.0, places=6)
-
-    def test_target_risk_u_wins_over_current_config(self):
-        """H1：建行时的计划风险优先于「当前配置 × 当前开关」（混合态修法）。
-
-        开关是可随时改的，建行与确认之间切换过就会出现「旧政策下的单 + 新政策
-        的目标」—— 那不是用户的问题，不能让体检把这种单说成下错了。
-        """
-        c = cfg(short_risk_half=True)          # 现在开着
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 84, 83_000.0, 85_400.0, 84,
-                                 "contracts", side=-1, target_risk_u=20.16)   # 建行时全额
-        self.assertAlmostEqual(rev["target_risk_u"], 20.16, places=6)
-        self.assertEqual(rev["notes"], [])
-        c = cfg(short_risk_half=False)         # 现在关着
-        rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 42, 83_000.0, 85_400.0, 42,
-                                 "contracts", side=-1, target_risk_u=10.08)   # 建行时半额
-        self.assertAlmostEqual(rev["target_risk_u"], 10.08, places=6)
-        self.assertEqual(rev["notes"], [])
-
-    def test_target_risk_u_dirty_falls_back_to_computed(self):
-        """None / 0 / 负数 / 非数字 → 退回现算口径（老行 risk_u 可能是 NULL）。"""
-        c = cfg(short_risk_half=True)
-        for bad in (None, 0, -1, "abc"):
-            rev = engine.review_fill(c, "BTC_USDT", 83_000.0, 42, 83_000.0, 85_400.0, 42,
-                                     "contracts", side=-1,
-                                     target_risk_u=bad)          # type: ignore[arg-type]
-            self.assertAlmostEqual(rev["target_risk_u"], 10.0, places=6, msg=repr(bad))
-
-
 # ================================================================ 2/读路径
 # 2026-10-30 面板精简：开关页与 /admin/switch/strategy 已删除，「空单风险减半」在页面
 # 上不再有旋钮（连同影响预览一起删）。DB 里的值照旧生效 —— 这条钉住读路径没被删坏。
@@ -515,7 +452,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：20.0U（权益 1,000U × 2%），保证金(5x) 86U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),
     ("BTC_USDT", 1): dict(
         contracts=36918, coin_qty=3.6918,
@@ -532,7 +468,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：20.0U（权益 1,000U × 2%），保证金(5x) 100U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),
     ("ETH_USDT", -1): dict(
         contracts=344, coin_qty=3.44,
@@ -549,7 +484,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：20.0U（权益 1,000U × 2%），保证金(5x) 85U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),
     ("ETH_USDT", 1): dict(
         contracts=369, coin_qty=3.69,
@@ -566,7 +500,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：20.0U（权益 1,000U × 2%），保证金(5x) 100U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),
     ("SOL_USDT", -1): dict(
         contracts=34, coin_qty=3.4000000000000004,
@@ -583,7 +516,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：19.7U（权益 1,000U × 2%），保证金(5x) 84U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),
     ("SOL_USDT", 1): dict(
         contracts=36, coin_qty=3.6,
@@ -600,7 +532,6 @@ GOLDEN_OFF = {
             '止盈：不设',
             '风险：19.5U（权益 1,000U × 2%），保证金(5x) 97U',
             '离场：收到本系统提醒后 4 小时内市价平仓',
-            '确认开仓：https://x/c/1?a=view&t=15af320d603a5bcc52d3e505fd5d8aad',
         ])),}
 
 
@@ -611,10 +542,9 @@ class TestOffGoldenMatrix(unittest.TestCase):
     """
 
     def _cfg(self):
-        c = cfg()                       # equity 1000 / risk_pct 2% / 5x / stop 1.5%~10%
-        c.token_secret = "s"            # 与跨树 diff 脚本同一套固定外部输入
-        c.base_url = "https://x"
-        return c
+        # equity 1000 / risk_pct 2% / 5x / stop 1.5%~10%
+        # （PR B：token_secret / base_url 原用于钉确认链接签名，链接删掉后不再需要）
+        return cfg()
 
     def _run(self, symbol, side, half=False):
         bars, ind, sq, i = _short_setup() if side == -1 else _long_setup()
@@ -640,7 +570,7 @@ class TestOffGoldenMatrix(unittest.TestCase):
                                    ("entry_price", "entry"), ("stop_price", "stop")):
                     self.assertAlmostEqual(getattr(o, field), g[key], places=9,
                                            msg=f"{symbol}/{side}:{field}")
-                # 提醒卡文案全文（含确认链接签名：token_secret / base_url / pid 固定）
+                # 提醒卡文案全文（PR B：末行确认链接已删，其余逐字符钉住）
                 self.assertEqual(engine.format_entry(c, ev.sig, o, 1), g["text"])
 
     def test_matrix_really_distinguishes_the_switch(self):
@@ -653,107 +583,6 @@ class TestOffGoldenMatrix(unittest.TestCase):
             with self.subTest(symbol=symbol):
                 _c, ev = self._run(symbol, 1, half=True)          # 多单永不变
                 self.assertEqual(ev.order.contracts, GOLDEN_OFF[(symbol, 1)]["contracts"])
-
-
-# ================================================================ H1 混合态（真链路）
-try:
-    from fastapi.testclient import TestClient as _TestClient
-except ImportError:                       # pragma: no cover - fastapi 未装
-    _TestClient = None
-
-
-@unittest.skipIf(_TestClient is None, "fastapi 未安装")
-class TestConfirmPostMixedState(unittest.TestCase):
-    """H1：**建行与确认之间切换开关**，体检目标必须还是建行时的计划风险。
-
-    走 main.confirm_post 全链路，因为「参数没被传进去」是单测测不出来的：只测
-    engine.review_fill(target_risk_u=...) 的话，删掉 main.py 那行接线照样绿，
-    线上却继续拿新政策去审旧单 —— 全额空单被判「+102%，应开 41 张」，或半额
-    空单被判「-50%，应开双倍」。两个方向都是反向建议，所以两个方向各钉一条。
-    """
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="mixed_")
-        self._env = {k: os.environ.get(k) for k in
-                     ("DB_PATH", "ENABLE_SCHEDULER", "TOKEN_SECRET", "BASE_URL",
-                      "DRY_RUN", "SHORT_RISK_HALF")}
-        os.environ.update({"DB_PATH": os.path.join(self.tmp, "mixed.db"),
-                           "ENABLE_SCHEDULER": "false",
-                           "TOKEN_SECRET": "mixed-secret",
-                           "BASE_URL": "https://mixed.example",
-                           "DRY_RUN": "true"})
-        os.environ.pop("SHORT_RISK_HALF", None)
-        import app.main as main_mod
-        self.mod = importlib.reload(main_mod)
-        # 不依赖进程级 env 的读取时序（app.config 早已被别的用例导入过）
-        self.mod.config.token_secret = "mixed-secret"
-        self.mod.config.base_url = "https://mixed.example"
-        self.db = self.mod.db
-
-    def tearDown(self):
-        try:
-            self.db.conn.close()
-        except Exception:                                              # noqa: BLE001
-            pass
-        for k, v in self._env.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-        import shutil
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    # ---- 夹具
-
-    def _pending_short(self, contracts, risk_u, bar_ms):
-        """建行时写入的**计划**口径：contracts 张 / risk_u 计划风险。"""
-        return self.db.create_position(
-            symbol="BTC_USDT", signal_bar_ms=bar_ms, side=-1,
-            entry_price=83_000.0, stop_price=85_400.0, stop_dist=0.0289,
-            contracts=contracts, coin_qty=contracts * 0.0001,
-            notional=contracts * 0.0001 * 83_000.0, risk_u=risk_u,
-            equity_at_entry=1000.0)
-
-    def _confirm(self, pid, contracts):
-        tok = engine.sign_token(self.mod.config.token_secret, pid, "open")
-        with _TestClient(self.mod.app) as c:
-            return c.post(f"/c/{pid}", data={
-                "a": "open", "t": tok, "actual_entry": "83000", "fill_amount": "",
-                "actual_contracts": str(contracts), "actual_stop": "85400",
-                "stop_placed": "1"})
-
-    # ---- 两个方向
-
-    def test_full_size_row_then_switch_on_is_not_told_to_halve(self):
-        pid = self._pending_short(84, 20.16, 1_791_900_000_000)   # 建行时开关=关（全额）
-        self.db.set_config("short_risk_half", 1)                  # 确认前把开关打开
-        r = self._confirm(pid, 84)
-        self.assertEqual(r.status_code, 200)
-        self.assertNotIn("偏离目标", r.text, "全额空单不该被按半额目标审判")
-        self.assertNotIn("+102%", r.text)
-        self.assertNotIn("若要正好", r.text, "不能建议把满额空单砍成半额")
-        self.assertIn("与目标一致", r.text)
-
-    def test_half_row_then_switch_off_is_not_told_to_double(self):
-        pid = self._pending_short(42, 10.08, 1_791_900_400_000)   # 建行时开关=开（半额）
-        self.db.set_config("short_risk_half", 0)                  # 确认前把开关关掉
-        r = self._confirm(pid, 42)
-        self.assertEqual(r.status_code, 200)
-        self.assertNotIn("偏离目标", r.text, "半额空单不该被按全额目标审判")
-        self.assertNotIn("-50%", r.text)
-        self.assertNotIn("若要正好", r.text, "不能建议开双倍张数")
-        self.assertIn("与目标一致", r.text)
-
-    def test_target_comes_from_the_row_not_from_current_config(self):
-        """反证接线：同一行按 84 张确认，计划风险 20.16U —— 若目标被现算成 10U，
-        就会冒出「偏离目标」。这里额外把当前配置改成「无减半」，目标也不该变。"""
-        pid = self._pending_short(84, 20.16, 1_791_900_600_000)
-        self.db.set_config("short_risk_half", 0)
-        self.db.set_config("risk_pct", 0.05)        # 当前配置 5% → 现算会是 50U
-        r = self._confirm(pid, 84)
-        self.assertEqual(r.status_code, 200)
-        self.assertNotIn("若要正好", r.text)
-        self.assertIn("与目标一致", r.text)
 
 
 # ================================================================ 面板影响预览（M2）

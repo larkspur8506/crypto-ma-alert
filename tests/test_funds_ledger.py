@@ -8,7 +8,7 @@
 4. v_ledger union：手算 fixture 与视图逐行一致；fee_quote NULL 标注路径
 5. running balance：全量正序算完再切片，跨页余额连续；rows 10/20/50 联动
 6. 面板渲染：区块在记录页最前、对账行/「未归属」/「老数据缺手续费」可见、数字唯一
-7. 确认页 P3 文案：净盈亏与总成本并列、net_pnl 原值未被改动
+7. （已删除·PR B）确认页 P3 文案：随 /c/{pid} 确认页退役
 
 全部用临时 sqlite DB + 假 info，不触网、不碰生产库。
 """
@@ -643,74 +643,11 @@ class TestPanelRender(BaseCase):
         self.assertIn("读取失败", h)
 
 
-# ================================================================ 7. P3 确认页/持仓卡
-@unittest.skipUnless(_HAVE_FASTAPI, "fastapi 未安装")
-class TestConfirmPageP3(unittest.TestCase):
-    """/c 摘要页：HL 仓新增资金费两行；net_pnl 原口径原值不动。"""
-
-    def setUp(self):
-        self.tmp = tempfile.mkdtemp(prefix="funds_p3_")
-        os.environ["DB_PATH"] = os.path.join(self.tmp, "t.db")
-        os.environ["ENABLE_SCHEDULER"] = "false"
-        os.environ["ADMIN_TOKEN"] = "tok"
-        os.environ["TOKEN_SECRET"] = "sec"
-        os.environ["BASE_URL"] = "https://smoke.example"
-        os.environ["DRY_RUN"] = "true"
-        self.mod = importlib.import_module("app.main")
-        importlib.reload(self.mod)
-        self.db = self.mod.db
-        self.pid = _pos(self.db, opened=2000.0, closed=5000.0)
-        self.db.conn.execute(
-            "UPDATE positions SET hl_status='closed', net_pnl=0.96, pnl_source='fills'"
-            " WHERE id=?", (self.pid,))
-        self.db.conn.commit()
-        _fill(self.db, "t1", ts=2100, closed_pnl=0.0, fee_quote=0.02, dir_="Open Long")
-        _fill(self.db, "t2", ts=4900, closed_pnl=1.0, fee_quote=0.02, dir_="Close Long")
-        # 归集一条资金费给本仓（+0.05）+ 一条无持仓期的（不归集）
-        hl_funding.record_funding(self.db, [_ev(3000_000, usdc="0.05"),
-                                            _ev(9000_000, usdc="0.07")])
-        self.client = TestClient(self.mod.app)
-
-    def tearDown(self):
-        shutil.rmtree(self.tmp, ignore_errors=True)
-
-    def _get(self):
-        t = self.mod.engine.sign_token(self.mod.config.token_secret, self.pid, "view")
-        return self.client.get(f"/c/{self.pid}", params={"a": "view", "t": t})
-
-    def test_hl_row_shows_funding_net_and_cost(self):
-        r = self._get()
-        self.assertEqual(r.status_code, 200)
-        h = r.text
-        self.assertIn("本单资金费合计", h)
-        self.assertIn("+0.05 U", h)
-        self.assertIn("本单净盈亏（含手续费，不含资金费）", h)
-        self.assertIn("+0.96 U", h, "净盈亏 = net_pnl 原值")
-        self.assertIn("本单总成本（含资金费）", h)
-        self.assertIn("0.04 U", h, "总成本 = 手续费 0.04 + 资金费支出 0")
-
-    def test_net_pnl_in_db_untouched(self):
-        self._get()
-        row = self.db.position_by_id(self.pid)
-        self.assertAlmostEqual(row["net_pnl"], 0.96, "net_pnl 原口径一律不动")
-        self.assertEqual(row["pnl_source"], "fills")
-
-    def test_non_hl_row_has_no_funding_lines(self):
-        pid2 = _pos(self.db, symbol="ETH_USDT", opened=100.0, closed=200.0)
-        self.db.conn.execute("UPDATE positions SET hl_status=NULL WHERE id=?", (pid2,))
-        self.db.conn.commit()
-        t = self.mod.engine.sign_token(self.mod.config.token_secret, pid2, "view")
-        r = self.client.get(f"/c/{pid2}", params={"a": "view", "t": t})
-        self.assertEqual(r.status_code, 200)
-        self.assertNotIn("本单资金费合计", r.text, "非 HL 仓不加资金费行")
-
-    def test_no_funding_record_shown_honestly(self):
-        pid3 = _pos(self.db, symbol="SOL_USDT", opened=100.0, closed=200.0)
-        self.db.conn.execute("UPDATE positions SET hl_status='closed' WHERE id=?", (pid3,))
-        self.db.conn.commit()
-        t = self.mod.engine.sign_token(self.mod.config.token_secret, pid3, "view")
-        r = self.client.get(f"/c/{pid3}", params={"a": "view", "t": t})
-        self.assertIn("暂无资金费记录", r.text, "没有资金费记录就明说，不猜 0")
+# ================================================================ 7. P3 确认页（已删）
+# 2026-10-30 PR B：/c/{pid} 确认页退役，main._hl_funding_lines（P3 的「本单资金费合计 /
+# 本单总成本」两行）随页面一起删除，本节的四个渲染用例（HL 仓两行、net_pnl 原值不动、
+# 非 HL 仓不加行、无记录如实说）随之删除。资金费归集与 net_pnl 口径本身仍由第 1~6 节
+# 与执行器 §8 的用例锁住。
 
 
 # ================================================================ 8. 执行器挂点

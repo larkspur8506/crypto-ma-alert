@@ -280,30 +280,9 @@ if FastAPI is not None:
             self.assertRegex(html, r"<html lang='zh-CN'>(?! data-theme)")
 
 
+# 2026-10-30 PR B：TestConfirmPageTheme（/c 确认页随 cookie 走主题）随确认页删除；
+# page_shell / normalize_theme 的主题口径仍由上面 ThemeBase 的各用例锁住。
+
+
 if __name__ == "__main__":
     unittest.main()
-
-
-class TestConfirmPageTheme(ThemeBase):
-    """/c 确认页的主题 cookie（签名链接页，无登录态，主题跟 cookie 走）。"""
-
-    def _signed(self, pid=1, action="view"):
-        from app import engine as _e
-        return _e.sign_token("x", pid, action)
-
-    def test_summary_carries_request_and_theme(self):
-        # 渲染层单测（不 import app.main —— 它模块级建 DB，/app 不可写会炸）：
-        # page() 收到带 cookie 的 request 必须渲染出 data-theme。
-        import importlib
-        pm = importlib.import_module("app.ui_theme")
-        from fastapi import Request as _Req  # noqa: F401
-        class _FakeReq:
-            cookies = {"cma_theme": "light"}
-        html = pm.page_shell("light", "t", "<p>x</p>", head_extra="")
-        self.assertIn("data-theme='light'", html)
-        # page() 的 cookie 读取链路：main.page 依赖 _req_theme(request)，
-        # 用假 request 验证（不 import main，避免模块级 DB）。
-        import sys as _sys
-        _sys.modules.setdefault("app.main", None)  # 不触发
-        from app.ui_theme import normalize_theme as _nt
-        self.assertEqual(_nt(_FakeReq.cookies.get("cma_theme")), "light")

@@ -2,7 +2,7 @@
 
 七项逐项钉词面（铁律 6：断言看渲染 HTML，不看源码；铁律 7：/hl 与 /admin
 双入口各断言一遍 —— P1 复核教训）：
-0. 命名与头部：产品名「双均线交易台」+ 副题；title/webmanifest/确认页同步；
+0. 命名与头部：产品名「双均线交易台」+ 副题；title/webmanifest/面板同步；
    旧词面（crypto-ma-alert 管理面板 / Hyperliquid 执行器监控）渲染层整页 0 处。
 1. 挂单表按需渲染：正常态（每仓恰好一条 reduce-only 触发单）不渲染；孤儿/多单/
    非止损单/挂单不可信（fail-open）才渲染。

@@ -693,7 +693,7 @@ class TestM7AlertWordingFollowsKillState(FillCloseBase):
 
 
 class TestM8ExitReasonRendered(unittest.TestCase):
-    """M8：`exchange` 在摘要/确认页要显示中文（不能把英文枚举印给用户）。"""
+    """M8：`exchange` 必须显示中文（不能把英文枚举印给用户）。"""
 
     def test_exchange_label_and_wiring(self):
         from app import engine
@@ -702,11 +702,9 @@ class TestM8ExitReasonRendered(unittest.TestCase):
         # 未知值兜底原文（不许崩、也不许编一个看着像结论的词）
         self.assertEqual(engine._exit_reason_plain("weird_reason", 1), "weird_reason")
 
-        src = (Path(__file__).resolve().parent.parent / "app" / "main.py").read_text("utf-8")
-        self.assertNotIn("（{row['exit_reason']}）", src, "摘要页仍在直接印英文枚举")
-        self.assertNotIn("（{row['exit_reason']}，", src, "确认页仍在直接印英文枚举")
-        self.assertGreaterEqual(src.count("_exit_label(row)"), 2,
-                                "摘要页与确认页都要走 _exit_label")
+        # 2026-10-30 PR B：原三条源码断言钉的是 main.py 里摘要页/确认页的 _exit_label 接线，
+        # 确认页（含 _summary/_exit_label）已整段删除 —— 这里只剩「枚举 → 中文」的唯一来源
+        # （engine._exit_reason_plain）在上面被逐值钉住；面板侧的中文渲染由 panel 用例覆盖。
 
 
 if __name__ == "__main__":

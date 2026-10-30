@@ -138,7 +138,7 @@ class TestFormatEntryDegrade(unittest.TestCase):
         text = engine.format_entry(c, _sig(), None, 7)
         self.assertIn("做多信号", text)                 # 信号照出
         self.assertIn("已跳过张数建议", text)           # 张数段降级
-        self.assertIn("确认开仓", text)                 # 提醒不残缺
+        self.assertIn("止损单：计划委托", text)         # 提醒不残缺（PR B：确认链接行已删）
         self.assertNotIn("输入", text)                  # 不再给名义金额
         self.assertNotIn("风险：", text)                # 无法算风险/保证金
 

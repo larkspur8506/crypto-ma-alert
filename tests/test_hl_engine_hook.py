@@ -157,7 +157,8 @@ class TestEntryHook(Base):
         with mock.patch.object(engine, "walk", side_effect=stub):
             sent = engine.tick(self.db, self.cfg, self.notifier)
         self.assertEqual(len(sent), 1)
-        self.assertIn("确认开仓", sent[0])
+        self.assertIn("入场：市价", sent[0])            # 原提醒路径完好（PR B：无确认链接）
+        self.assertNotIn("/c/", sent[0])
 
     def test_exception_from_executor_does_not_break_tick(self):
         ex = FakeExecutor(boom=True)
@@ -186,7 +187,8 @@ class TestEntryHook(Base):
             sent = engine.tick(self.db, self.cfg, self.notifier, executor=ex)
 
         self.assertEqual(len(sent), 1, "人工操作卡必须照发（dry 不许吞信号）")
-        self.assertIn("确认开仓", sent[0])
+        self.assertIn("入场：市价", sent[0])            # 人工操作卡正文完好（PR B：无确认链接）
+        self.assertNotIn("/c/", sent[0])
         self.assertTrue(any("HL影子" in m for m in self.notifier.messages),
                         "应推送一条影子提醒，供逐条比对")
         # 影子期不发任何真实委托，仓位仍停在 pending 等人工确认

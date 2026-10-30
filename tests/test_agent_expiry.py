@@ -800,7 +800,7 @@ class TestFlattenClosesLocalPositions(Base):
         row = self.db.position_by_id(pid)
         self.assertEqual(row["status"], "closed", "本地仓位必须关账（H2）")
         self.assertEqual(row["exit_reason"], A.EXIT_REASON_EXPIRY)
-        self.assertEqual(row["auto_closed"], 1, "引擎自动关账 → 用户可在确认页覆盖真实价")
+        self.assertEqual(row["auto_closed"], 1, "引擎自动关账 → 真实价按「记录」页 hl_fills 核对")
         # exit_price 用实际成交均价（FakeExchange 回 limit_px）
         fill = [c for c in ex.calls if c[0] == "order"][0][4]
         self.assertAlmostEqual(float(row["exit_price"]), float(fill), places=6)

@@ -85,26 +85,6 @@ class TestShortRMultiple(unittest.TestCase):
         self.assertAlmostEqual(sum(rs), 2.0, places=6)
 
 
-class TestStopSideValidation(unittest.TestCase):
-    """Bug 2 回归：确认流必须挡住方向填反的止损。"""
-
-    def test_long_stop_above_entry_rejected(self):
-        self.assertIsNotNone(engine.validate_stop_side(1, 100.0, 101.0))
-        self.assertIsNotNone(engine.validate_stop_side(1, 100.0, 100.0))
-
-    def test_short_stop_below_entry_rejected(self):
-        self.assertIsNotNone(engine.validate_stop_side(-1, 100.0, 99.0))
-        self.assertIsNotNone(engine.validate_stop_side(-1, 100.0, 100.0))
-
-    def test_valid_sides_pass(self):
-        self.assertIsNone(engine.validate_stop_side(1, 100.0, 97.0))
-        self.assertIsNone(engine.validate_stop_side(-1, 100.0, 103.0))
-
-    def test_error_message_mentions_side(self):
-        self.assertIn("做空", engine.validate_stop_side(-1, 100.0, 99.0))
-        self.assertIn("做多", engine.validate_stop_side(1, 100.0, 101.0))
-
-
 class TestShortStateMachine(unittest.TestCase):
     """做空从信号 → 落库 → 走 bar → 离场的完整链路。"""
 
@@ -211,13 +191,13 @@ class TestConfigOverrides(unittest.TestCase):
 
 
 class TestFillAmountAndRiskReview(unittest.TestCase):
-    """确认页：按成交金额换算张数 + 成交后风险体检（2026-10-13 首单暴露的缺口）。
+    """成交金额 → 张数换算 + 风险几何口径（首单真实数字）。
 
-    背景：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额，
-    用户晚入场时成交价漂了，同一批张数的止损距离与实际风险都会变。
-    这里锁住两件事：
-      1. 成交金额 → 张数 的换算（必须用实际成交金额，不是下单时的预览张数）；
-      2. review_fill 必须把「止损距离超出验证区间」「风险偏离目标」讲出来。
+    背景：提醒文案里的「输入 N USDT」是按**信号价**算的名义金额，用户晚入场时
+    成交价漂了，同一批张数的止损距离与实际风险都会变。这里锁住换算与 metrics 口径。
+
+    2026-10-30 PR B：本类原有的 review_fill（成交后风险体检）四个用例随 /c/{pid}
+    确认页一起删除 —— 体检只服务人工确认流，已无调用方。
     """
 
     def _cfg(self):
@@ -249,75 +229,6 @@ class TestFillAmountAndRiskReview(unittest.TestCase):
         self.assertAlmostEqual(m["coin_qty"], 0.0087, places=9)
         self.assertAlmostEqual(m["risk_u"], 10.01, places=1)
         self.assertAlmostEqual(m["stop_dist"], 0.01388, places=4)
-
-    def test_review_flags_late_short_entry(self):
-        """首单实测：做空晚 3h 入场，止损距离掉到 1.39%、风险只剩 1%。"""
-        cfg = self._cfg()
-        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 82909.3, 84060.0, 87, "amount")
-        self.assertEqual(rev["level"], "warn")
-        self.assertAlmostEqual(rev["risk_u"], 10.01, places=1)
-        self.assertLess(rev["stop_dist"], cfg.stop_min)
-        self.assertAlmostEqual(rev["drift"], 0.01340, places=4)
-        self.assertTrue(any("超出" in n for n in rev["notes"]), "必须报止损距离出区间")
-        self.assertTrue(any("偏离目标" in n for n in rev["notes"]), "必须报风险偏离")
-        self.assertTrue(any("应开" in n for n in rev["notes"]), "必须给出补正张数")
-
-    def test_review_clean_when_fill_matches_signal(self):
-        cfg = self._cfg()
-        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 89, "contracts")
-        self.assertEqual(rev["level"], "ok")
-        self.assertEqual(rev["notes"], [])
-
-    def test_review_flags_chasing_a_long(self):
-        """做多追高：入场价离止损更远 → 实际风险放大（危险侧）。"""
-        cfg = self._cfg()
-        rev = engine.review_fill(cfg, "BTC_USDT", 100000.0, 50, 102000.0, 96000.0, 50, "contracts")
-        self.assertEqual(rev["level"], "warn")
-        self.assertGreater(rev["risk_u"], 20.0)
-        self.assertGreater(rev["drift"], 0)
-        self.assertTrue(any("偏离目标" in n for n in rev["notes"]))
-
-    def test_review_flags_margin_filled_as_amount(self):
-        """把保证金当成成交金额填 → 张数只有建议的 1/杠杆，必须提示核对。"""
-        cfg = self._cfg()
-        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 17, "amount")
-        self.assertTrue(any("保证金" in n for n in rev["notes"]))
-
-    def test_review_skips_margin_hint_when_contracts_typed(self):
-        cfg = self._cfg()
-        rev = engine.review_fill(cfg, "BTC_USDT", 81812.8, 89, 81812.8, 84059.96, 17, "contracts")
-        self.assertFalse(any("保证金" in n for n in rev["notes"]))
-
-
-class TestRegimeNote(unittest.TestCase):
-    """确认页的 MA200 提示：做空在 MA200 上方要报警，做多只在跌破时提示质量偏弱。"""
-
-    def test_short_above_ma200_warns(self):
-        r = engine.regime_note(-1, 83281.1, 82055.0)
-        self.assertEqual(r["level"], "warn")
-        self.assertIn("做空趋势过滤已失效", r["text"])
-        self.assertIn("MA200 上方 +1.49%", r["text"])
-
-    def test_short_below_ma200_ok(self):
-        r = engine.regime_note(-1, 81000.0, 82055.0)
-        self.assertEqual(r["level"], "ok")
-        self.assertIn("过滤成立", r["text"])
-
-    def test_long_below_ma200_warns_softly(self):
-        r = engine.regime_note(1, 81000.0, 82055.0)
-        self.assertEqual(r["level"], "warn")
-        self.assertIn("做多趋势质量偏弱", r["text"])
-        self.assertNotIn("失效", r["text"])
-
-    def test_long_above_ma200_ok(self):
-        r = engine.regime_note(1, 83000.0, 82055.0)
-        self.assertEqual(r["level"], "ok")
-        self.assertIn("趋势配合", r["text"])
-
-    def test_missing_ma200_is_silent(self):
-        self.assertEqual(engine.regime_note(-1, 83000.0, 0.0)["text"], "")
-        self.assertEqual(engine.regime_note(1, 83000.0, 0.0)["text"], "")
-
 
 class TestStopExitAlertText(unittest.TestCase):
     """止损提醒不能说「4 小时内市价平仓」——那是交易所已成交的事件，照做等于反手开仓。"""

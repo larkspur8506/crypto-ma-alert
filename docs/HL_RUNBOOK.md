@@ -144,12 +144,12 @@ cat scripts/hl_live_smoke.py | ssh oracle1 'sudo -n docker exec -i crypto-ma-ale
 执行器的设计是「止损挂失败 → 立刻平仓」，所以出现裸奔仓位通常意味着**平仓也失败了**（如交易所不可达），此时人工介入。
 
 ### B. 对账 mismatch（`hl_events` 有「对账异常」）
-执行器会**自动 kill**（停止新开仓）。处理：① 用 §4 的 `clearinghouseState` 看真实仓位；② 与本地 `positions` 表核对；③ 人工把仓位与本地记录对齐（平掉多余的仓 / 在确认页补录）；④ 面板解除 kill 前，先确认 `hl_orders` 里没有卡在 `intent/sent` 的单。
+执行器会**自动 kill**（停止新开仓）。处理：① 用 §4 的 `clearinghouseState` 看真实仓位；② 与本地 `positions` 表核对；③ 人工把仓位与本地记录对齐（平掉多余的仓 / 到面板「记录」页按 `hl_fills` 核对后按 §6.H 直改库）；④ 面板解除 kill 前，先确认 `hl_orders` 里没有卡在 `intent/sent` 的单。
 
 #### 止损/人工已在交易所平仓（`hl_fill_close`，默认开）
 对账发现「本地有仓、交易所无仓」时，**先**用本轮已同步的 `hl_fills` 自证仓位已平：成交必须是开仓后（`opened_at−120s` 起）、`reduce_only`/`Close` 腿、合计数量落在「持仓量（`hl_sz`，回落 `actual_contracts`）± 1 tick」区间内（**低于** = 只平了一部分；**高于** = 窗口里混进了不属于这仓的成交，账不可归因）。全部满足才按**加权成交均价**关账（`exit_reason` = 全部成交出自 `hl_stop_oid` → `stop`，否则 `exchange`）、把对应挂单落 `filled`、推一条提醒，且**不** kill；任一条件不满足（无成交/数量不足或超额/精度不可知/oid 不明）完全退回旧行为（mismatch + kill）。
 `exit_reason=exchange`（人工/外部平掉，止损单没成交）时，执行器会顺手撤掉该 symbol 仍 `resting/sent` 的止损类挂单（`stop` / `stop:fix` / `exit:rehang`，只撤有明确 oid 的行）并落 `cancelled` —— 否则那张孤儿 reduce-only 单会把下一次开仓平掉。撤单失败：行保持 `resting` + `hl_events` 记 error + 推一条告警，需人工到 HL 撤单。
-该开关只能靠 DB 直改关掉（`hl_fill_close=0`，面板已无开关页；写法见 §6.H）：**两条路径一起**回到旧行为 —— 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效（mismatch 行直接让出接管权，引擎走人工提醒流）。关掉后止损成交只能人工补录，别指望 4h 收盘的 `on_exit` 代关。
+该开关只能靠 DB 直改关掉（`hl_fill_close=0`，面板已无开关页；写法见 §6.H）：**两条路径一起**回到旧行为 —— 对账不再按成交证据关账，`on_exit` 的「mismatch + stop」放行也一并失效（mismatch 行直接让出接管权，引擎走人工提醒流）。关掉后止损成交只能按 §6.H 直改 `positions` 行对齐（补录 UI 已随面板精简移除），别指望 4h 收盘的 `on_exit` 代关。
 两条容易踩的边界（对抗审查后收紧）：① **挂单落 `filled` 只认 oid 相等** —— 成交里没有 oid（升级前已同步的老成交恒为 NULL）时一行都不改，只记一条 `hl_events`（候选来自 `hl_recent_orders` 的跨 bar 扫描，「恰好一行」也可能是别的仓那张没成交的止损）；② `on_exit` 的止损关账**必须有 `Close` 腿**，只有开仓腿时 `_last_fill_px` 返回 `None`（不再拿开仓价冒充成交价）→ mismatch 行让出接管权、不关账；同一轮对账里一批成交只归一个仓（tid 已消耗即 fail-closed）。
 
 ### B2. 数量对账不一致（`hl_events` 有「数量对账」/「持仓数量对账不一致」）
@@ -232,7 +232,7 @@ strike，再解除 kill 即可。
 - 手工兜底：接口查不到同名授权时才用（`hl_agent_valid_until_ms`）。**页面已不提供「设置」入口**（防陈旧兜底值误平仓，资金路径类教训 #4），要设置走 §6.H 的 sqlite 一行；**清空**走总览「管理」卡里的「清除兜底」按钮（仅当库里有值时才渲染）。
 - 关掉自动清仓：DB 直改 `agent_expiry_cleanup=0`（写法见 §6.H；识别不了的值一律按「开」——漏清仓的代价比提前平仓大）。
 - 执行器处于 `off`（只提醒）时：不会清仓，面板状态显示「未自动清仓（执行器 off）」，并推一条「请自行决定是否手动处理」（7 天节流一次，不会每小时刷）。
-- **清完仓后恢复交易**：先续期并更新 API，再到面板总览「管理」卡解除 kill —— 清仓本身不清 kill（故意的）。**本地仓位已在清仓时自动关账（`exit_reason=agent_expiry_cleanup`、`auto_closed=1`），不需要手工改库**；对账不会再报 mismatch，解 kill 后不会被重新拉回去。若真实成交价与参考价有差异，到「记录」页按 `hl_fills` 核对，需要的话在确认页覆盖。
+- **清完仓后恢复交易**：先续期并更新 API，再到面板总览「管理」卡解除 kill —— 清仓本身不清 kill（故意的）。**本地仓位已在清仓时自动关账（`exit_reason=agent_expiry_cleanup`、`auto_closed=1`），不需要手工改库**；对账不会再报 mismatch，解 kill 后不会被重新拉回去。若真实成交价与参考价有差异，到「记录」页按 `hl_fills` 核对（确认页已于 2026-10-30 退役，需要改正按 §6.H 直改库）。
 
 
 ### H. 改参数 / 开关 / 模式 / 回撤峰值（面板已无入口）
@@ -270,6 +270,14 @@ PY'
 | 改单笔风险 | `risk_pct` | `0.02`（数字；`"0.02"` 也认 —— apply_db 两种都吃） |
 | 关掉记录页「净额（流水）」列 | `hl_pnl_from_fills` | `0` |
 | 关掉「交易所已平仓自动关账」 | `hl_fill_close` | `0` |
+
+修 `positions` 行（非 configuration 表，直接 UPDATE；id 从「记录」页取，`hl_fills` 是成交价唯一事实来源）：
+
+```sql
+UPDATE positions SET actual_entry=99.45, actual_stop=102.73 WHERE id=<pid>;
+```
+
+注意：直改只写所列字段、**不做任何风险重算**（`r_multiple` 等要调就连新值一起写明）。
 
 改完自检：`curl -s "$BASE/api/hl/status?k=$K" | python3 -m json.tool | head -20`（mode / kill
 与预期一致），再看面板总览「管理」卡的只读模式徽章。

@@ -129,9 +129,10 @@ def main() -> int:
     if row is None:
         print("✗ 第 1 轮没有产生仓位记录 —— 信号链路没走通")
         return 3
-    print(f"· 第 1 轮：产生仓位 #{row['id']}（status={row['status']}，待用户确认）")
+    print(f"· 第 1 轮：产生仓位 #{row['id']}（status={row['status']}，待确认）")
 
-    # 模拟用户确认（真实流程是点确认页；这里直接落库，等价于用户录入了成交）
+    # 模拟确认（live 下由执行器调 db.confirm_position 自动完成；本脚本直接落库
+    # 等价复现同一条写路径 —— 人工确认页已于 2026-10-30 PR B 移除）
     db.confirm_position(int(row["id"]), float(row["entry_price"]), int(row["contracts"]),
                         float(row["stop_price"]), True)
     print("· 模拟用户确认开仓（confirm_position）")

@@ -50,9 +50,9 @@ uvicorn app.main:app --port 8000
 | `STOP_MIN` / `STOP_MAX` | 止损距离过滤，默认 0.015 / 0.10 |
 | `ENABLE_LONG` / `ENABLE_SHORTS` | 是否允许做多 / 做空，默认都 true |
 | `SHORT_REGIME_MA` | 做空趋势过滤均线周期，默认 200；设 0 关闭过滤（**不建议**） |
-| `BASE_URL` | 确认链接的域名 |
+| `BASE_URL` | 站点根地址（**确认页已于 2026-10-30 退役，不再拼签名链接**；配置项保留供脚本/历史部署用） |
 | `ADMIN_TOKEN` | `/admin` 访问口令（`?k=<token>`） |
-| `TOKEN_SECRET` | 签名链接密钥 |
+| `TOKEN_SECRET` | 签名链接密钥（确认页退役后已无读者，保留只为兼容现有 compose 环境变量） |
 | `DRY_RUN` | `true` 时只打印不发送 |
 | `ENABLE_SCHEDULER` | `false` 时不起调度器（本地调试用） |
 
@@ -65,18 +65,18 @@ uvicorn app.main:app --port 8000
 幂等键 = `symbol + bar_open_ms + kind`，且**只在推送成功后才标记**（失败下次重试）。
 停机期间错过的信号会在下次 tick 补报：可交易的只有**最近一根已收盘 bar**，更早的发「错过的信号」提示。
 
-## 确认流（方案 B）
+## 人工确认流（2026-10-30 PR B 已退役）
 
-入场提醒里带一个签名链接（无需登录）：`/c/<id>?a=view&t=<hmac>`。点开后：
+旧版（方案 B）会在入场/离场提醒里带一个签名链接（`/c/<id>?a=view&t=<hmac>`），点开在网页上
+补录实际成交价 / 张数 / 止损并"确认开仓"。**执行器接管自动开仓后这条流再无入口**（pending 行
+由执行器在成交瞬间确认），所以整条流已删除：`GET`/`POST /c/{pid}`、签名 tok 生成/校验、
+成交后风险体检（`engine.review_fill`）与确认页渲染全部下线。
 
-- **实际成交价**（预填信号价）
-- **实际张数**（预填建议值）
-- **实际止损触发价**（预填 band 下沿）
-- **☑ 已挂止损单**
-- 按钮：按以上数值确认 / 未开仓·忽略
+现在核对真实成交只有一条路：**面板 →「记录」页**（`hl_fills` 成交 / `hl_orders` 下单），
+需要改正本地记录按 `docs/HL_RUNBOOK.md` §6.H 直改库。
 
-离场提醒同理带 `/c/<id>?a=close&t=...`，填实际平仓价 + 离场原因。
-未确认的仓位按假设值计入统计，周报会标注「未确认 N 笔」。
+仍保留的相关机制：pending 行超过 `PENDING_BARS_MAX` 根 4h 自动作废释放槽位（`db.ignore_position`），
+positions 的 pending → open → closed 状态机与 `/api/hl/*`、`/admin/tick` 接口一律未动。
 
 ## HL 自动执行（可选，默认关闭）
 
@@ -99,7 +99,7 @@ app/market.py     HL K 线（实盘主源，与下单同场所）+ 诊断降级�
 app/sizing.py     以损定仓 → MEXC 张数 / 名义 / 保证金 / 强平价
 app/engine.py     walk() 纯状态机 + 提醒文案 + tick + 心跳/周报（executor 钩子）
 app/notify.py     企业微信 + Telegram 双通道（重试 / 分段 / 成功后才去重）
-app/main.py       FastAPI + APScheduler + 确认页/HL 面板/面板路由装配
+app/main.py       FastAPI + APScheduler + 路由装配（/admin 面板、/hl、/api/hl/*、/admin/tick）
 app/hl/info.py       只读客户端（纯 stdlib，不需 SDK/私钥）
 app/hl/exchange.py   唯一 import 官方 SDK 的写路径（下单/撤单/杠杆/死手开关）
 app/hl/executor.py   状态机：闸门 → 意图 → 下单 → 挂止损 → 对账 → 熔断
