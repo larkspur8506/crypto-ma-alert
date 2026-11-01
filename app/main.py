@@ -534,6 +534,52 @@ def _job_hl_monitor() -> None:
     capture_panel_snapshot("monitor", with_why=False)
 
 
+#: MR 腿（feat/mr-leg）：最近一次 tick 的状态块（/api/hl/status 的 `mr` 字段来源）。
+_MR_STATUS: Dict[str, Any] = {}
+_mr_leg: Optional[Any] = None
+
+
+def _build_mr_leg() -> Optional[Any]:
+    """装配 HL MR 腿。mode=off / 无地址 / 装配失败 → None（纯提醒模式不跑 MR）。"""
+    p = hl_params()
+    if p.mode == "off" or not p.account_address:
+        return None
+    try:
+        from app.hl.exchange import HlExchange
+        from app.hl.mr import HlMrLeg
+        info = get_hl_info()
+        ex = HlExchange(account_address=p.account_address, private_key=p.private_key,
+                        base_url=p.base_url, dry_run=(p.mode == "dry"),
+                        max_slippage_pct=p.max_slippage_pct, info=info)
+        return HlMrLeg(db=db, info=info, exchange=ex,
+                       address_fn=lambda: hl_params().account_address,
+                       notifier=notifier)
+    except Exception as e:                                            # noqa: BLE001
+        logger.exception("装配 MR 腿失败: %s", e)
+        return None
+
+
+def _job_mr_tick() -> None:
+    """每 5 分钟：MR 腿 tick（挂 _tick_lock 与主策略串行；异常只记状态不外抛）。"""
+    global _mr_leg
+    with _tick_lock:
+        try:
+            if _mr_leg is None:
+                _mr_leg = _build_mr_leg()
+            if _mr_leg is None:
+                _MR_STATUS.clear()
+                _MR_STATUS.update({"enabled": False, "state": "mode_off",
+                                   "recon": "unknown", "error": ""})
+                return
+            _MR_STATUS.clear()
+            _MR_STATUS.update(_mr_leg.tick())
+        except Exception as e:                                        # noqa: BLE001
+            logger.exception("MR 腿 tick 异常: %s", e)
+            _MR_STATUS.clear()
+            _MR_STATUS.update({"state": "error", "recon": "unknown",
+                               "error": f"{type(e).__name__}: {e}"})
+
+
 def _job_heartbeat() -> None:
     cfg = current_config()
     text = engine.heartbeat_text(db, cfg)
@@ -621,6 +667,9 @@ async def lifespan(app: FastAPI):
         scheduler.add_job(_job_heartbeat, CronTrigger(hour=config.heartbeat_hour, minute=0), id="heartbeat")
         scheduler.add_job(_job_weekly, CronTrigger(day_of_week="mon", hour=config.heartbeat_hour, minute=5), id="weekly")
         scheduler.add_job(_job_hl_monitor, CronTrigger(minute="*/5"), id="hl_monitor",
+                          max_instances=1, coalesce=True)
+        # MR 腿（feat/mr-leg）：5 分钟一轮，错开 hl_monitor 30 秒避免同刻抢 CPU/锁
+        scheduler.add_job(_job_mr_tick, CronTrigger(minute="2-59/5"), id="mr_tick",
                           max_instances=1, coalesce=True)
         # API 钱包到期检查：每小时第 11 分（错开 tick 的 :03/:33 与 hl_monitor 的 5 分整）
         scheduler.add_job(_job_agent_expiry, CronTrigger(minute=11), id="agent_expiry",
@@ -745,6 +794,7 @@ def _hl_deps():
         address_fn=lambda: hl_params().account_address,
         mode_fn=hl_mode,
         base_url_fn=lambda: hl_params().base_url,
+        mr_fn=lambda: dict(_MR_STATUS) if _MR_STATUS else None,
     )
 
 
@@ -928,4 +978,19 @@ def admin_hl_kill(request: Request, on: str = Form("0"), k: str = Form("")):
             db.hl_log_event("kill", f"解除回撤熔断时重置基线失败：{type(e).__name__}: {e}")
     db.hl_set_kill(want, "人工" if want else "", origin="manual")
     db.hl_log_event("kill", f"人工{'触发' if want else '解除'} kill switch")
+    return RedirectResponse(f"/admin?tab=overview&k={_urlquote(str(k))}", status_code=303)
+
+
+@app.post("/admin/hl/mr")
+def admin_hl_mr(request: Request, on: str = Form("0"), k: str = Form("")):
+    """MR 腿开关（feat/mr-leg）。只挡新入场；持仓照常按信号离场。
+
+    默认停用（configuration `mr_enabled` 无值 = 停用）——首笔真单在人工核对
+    之前，这个开关就是 MR 腿的上线闸门。与 /admin/hl/kill 的关系：kill 挡
+    所有腿的新开仓（包括 MR）；本开关只管 MR 自己。
+    """
+    _require_admin(request, k or None)
+    want = on in ("1", "true", "on")
+    db.set_config("mr_enabled", "1" if want else "0")
+    db.hl_log_event("mr_admin", f"MR 腿人工{'启用' if want else '停用'}")
     return RedirectResponse(f"/admin?tab=overview&k={_urlquote(str(k))}", status_code=303)

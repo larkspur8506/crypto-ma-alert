@@ -99,6 +99,8 @@ class DashboardDeps:
     mode_fn: Callable[[], str]          # off | dry | live
     base_url_fn: Callable[[], str] = lambda: MAINNET_DEFAULT
     now_fn: Callable[[], float] = time.time
+    #: `() -> dict | None`，MR 腿状态块（app/hl/mr.py 的 tick() 返回值；main 是唯一 writer）。
+    mr_fn: Optional[Callable[[], Any]] = None
 
 
 # ---------------------------------------------------------------- 小工具
@@ -2337,7 +2339,17 @@ def build_router(deps: DashboardDeps) -> Any:
     def hl_status(request: Request, k: str = ""):
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-        return status_payload(deps)
+        payload = status_payload(deps)
+        # MR 腿状态块（feat/mr-leg）：独立于主策略，字段见 app/hl/mr.py 的 tick()。
+        # 读不到 = None（面板/聚合页显示「未知」，不冒充「正常」）。
+        if deps.mr_fn is not None:
+            try:
+                mr = deps.mr_fn()
+            except Exception:                                     # noqa: BLE001
+                mr = {"state": "error", "error": "mr status read failed"}
+            if mr:
+                payload["mr"] = mr
+        return payload
 
     @router.get("/api/hl/equity")
     def hl_equity(request: Request, k: str = ""):
