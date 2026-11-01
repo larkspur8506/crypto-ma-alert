@@ -22,6 +22,12 @@ from typing import List, Optional
 from app.hl import MODE_OFF, EV_HEARTBEAT
 from app.hl.info import HlInfoError
 
+
+def _brief(msg: object, limit: int = 120) -> str:
+    """异常/错误文本摘要：压掉换行与多余空白，超长截断加省略号。"""
+    s = " ".join(str(msg).split())
+    return s if len(s) <= limit else s[:limit] + "…"
+
 STUCK_ORDER_S = 180.0
 HEARTBEAT_MAX_S = 15 * 60
 CLOCK_SKEW_MAX_S = 2.0
@@ -136,7 +142,8 @@ def run_checks(db, cfg=None, info=None, mode: str = MODE_OFF, force: bool = Fals
     failed = [r for r in db.hl_recent_orders(100)
               if r["status"] == "failed" and float(r["created_at"]) >= since]
     if failed:
-        add(f"近 24h 有 {len(failed)} 条下单失败（最近：{failed[0]['error'] or '无错误信息'}）")
+        last_err = _brief(failed[0]["error"] or "无错误信息", 160)
+        add(f"近 24h 有 {len(failed)} 条下单失败（最近：{last_err}）")
     else:
         add("近 24h 无失败下单", ok=True)
 

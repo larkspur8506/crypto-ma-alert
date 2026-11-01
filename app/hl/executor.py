@@ -33,7 +33,8 @@ from app.hl import pnl as hl_pnl
 from app.hl import flows as hl_flows
 from app.hl import funding as hl_funding
 from app.hl import dd as hl_dd
-from app.hl.exchange import STATUS_DRY, STATUS_FILLED, STATUS_RESTING, make_cloid
+from app.hl.exchange import (STATUS_DRY, STATUS_FILLED, STATUS_RESTING, _clean_alert_text,
+                             make_cloid)
 from app.engine import DISPLAY_TZ, TZ_LABEL
 from app.hl.info import HlInfoError
 from app.sizing import effective_risk_pct
@@ -560,6 +561,7 @@ class Executor:
         main._retry_failed_alerts 会照常补推。
         """
         ok = False
+        text = _clean_alert_text(text)
         try:
             ok = bool(self.notifier is not None and self.notifier.send_message(text))
         except Exception as e:                                       # noqa: BLE001
