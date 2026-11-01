@@ -49,6 +49,10 @@ class HlMrConfig:
     min_notional: float = 10.0
     slippage_bps: int = 15              # IOC 限价的保护带宽（单边）
     candle_hours: int = 500             # 1h×500 ≈ 21 天会话
+    #: funding 基线（%名义/小时）。实测 2026-01-22~11-01 中位 0.0004%/h（3.5%/年）。
+    funding_baseline_pct_per_h: float = 0.0004
+    #: 即时止损触发器：成交滑点（|avg_px−ref|/ref）超过该 bp → 自动停用 MR 腿。
+    max_slippage_bps: float = 20.0
 
 
 def _round_px(px: float, sz_decimals: int) -> float:
@@ -101,8 +105,45 @@ class HlMrLeg:
         if self.notifier is not None:
             try:
                 self.notifier.send_message(clean)
-            except Exception as exc:                          # noqa: BLE001
-                logger.warning("mr: alert delivery failed: %s", exc)
+            except Exception:                                 # noqa: BLE001
+                logger.exception("MR 告警通知失败")
+
+    def _auto_disable(self, reason: str) -> None:
+        """即时止损触发器：写 mr_enabled=0（只挡新入场）+ 审计事件 + 告警。"""
+        try:
+            self.db.set_config("mr_enabled", "0")
+            self.db.hl_log_event(MR_EVENT_KIND, f"MR 腿自动停用：{reason}",
+                                 data={"enabled": False, "by": "auto", "reason": reason})
+        except Exception:                                     # noqa: BLE001
+            logger.exception("MR 自动停用写库失败")
+        self._alert(f"MR 腿自动停用：{reason}")
+
+    def _slippage_guard(self, result: dict, ref: float, *, side: str) -> None:
+        """成交价 vs 参考价的滑点超过 max_slippage_bps → 自动停用（触发器）。"""
+        try:
+            avg = result.get("avg_px")
+            if not avg or not ref or ref <= 0:
+                return
+            slip_bps = abs(float(avg) - ref) / ref * 10000.0
+            if slip_bps > self.config.max_slippage_bps:
+                self._auto_disable(f"{side}滑点 {slip_bps:.1f}bp > "
+                                   f"{self.config.max_slippage_bps:.0f}bp"
+                                   f"（ref={ref:.2f} avg={float(avg):.2f}）")
+        except Exception:                                     # noqa: BLE001
+            logger.exception("MR 滑点检查失败")
+
+    def _funding_guard(self, funding_pct: Optional[float], entry_ts: float,
+                       now_s: float) -> None:
+        """实际付出 funding 超过基线 2 倍（且绝对值 >0.01%）→ 自动停用（触发器）。"""
+        if funding_pct is None or funding_pct <= 0:
+            return
+        hours = max(now_s - entry_ts, 0.0) / 3600.0
+        expected = self.config.funding_baseline_pct_per_h * hours
+        if expected > 0 and funding_pct > 2.0 * expected and funding_pct > 0.01:
+            self._auto_disable(f"funding {funding_pct:.3f}% 超基线 2 倍"
+                               f"（预期 {expected:.3f}%，持仓 {hours:.1f}h）")
+
+    # ------------------------------------------------------------------ 入场
 
     # ------------------------------------------------------------------ 账户读数
 
@@ -305,6 +346,7 @@ class HlMrLeg:
             equity_at_entry=equity_total,
             raw={"ref_price": mark, "limit_px": limit_px, "cloid": cloid,
                  "result_status": str(result.get("status"))})
+        self._slippage_guard(result, mark, side="入场")
         status["state"] = "entered"
         status["last_fill_at"] = now / 1000.0
         self._alert(f"MR 入场：{cfg.coin} {sz} @≈{mark:.2f}"
@@ -380,6 +422,9 @@ class HlMrLeg:
             raw={"ref_price": mark, "limit_px": limit_px, "cloid": cloid,
                  "funding_paid_usdc": funding_paid, "fee_est": fee_est,
                  "result_status": str(result.get("status"))})
+        self._slippage_guard(result, mark, side="离场")
+        self._funding_guard(funding_pct, float(open_row["entry_ts"] or 0.0),
+                            now / 1000.0)
         status["state"] = "exited"
         status["last_fill_at"] = now / 1000.0
         self._alert(

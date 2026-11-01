@@ -74,7 +74,8 @@ class FakeInfo:
         return {"XYZ100": self.mid}
 
     def user_funding_history(self, address: str, start_ms: int, end_ms: int) -> list:
-        return [{"delta": {"type": "funding", "coin": "XYZ100", "usdc": "-0.25"}}]
+        return [{"delta": {"type": "funding", "coin": "XYZ100",
+                           "usdc": str(getattr(self, "funding_usdc", "-0.03"))}}]
 
 
 class FakeExchange:
@@ -201,12 +202,67 @@ class TestMrExit(unittest.TestCase):
             row = db.mr_recent_trades(1)[0]
             self.assertEqual(row["state"], "CLOSED")
             self.assertEqual(row["exit_signal_date"], "2026-04-17")
-            # funding = 0.25/249.24×100 ≈ 0.1003
-            self.assertAlmostEqual(row["funding_pct"], 0.1003, places=3)
-            # net = (95.5 − 93)×2.68 − 0.25 − 0.0009×(249.24 + 2.68×95.5)
+            # funding = 0.03/249.24×100 ≈ 0.0120（贴近 0.0004%/h × 30.5h 基线）
+            self.assertAlmostEqual(row["funding_pct"], 0.012037, places=4)
+            # net = (95.5 − 93)×2.68 − 0.03 − 0.0009×(249.24 + 2.68×95.5)
             fee = 0.0009 * (249.24 + 2.68 * 95.5)
-            self.assertAlmostEqual(row["net_pnl"], 6.7 - 0.25 - fee, places=3)
+            self.assertAlmostEqual(row["net_pnl"], 6.7 - 0.03 - fee, places=3)
             self.assertEqual(status["state"], "exited")
+
+
+class TestMrTriggers(unittest.TestCase):
+    """P3 对抗审核新增的即时止损触发器：滑点 >20bp、funding 超基线 2 倍 → 自动停用。"""
+
+    def test_entry_slippage_over_threshold_disables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            real_place = ex.place_order
+
+            def place(coin, is_buy, sz, limit_px, **kw):
+                res = real_place(coin, is_buy, sz, limit_px, **kw)
+                res["avg_px"] = limit_px * 1.005          # 50bp 滑点 > 20bp 阈值
+                return res
+
+            ex.place_order = place
+            _enable(db)
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "entered")   # 单照下、台账照记
+            self.assertEqual(db.get_config_str("mr_enabled", "1"), "0")
+
+    def test_entry_slippage_within_threshold_keeps_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            _enable(db)
+            leg.tick(now_ms=ENTRY_NOW_MS)                  # 默认 avg=limit → 15bp
+            self.assertEqual(db.get_config_str("mr_enabled", "1"), "1")
+
+    def test_funding_over_twice_baseline_disables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            info.funding_usdc = "-0.25"                    # 0.1003% >> 2×0.0122%
+            _enable(db)
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+                equity_at_entry=500.0)
+            status = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(status["state"], "exited")    # 离场本身完成
+            self.assertEqual(db.get_config_str("mr_enabled", "1"), "0")
+
+    def test_funding_near_baseline_keeps_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            _enable(db)
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0, margin=249.24,
+                equity_at_entry=500.0)
+            leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(db.get_config_str("mr_enabled", "1"), "1")
 
 
 class TestMrRecon(unittest.TestCase):
