@@ -52,6 +52,32 @@ def _coerce_cloid(cloid):
     return Cloid.from_str(txt)
 
 
+def _exc_text(exc: "BaseException | str", limit: int = 300) -> str:
+    """SDK 异常摘要：压成一行 + 截断；HTML 错误页只留标题。
+
+    交易所停机/维护窗口的 LB 会回整页 HTML，SDK 异常会把它原样带进
+    `str(exc)`——不清洗就会顺着 `error` 列进告警与看守推送。
+    """
+    text = " ".join(str(exc).split())
+    if "<html" in text.lower():
+        lower = text.lower()
+        title = ""
+        start = lower.find("<title>")
+        if start != -1:
+            end = lower.find("</title>", start)
+            if end != -1:
+                title = " ".join(text[start + len("<title>"):end].split())
+        text = f"HTML 错误页：{title}" if title else "HTML 错误页"
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _clean_alert_text(text: str, limit: int = 800) -> str:
+    """告警兜底：HTML 页只留标题，超长截断；正常多行文案原样不动。"""
+    if "<html" in text.lower():
+        return _exc_text(text)
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
 def _err(msg: str, raw: Any = None, status: str = STATUS_ERROR) -> dict:
     return {"ok": False, "status": status, "oid": None, "avg_px": None, "filled_sz": None,
             "error": msg, "raw": raw}
@@ -131,7 +157,7 @@ class HlExchange:
                                       account_address=self.account_address, timeout=self.timeout)
             return True
         except Exception as e:                                       # noqa: BLE001
-            self._init_error = f"初始化 SDK 失败：{e}"
+            self._init_error = _exc_text(f"初始化 SDK 失败：{e}")
             logger.error("[hl-exchange] %s", self._init_error)
             return False
 
@@ -174,7 +200,7 @@ class HlExchange:
         try:
             resp = self._exchange.update_leverage(int(leverage), coin, is_cross=bool(cross))
         except Exception as e:                                       # noqa: BLE001
-            return _err(f"update_leverage 异常：{e}")
+            return _err(f"update_leverage 异常：{_exc_text(e)}")
         if isinstance(resp, dict) and resp.get("status") == "ok":
             return _ok(STATUS_RESTING, raw=resp)
         return _err(str(resp)[:200], resp)
@@ -206,7 +232,7 @@ class HlExchange:
             resp = self._exchange.order(coin, bool(is_buy), float(sz), float(limit_px),
                                         order_type, reduce_only=bool(reduce_only), cloid=cloid_obj)
         except Exception as e:                                       # noqa: BLE001
-            return _err(f"下单异常：{e}")
+            return _err(f"下单异常：{_exc_text(e)}")
         out = parse_order_response(resp)
         out["request"] = {"coin": coin, "is_buy": is_buy, "sz": sz, "limit_px": limit_px,
                           "reduce_only": reduce_only, "order_type": order_type}
@@ -220,7 +246,7 @@ class HlExchange:
         try:
             resp = self._exchange.cancel(coin, int(oid))
         except Exception as e:                                       # noqa: BLE001
-            return _err(f"撤单异常：{e}")
+            return _err(f"撤单异常：{_exc_text(e)}")
         if isinstance(resp, dict) and resp.get("status") == "ok":
             return _ok(STATUS_RESTING, oid=oid, raw=resp)
         # 已经被成交/撤掉的单，撤单接口会报错 —— 对调用方来说等价于「不在场了」
@@ -231,7 +257,7 @@ class HlExchange:
         try:
             orders = [o for o in self.info.open_orders(self.account_address) if o.get("coin") == coin]
         except HlInfoError as e:
-            return _err(f"读取挂单失败，未撤任何单：{e}")
+            return _err(f"读取挂单失败，未撤任何单：{_exc_text(e)}")
         results = []
         for o in orders:
             results.append({"oid": o.get("oid"), "res": self.cancel(coin, int(o["oid"]))})
@@ -307,7 +333,7 @@ class HlExchange:
         try:
             resp = self._exchange.schedule_cancel(ts)
         except Exception as e:                                       # noqa: BLE001
-            return _err(f"schedule_cancel 异常：{e}")
+            return _err(f"schedule_cancel 异常：{_exc_text(e)}")
         if isinstance(resp, dict) and resp.get("status") == "ok":
             return _ok(STATUS_RESTING, raw={"scheduled_ms": ts, "resp": resp})
         return _err(str(resp)[:200], resp)
