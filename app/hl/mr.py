@@ -43,7 +43,10 @@ TAKER_FEE_RATE = 0.0009
 class HlMrConfig:
     """HL MR 腿参数。改动 = 改这里 + 走 PR（参数面刻意最小）。"""
 
-    coin: str = "XYZ100"
+    #: HIP-3 的 coin 全程用 **dex 限定名**：meta?dex=xyz 返回 `xyz:XYZ100`、
+    #  candleSnapshot/ordering 同名（裸名 candleSnapshot 直接 500，2026-11-01 部署
+    #  冒烟实测）。allMids 无此键 → _mark 自动走 K 线收盘回退，无需处理。
+    coin: str = "xyz:XYZ100"
     dex: str = "xyz"
     exposure: float = 0.5               # 名义 = 权益 × 0.5
     min_notional: float = 10.0

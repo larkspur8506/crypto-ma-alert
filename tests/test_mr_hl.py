@@ -59,13 +59,13 @@ class FakeInfo:
             return {"marginSummary": {"marginUsed": "0"}, "assetPositions": []}
         return {"marginSummary": {"marginUsed": "250"},
                 "assetPositions": [{"position": {
-                    "coin": "XYZ100", "szi": self.mr_szi, "entryPx": "93.0",
+                    "coin": "xyz:XYZ100", "szi": self.mr_szi, "entryPx": "93.0",
                     "positionValue": str(abs(float(self.mr_szi)) * self.mid),
                     "unrealizedPnl": "3.0",
                     "leverage": {"marginUsed": "250"}}}]}
 
     def perp_meta_dex(self, dex: str) -> list:
-        return [{"name": "XYZ100", "szDecimals": 2, "maxLeverage": "30"}]
+        return [{"name": "xyz:XYZ100", "szDecimals": 2, "maxLeverage": "30"}]
 
     def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
         return [r for r in CANDLES if start_ms <= r["t"] <= end_ms]
@@ -74,7 +74,7 @@ class FakeInfo:
         return {"XYZ100": self.mid}
 
     def user_funding_history(self, address: str, start_ms: int, end_ms: int) -> list:
-        return [{"delta": {"type": "funding", "coin": "XYZ100",
+        return [{"delta": {"type": "funding", "coin": "xyz:XYZ100",
                            "usdc": str(getattr(self, "funding_usdc", "-0.03"))}}]
 
 
@@ -133,7 +133,7 @@ class TestMrEntry(unittest.TestCase):
             order = ex.orders[0]
             self.assertTrue(order["is_buy"])
             self.assertFalse(order["reduce_only"])
-            self.assertEqual(order["coin"], "XYZ100")
+            self.assertEqual(order["coin"], "xyz:XYZ100")
             # 名义 = 500×0.5 = 250；mark = 93.0；sz = floor(250/93, 2) = 2.68
             self.assertEqual(order["sz"], 2.68)
             self.assertTrue(str(order["cloid"]).startswith("0x"))
