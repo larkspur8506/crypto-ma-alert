@@ -232,6 +232,39 @@ class DB:
 
     def _migrate(self) -> None:
         """轻量迁移：老库补新列（CREATE TABLE IF NOT EXISTS 不会改已存在的表）。"""
+        # MR（超跌反弹）腿台账（feat/mr-leg）：一个 signal_date 一行（唯一约束 = 幂等键），
+        # 状态 OPEN/CLOSED/SKIPPED；funding/净盈亏在平仓时回填。与 lighter-ma-bot 同构。
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS mr_trades (
+                id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_date        TEXT    NOT NULL,
+                entry_session      TEXT,
+                state              TEXT    NOT NULL CHECK (state IN ('OPEN','CLOSED','SKIPPED')),
+                side               INTEGER NOT NULL DEFAULT 1,
+                qty                REAL,
+                qty_int            INTEGER,
+                entry_price        REAL,
+                entry_order_id     TEXT,
+                entry_ts           REAL,
+                notional           REAL,
+                margin             REAL,
+                equity_at_entry    REAL,
+                exit_price         REAL,
+                exit_order_id      TEXT,
+                exit_ts            REAL,
+                exit_reason        TEXT,
+                exit_signal_date   TEXT,
+                funding_pct        REAL,
+                fee_quote          REAL,
+                net_pnl            REAL,
+                raw                TEXT,
+                created_at         REAL    NOT NULL,
+                updated_at         REAL    NOT NULL,
+                UNIQUE (signal_date)
+            )""")
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_mr_trades_state ON mr_trades(state)")
+        self.conn.commit()
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
         if "side" not in cols:
             self.conn.execute("ALTER TABLE positions ADD COLUMN side INTEGER NOT NULL DEFAULT 1")
@@ -790,7 +823,92 @@ class DB:
         sql += " ORDER BY ts ASC, id ASC"
         return list(self.conn.execute(sql, args))
 
+    # ------------------------------------------------------------------ MR 腿台账
+
     @_locked
+    def mr_open_trade(self) -> Optional[sqlite3.Row]:
+        """MR 腿当前持有的那一笔（state='OPEN'，单槽至多一行）。"""
+        return self.conn.execute(
+            "SELECT * FROM mr_trades WHERE state='OPEN' ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+
+    @_locked
+    def mr_trade_by_signal(self, signal_date: str) -> Optional[sqlite3.Row]:
+        return self.conn.execute("SELECT * FROM mr_trades WHERE signal_date=?",
+                                 (str(signal_date),)).fetchone()
+
+    @_locked
+    def mr_recent_trades(self, limit: int = 10) -> List[sqlite3.Row]:
+        return list(self.conn.execute(
+            "SELECT * FROM mr_trades ORDER BY id DESC LIMIT ?", (int(limit),)))
+
+    @_locked
+    def mr_record_entry(self, *, signal_date: str, entry_session: str, qty: float,
+                        qty_int: int, entry_price: Optional[float],
+                        entry_order_id: Optional[str], entry_ts: float,
+                        notional: Optional[float], margin: Optional[float],
+                        equity_at_entry: Optional[float],
+                        raw: Optional[Dict[str, Any]] = None) -> int:
+        """写一笔 OPEN 台账行。`signal_date` 唯一约束 = 幂等键：重复调用原样返回已有 id。"""
+        existing = self.conn.execute("SELECT id FROM mr_trades WHERE signal_date=?",
+                                     (str(signal_date),)).fetchone()
+        if existing is not None:
+            return int(existing["id"])
+        cur = self.conn.execute(
+            "INSERT INTO mr_trades(signal_date, entry_session, state, side, qty, "
+            "qty_int, entry_price, entry_order_id, entry_ts, notional, margin, "
+            "equity_at_entry, raw, created_at, updated_at) "
+            "VALUES(?,?, 'OPEN', 1, ?,?,?,?,?,?,?,?,?,?,?)",
+            (str(signal_date), str(entry_session), float(qty), int(qty_int),
+             None if entry_price is None else float(entry_price),
+             None if entry_order_id is None else str(entry_order_id),
+             float(entry_ts), None if notional is None else float(notional),
+             None if margin is None else float(margin),
+             None if equity_at_entry is None else float(equity_at_entry),
+             json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
+             if raw is not None else None,
+             now(), now()))
+        self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    @_locked
+    def mr_mark_skipped(self, signal_date: str, reason: str) -> int:
+        """信号被放弃（超窗口/数值不足等）。已有行则原样返回。"""
+        existing = self.conn.execute("SELECT id FROM mr_trades WHERE signal_date=?",
+                                     (str(signal_date),)).fetchone()
+        if existing is not None:
+            return int(existing["id"])
+        cur = self.conn.execute(
+            "INSERT INTO mr_trades(signal_date, state, exit_reason, created_at, "
+            "updated_at) VALUES(?, 'SKIPPED', ?, ?, ?)",
+            (str(signal_date), str(reason), now(), now()))
+        self.conn.commit()
+        return int(cur.lastrowid or 0)
+
+    @_locked
+    def mr_close_trade(self, trade_id: int, *, exit_price: float,
+                       exit_order_id: Optional[str], exit_ts: float,
+                       exit_reason: str, exit_signal_date: Optional[str],
+                       funding_pct: Optional[float], fee_quote: Optional[float],
+                       net_pnl: Optional[float],
+                       raw: Optional[Dict[str, Any]] = None) -> None:
+        self.conn.execute(
+            "UPDATE mr_trades SET state='CLOSED', exit_price=?, exit_order_id=?, "
+            "exit_ts=?, exit_reason=?, exit_signal_date=?, funding_pct=?, "
+            "fee_quote=?, net_pnl=?, raw=COALESCE(?, raw), updated_at=? "
+            "WHERE id=? AND state='OPEN'",
+            (float(exit_price),
+             None if exit_order_id is None else str(exit_order_id),
+             float(exit_ts), str(exit_reason),
+             None if exit_signal_date is None else str(exit_signal_date),
+             None if funding_pct is None else float(funding_pct),
+             None if fee_quote is None else float(fee_quote),
+             None if net_pnl is None else float(net_pnl),
+             json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str)
+             if raw is not None else None,
+             now(), int(trade_id)))
+        self.conn.commit()
+
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "") -> None:
         self.conn.execute(

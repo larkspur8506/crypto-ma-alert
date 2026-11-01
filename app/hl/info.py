@@ -83,6 +83,24 @@ class HlInfo:
     def user_state(self, address: str) -> dict:
         return self.post({"type": "clearinghouseState", "user": address}) or {}
 
+    def user_state_dex(self, address: str, dex: str) -> dict:
+        """HIP-3 builder perp dex 的用户状态（如 `dex='xyz'` 的 XYZ100）。
+
+        与主 `clearinghouseState` 同结构（marginSummary/assetPositions）；
+        MR 腿（XYZ100）的持仓与保证金占用从这里读。
+        """
+        return self.post({"type": "clearinghouseState", "user": address,
+                          "dex": dex}) or {}
+
+    def perp_meta_dex(self, dex: str) -> list:
+        """builder perp dex 的 universe（`{"type":"meta","dex":...}` → universe 列表）。
+
+        每行含 `name/szDecimals/maxLeverage`——MR 下单的数量精度从这里取，
+        不许硬编码（szDecimals 错一位，订单直接被交易所拒）。
+        """
+        payload = self.post({"type": "meta", "dex": dex}) or {}
+        return payload.get("universe") or []
+
     def spot_state(self, address: str) -> dict:
         """现货状态。**统一账户（HL 新账户默认）下余额与占用都在这里**：
         官方文档 Important details #3 ——「对 API 用户，统一账户/组合保证金把余额和占用
