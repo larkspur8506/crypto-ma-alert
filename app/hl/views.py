@@ -1259,8 +1259,6 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .badge b{font-size:13px;font-weight:600}
 .sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
-.tag{display:inline-block;padding:0 5px;border-radius:3px;font-size:10px;font-weight:600;
-     color:var(--muted);border:1px solid var(--line2);vertical-align:1px}
 .mrline{grid-column:1/-1;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
         font-size:12px}
 .kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:4px 0;
@@ -1795,7 +1793,8 @@ def _mr_phase_text(mr: Dict[str, Any]) -> str:
     phase = str(sig.get("phase") or "")
     win = _as_dict(sig.get("window"))
     if phase == "signal_ready":
-        return f"信号已出，等 {win.get('date', '')} 开盘".strip()
+        day = str(win.get("date") or "").strip()
+        return f"信号已出，等 {day} 开盘" if day else "信号已出，等开盘"
     if phase == "expired":
         return "窗口已过，等明日"
     if phase == "holding":
@@ -1878,7 +1877,7 @@ def _mr_card_line(p: Dict[str, Any]) -> str:
         parts.append(f"下一次评估 {_et_iso_local(mr['next_eval_et'])}")
     status_css = "neg" if mr.get("status") == "对账不平" else "muted"
     return ("<div class='mrline'>"
-            "<b>超跌腿 · QQQ</b> <span class='tag'>MR</span> "
+            "<b>超跌腿 · QQQ</b> <span class='muted'>MR</span> "
             + "".join(f"{x} · " for x in parts)
             + f"<b class='{status_css}'>{_esc(mr['status'])}</b></div>")
 
@@ -2212,14 +2211,14 @@ def _render_body(p: dict) -> str:
             dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
                         if mr["dist_to_exit_pct"] is not None else "—")
             o.append("<tr>"
-                     + _td("<b>QQQ</b> <span class='tag'>MR</span>")
+                     + _td("<b>QQQ</b> <span class='muted'>MR</span>")
                      + _td("<b>多</b>")
                      + _td(_fmt_sz(mr.get("qty")), "num hidem")
                      + _td(_fmt(mr.get("entry")), "num")
                      + _td(_fmt(mr.get("mark")), "num")
                      + _td(upnl_txt + pct_txt, f"num {upnl_cls}".strip())
                      + _td("—", "num")
-                     + _td("<span class='muted'>无（策略不加）</span>", "num")
+                     + _td("<span class='muted'>—</span>", "num")
                      + _td("—", "num")
                      + _td(f"{mr['leverage']:.0f}x" if mr.get("leverage") else "—",
                            "num hidem")
@@ -2237,11 +2236,31 @@ def _render_body(p: dict) -> str:
                 extra.append(f"RSI2 {mr['rsi2']:.2f}")
             if mr.get("exit_line"):
                 extra.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
-            o.append(f"<tr><td colspan='13' class='muted'>QQQ <span class='tag'>MR</span> "
-                     f"· 超跌腿空仓 · {_esc(mr['status'])}"
+            # 空仓也走「一行数字 + subm 小字行」，与上面 crypto 持仓行同字形同网格：
+            # 只用 colspan 脚注会和整张表对不齐（用户 2026-11-02 反馈「字体太怪」）。
+            o.append("<tr>"
+                     + _td("<b>QQQ</b> <span class='muted'>MR</span>")
+                     + _td("—")
+                     + _td("—", "num hidem")
+                     + _td("—", "num")
+                     + _td(_fmt(mr.get("mark")) if mr.get("mark") else "—", "num")
+                     + _td("—", "num")
+                     + _td("—", "num")
+                     + _td("—", "num")
+                     + _td("—", "num")
+                     + _td("—", "num hidem")
+                     + _td("—", "num hidem")
+                     + _td("—", "num hidem")
+                     + _td("—", "num hidem")
+                     + "</tr>")
+            o.append("<tr class='subm'><td colspan='13'>"
+                     f"超跌腿空仓 · {_esc(mr['status'])}"
                      + (" · " + " · ".join(extra) if extra else "")
+                     + (f" · 下一次评估 {_et_iso_local(mr.get('next_eval_et'))}"
+                        if mr.get("next_eval_et") else "")
                      + "</td></tr>")
-    if not positions and not (mr is not None and mr["holding"]):
+    # MR 块存在时（哪怕空仓）已有 QQQ 行，不再追加「交易所无持仓」以免自相矛盾
+    if not positions and mr is None:
         o.append(f"<tr><td colspan='13' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
