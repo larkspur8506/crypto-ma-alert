@@ -38,7 +38,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, time as _at_time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -511,10 +511,45 @@ class HlMrLeg:
             return status
         status["last_session_date"] = sessions[-1].date
         status["sessions_usable"] = len(sessions)
+        self._fill_signal_status(status, sessions, rows, now)
 
         if holding:
             return self._maybe_exit(now, sessions, rows, open_row, pos, status)
         return self._maybe_enter(now, sessions, rows, account, status)
+
+    def _fill_signal_status(self, status: Dict[str, Any], sessions, rows,
+                            now_ms: int) -> None:
+        """面板/聚合页要的只读视图：最近会话信号 + 离场线 + 下一次评估时刻。
+
+        全部在这里算完（tick 本来就要 sessions/signals），面板零重算、零网络。
+        离场线 = **最近 4 个已完成会话收盘均值** —— `close > SMA5`（SMA5 含当日）等价于
+        `close > mean(前 4 个收盘)`，面板显示的数可直接和收盘价比。
+        """
+        try:
+            sigs = mr_signal.session_signals(sessions)
+        except Exception:                                     # noqa: BLE001
+            return
+        if not sigs:
+            return
+        last = sessions[-1]
+        sig = sigs[-1]
+        closes = [s.close for s in sessions]
+        try:
+            status["mark"] = float(rows[-1].get("c")) if rows else None
+        except (TypeError, ValueError, AttributeError):
+            status["mark"] = None
+        status["signal"] = {
+            "last_session_date": last.date,
+            "rsi2": sig.get("rsi2"),
+            "threshold": mr_signal.RSI_THRESHOLD,
+            "entry_flag": bool(sig.get("entry")),
+            "exit_flag": bool(sig.get("exit_above")),
+            "exit_line": (sum(closes[-4:]) / 4.0) if len(closes) >= 4 else None,
+            "sessions_usable": len(sessions),
+            "next_eval_et": _next_eval_et(now_ms),
+            "window": _entry_window(sessions, now_ms),
+            "phase": _phase(sessions, now_ms),
+        }
 
     def _recon_fail(self, message: str) -> None:
         now_s = self.clock()
@@ -719,13 +754,30 @@ class HlMrLeg:
         exit_date = mr_signal.exit_decision(sessions=sessions, now_ms=now,
                                             entry_session_date=entry_session)
         status["state"] = "holding"
+        mark = self._mark(rows, pos)
+        entry_px = float(open_row["entry_price"] or 0.0)
+        signal = status.get("signal") or {}
+        exit_line = signal.get("exit_line")
         status["pos"] = {
             "signal_date": open_row["signal_date"],
             "entry_session": entry_session,
             "qty": open_row["qty"],
             "entry_price": open_row["entry_price"],
             "notional": open_row["notional"],
+            "entry_ts": open_row["entry_ts"],
             "upnl": pos["unrealized_pnl"] if pos else None,
+            "funding_paid": None,
+            # 面板口径（2026-11-02）：现价 / 浮盈% / 离场线 / 距离场% / 下一次评估
+            "mark": mark or None,
+            "upnl_pct": ((mark - entry_px) / entry_px * 100.0
+                         if mark and entry_px > 0 else None),
+            "exit_line": exit_line,
+            "dist_to_exit_pct": ((float(exit_line) - mark) / mark * 100.0
+                                 if exit_line and mark else None),
+            "margin": (pos or {}).get("margin_used"),
+            "leverage": 5.0 if pos else None,
+            "liq_price": None,
+            "next_eval_et": signal.get("next_eval_et"),
         }
         if exit_date is None:
             return status
@@ -892,3 +944,61 @@ def _attempt_ms(now_ms: int) -> int:
     真正的幂等护栏是台账 `mr_trades.signal_date` 唯一约束 + 只在空仓时入场。
     """
     return max(int(now_ms) // 60_000, 1)
+
+
+# ------------------------------------------------------------------ 面板视图（只读）
+
+def _next_eval_et(now_ms: int) -> str:
+    """下一次「收盘评估」的 ET 时刻（ISO，带时区）。"""
+    tz = ZoneInfo(mr_signal.SESSION_TZ)
+    now = datetime.fromtimestamp(now_ms / 1000.0, tz=tz)
+    day = now.date()
+    close = datetime.combine(day, _at_time(16, 0), tzinfo=tz)
+    if now >= close or day.weekday() >= 5 or mr_signal.is_market_holiday(day):
+        day = datetime.strptime(mr_signal.next_business_day(day.isoformat()),
+                                "%Y-%m-%d").date()
+        close = datetime.combine(day, _at_time(16, 0), tzinfo=tz)
+    return close.isoformat()
+
+
+def _entry_window(sessions, now_ms: int):
+    """待执行信号的入场窗口；没有待执行信号 → None。"""
+    k = mr_signal.completed_upto(sessions, now_ms)
+    if k <= 0:
+        return None
+    sig = mr_signal.session_signals(sessions[:k])[k - 1]
+    if not sig.get("entry"):
+        return None
+    return {"date": mr_signal.next_business_day(sessions[k - 1].date),
+            "start_et": "09:30",
+            "deadline_et": f"{9 + int(mr_signal.ENTRY_WINDOW_H)}:"
+                           f"{int((mr_signal.ENTRY_WINDOW_H % 1) * 60):02d}"}
+
+
+def _phase(sessions, now_ms: int) -> str:
+    """no_signal / signal_ready / in_window / expired / no_data（disabled/holding 由面板叠加）。"""
+    if not sessions:
+        return "no_data"
+    k = mr_signal.completed_upto(sessions, now_ms)
+    if k <= 0:
+        return "no_data"
+    last = sessions[k - 1]
+    sig = mr_signal.session_signals(sessions[:k])[k - 1]
+    tz = ZoneInfo(mr_signal.SESSION_TZ)
+    now = datetime.fromtimestamp(now_ms / 1000.0, tz=tz)
+    today = now.strftime("%Y-%m-%d")
+    entry_day = mr_signal.next_business_day(last.date)
+    if not sig.get("entry"):
+        return "expired" if entry_day < today else "no_signal"
+    if entry_day > today:
+        return "signal_ready"
+    if entry_day < today:
+        return "expired"
+    open_ms = int(datetime.strptime(today, "%Y-%m-%d")
+                  .replace(hour=9, minute=30, tzinfo=tz).timestamp() * 1000)
+    deadline_ms = open_ms + int(mr_signal.ENTRY_WINDOW_H * 3600_000)
+    if now_ms < open_ms:
+        return "signal_ready"
+    if now_ms <= deadline_ms:
+        return "in_window"
+    return "expired"

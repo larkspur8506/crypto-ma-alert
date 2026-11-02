@@ -756,3 +756,47 @@ class TestFifthRoundResiduals(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class TestMrSignalStatusForPanel(unittest.TestCase):
+    """面板契约（2026-11-02）：`status.signal` / `status.mark` 必须一次算全。
+
+    面板与聚合页只读这些字段，不重算；缺字段宁可 None（视图渲染 —），不许给 0。
+    """
+
+    def _leg(self):
+        from app.hl.mr import HlMrLeg
+        return HlMrLeg(db=None, info=None, exchange=None, address_fn=lambda: "0x0")
+
+    def _sessions(self):
+        from app.mr_signal import SessionBar
+        closes = [95.0, 94.0, 93.0, 92.0, 88.0]
+        dates = ["2026-10-26", "2026-10-27", "2026-10-28", "2026-10-29", "2026-10-30"]
+        return [SessionBar(date=d, open=c, high=c, low=c, close=c, bars=6,
+                           last_bar_ms=0, last_bar_et="15:00")
+                for d, c in zip(dates, closes)]
+
+    def test_fill_signal_status_fields(self):
+        import uuid
+        leg = self._leg()
+        sessions = self._sessions()
+        st = {}
+        # 2026-11-02 14:35 UTC = 09:35 ET（窗口内）
+        now = 1793630100000
+        rows = [{"c": "96.0"}]
+        leg._fill_signal_status(st, sessions, rows, now)
+        sig = st["signal"]
+        self.assertEqual(sig["last_session_date"], "2026-10-30")
+        self.assertEqual(sig["threshold"], 10.0)
+        self.assertAlmostEqual(sig["exit_line"], (94.0 + 93.0 + 92.0 + 88.0) / 4, places=6)
+        self.assertTrue(sig["entry_flag"])                    # RSI2 暴跌 → 入场信号
+        self.assertEqual(st["mark"], 96.0)
+        self.assertEqual(sig["phase"], "in_window")          # 10-30 信号 → 11-02 开盘窗口
+        self.assertEqual(sig["window"]["date"], "2026-11-02")
+        self.assertEqual(sig["next_eval_et"][:10], "2026-11-02")
+
+    def test_phase_expired_after_deadline(self):
+        leg = self._leg()
+        st = {}
+        # 2026-11-02 18:00 UTC = 13:00 ET（窗口 09:30–12:30 已过）
+        leg._fill_signal_status(st, self._sessions(), [{"c": "96.0"}], 1793642400000)
+        self.assertEqual(st["signal"]["phase"], "expired")

@@ -1259,6 +1259,10 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .badge b{font-size:13px;font-weight:600}
 .sec{font-size:11px;color:var(--muted);letter-spacing:1.5px;margin-bottom:8px}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:2px 20px}
+.tag{display:inline-block;padding:0 5px;border-radius:3px;font-size:10px;font-weight:600;
+     color:var(--muted);border:1px solid var(--line2);vertical-align:1px}
+.mrline{grid-column:1/-1;margin-top:8px;padding-top:8px;border-top:1px dashed var(--line2);
+        font-size:12px}
 .kv{display:flex;justify-content:space-between;gap:12px;font-size:13px;padding:4px 0;
     border-bottom:1px solid var(--line2)}
 .kv:last-child{border-bottom:0}
@@ -1741,6 +1745,11 @@ def _symbol_dynamics(p: dict) -> str:
          "<div class=\"card\"><div class=\"grid\">"]
     for r in rows:
         o.append(_sym_card(r, feed_map, last_bar))
+    # 超跌腿（QQQ）：与上面三个「均线腿」同卡、不同列（RSI2/离场线/距入场），
+    # 2026-11-02 用户拍板「标的动态也要能看到 QQQ 离仓价多远」。
+    mr_line = _mr_card_line(p)
+    if mr_line:
+        o.append(mr_line)
     # 图例行已按用户要求整段删除（2026-10-29）；口径细节留在 title 悬停里。
     o.append("</div>")
     o.append("</div>")
@@ -1762,6 +1771,116 @@ def _why_rows(deps: "DashboardDeps") -> List[Dict[str, Any]]:
     except Exception as e:                                        # noqa: BLE001
         logger.warning("[hl-views] /why 诊断计算失败（区块略去）：%s", e)
         return []
+
+
+_MR_PHASE_TEXT = {"in_window": "窗口内等成交", "no_signal": "空仓", "no_data": "无数据"}
+
+
+def _et_iso_local(iso: Any) -> str:
+    """ET ISO 时刻 → 面板时区（北京时间）短格式；解析失败给「—」，不猜。"""
+    try:
+        return dt.datetime.fromisoformat(str(iso)).astimezone(
+            _display_tz()).strftime("%m-%d %H:%M")
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _mr_phase_text(mr: Dict[str, Any]) -> str:
+    """MR 相位 → 一句中文结论（仓位表 / 动态卡共用；只描述状态，不复述数字）。"""
+    if str(mr.get("recon") or "") == "err" or str(mr.get("state") or "") == "recon_err":
+        return "对账不平"
+    if not mr.get("enabled"):
+        return "停用"
+    sig = _as_dict(mr.get("signal"))
+    phase = str(sig.get("phase") or "")
+    win = _as_dict(sig.get("window"))
+    if phase == "signal_ready":
+        return f"信号已出，等 {win.get('date', '')} 开盘".strip()
+    if phase == "expired":
+        return "窗口已过，等明日"
+    if phase == "holding":
+        return "持仓中"
+    return _MR_PHASE_TEXT.get(phase, "空仓")
+
+
+def _mr_view(p: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """把 `status.mr` 归一成面板用的视图；停用且空仓 → None（正常态整块不出现）。
+
+    口径（2026-11-02）：离场线 = 最近 4 个已完成会话收盘均值（与 `close > SMA5` 等价）；
+    「距离场%」正 = 现价仍在线下方（多单安全）。
+    """
+    mr = _as_dict(p.get("mr"))
+    if not mr:
+        return None
+    pos = _as_dict(mr.get("pos"))
+    enabled = bool(mr.get("enabled"))
+    if not enabled and not pos:
+        return None
+    sig = _as_dict(mr.get("signal"))
+    holding = bool(pos)
+    entry = _opt_num(pos.get("entry_price"))
+    mark = _opt_num(pos.get("mark")) or _opt_num(mr.get("mark"))
+    exit_line = _opt_num(pos.get("exit_line")) or _opt_num(sig.get("exit_line"))
+    dist_exit = _opt_num(pos.get("dist_to_exit_pct"))
+    return {
+        "enabled": enabled, "holding": holding, "recon": mr.get("recon"),
+        "qty": _opt_num(pos.get("qty")), "entry": entry, "mark": mark,
+        "upnl": _opt_num(pos.get("upnl")), "upnl_pct": _opt_num(pos.get("upnl_pct")),
+        "notional": _opt_num(pos.get("notional")), "margin": _opt_num(pos.get("margin")),
+        "leverage": _opt_num(pos.get("leverage")),
+        "entry_ts": _opt_num(pos.get("entry_ts")),
+        "exit_line": exit_line, "dist_to_exit_pct": dist_exit,
+        "dist_to_entry_pct": ((mark / entry - 1.0) * 100.0
+                              if (holding and entry and mark) else None),
+        "rsi2": _opt_num(sig.get("rsi2")), "threshold": _opt_num(sig.get("threshold")),
+        "last_session_date": sig.get("last_session_date"),
+        "sessions_usable": sig.get("sessions_usable"),
+        "next_eval_et": sig.get("next_eval_et"),
+        "phase": sig.get("phase"), "window": _as_dict(sig.get("window")),
+        "status": ("对账不平" if (str(mr.get("recon") or "") == "err"
+                             or str(mr.get("state") or "") == "recon_err")
+                   else ("停用" if not enabled
+                         else ("持仓中" if holding else _mr_phase_text(mr)))),
+    }
+
+
+def _mr_card_line(p: Dict[str, Any]) -> str:
+    """「三标的动态」卡内的超跌腿行（QQQ）：现价/持仓/距入场/RSI2/离场线/距离场/结论。
+
+    与 crypto 三张 `_sym_card` 同卡不同列 —— RSI2 与「密集带宽」不是一套语义，
+    硬塞进同一组列会出现 6 个永远为「—」的格子。停用且空仓 → 空串（整行不出现）。
+    """
+    mr = _mr_view(p)
+    if mr is None:
+        return ""
+    parts: List[str] = []
+    if mr.get("mark"):
+        parts.append(f"现价 {_fmt(mr['mark'])}")
+    if mr["holding"]:
+        parts.append(f"持仓 多 {_fmt_sz(mr.get('qty'))} @ {_fmt(mr.get('entry'))}")
+        if mr.get("dist_to_entry_pct") is not None:
+            parts.append(f"距入场 {mr['dist_to_entry_pct']:+.2f}%")
+        upnl_txt, upnl_cls = _sign(mr.get("upnl"))
+        parts.append(f"浮盈 <span class='{upnl_cls}'>{upnl_txt}</span>")
+    if mr.get("rsi2") is not None:
+        thr = mr.get("threshold")
+        ok = thr is not None and mr["rsi2"] < thr
+        parts.append(f"RSI2 {mr['rsi2']:.2f}{' ✔' if ok else ''}"
+                     + (f"（阈 {thr:.0f}）" if thr is not None else ""))
+    if mr.get("exit_line"):
+        parts.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
+    if mr.get("dist_to_exit_pct") is not None:
+        d = mr["dist_to_exit_pct"]
+        cls = "warn" if d < 0 else "muted"
+        parts.append(f"距离场 <span class='{cls}'>{d:+.2f}%</span>"
+                     + ("（已站上，等收盘）" if d < 0 else ""))
+    if mr.get("next_eval_et"):
+        parts.append(f"下一次评估 {_et_iso_local(mr['next_eval_et'])}")
+    status_css = "neg" if mr.get("status") == "对账不平" else "muted"
+    return ("<div class='mrline'>"
+            "<b>超跌腿 · QQQ</b> <span class='tag'>MR</span> "
+            + "".join(f"{x} · " for x in parts)
+            + f"<b class='{status_css}'>{_esc(mr['status'])}</b></div>")
 
 
 def _sign(v: Any, unit: str = " U") -> tuple:
@@ -2084,14 +2203,53 @@ def _render_body(p: dict) -> str:
                  f"保证金 {_fmt(pos.get('margin_used'))} U · "
                  f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'} · "
                  f"本单资金费 {fund_txt}</td></tr>")
-    if not positions:
+    mr = _mr_view(p)
+    if mr is not None:
+        if mr["holding"]:
+            upnl_txt, upnl_cls = _sign(mr["upnl"])
+            pct = mr["upnl_pct"]
+            pct_txt = f" · {pct:+.2f}%" if pct is not None else ""
+            dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
+                        if mr["dist_to_exit_pct"] is not None else "—")
+            o.append("<tr>"
+                     + _td("<b>QQQ</b> <span class='tag'>MR</span>")
+                     + _td("<b>多</b>")
+                     + _td(_fmt_sz(mr.get("qty")), "num hidem")
+                     + _td(_fmt(mr.get("entry")), "num")
+                     + _td(_fmt(mr.get("mark")), "num")
+                     + _td(upnl_txt + pct_txt, f"num {upnl_cls}".strip())
+                     + _td("—", "num")
+                     + _td("<span class='muted'>无（策略不加）</span>", "num")
+                     + _td("—", "num")
+                     + _td(f"{mr['leverage']:.0f}x" if mr.get("leverage") else "—",
+                           "num hidem")
+                     + _td(_fmt(mr.get("margin")), "num hidem")
+                     + _td("—", "num hidem")
+                     + _td("—", "num hidem")
+                     + "</tr>")
+            o.append("<tr class='subm'><td colspan='13'>"
+                     f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
+                     f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
+                     f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
+        else:
+            extra = []
+            if mr.get("rsi2") is not None:
+                extra.append(f"RSI2 {mr['rsi2']:.2f}")
+            if mr.get("exit_line"):
+                extra.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
+            o.append(f"<tr><td colspan='13' class='muted'>QQQ <span class='tag'>MR</span> "
+                     f"· 超跌腿空仓 · {_esc(mr['status'])}"
+                     + (" · " + " · ".join(extra) if extra else "")
+                     + "</td></tr>")
+    if not positions and not (mr is not None and mr["holding"]):
         o.append(f"<tr><td colspan='13' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
     o.append("</tbody></table></div>")
     # 图例（可见文字，iOS 无悬停）：ROE 口径收口 + 窄屏小字行的存在说明。
     o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
-             '窄屏隐藏列的数值见各仓下方小字行</div>')
+             '窄屏隐藏列的数值见各仓下方小字行 · '
+             'QQQ(MR) 腿不加止损，按收盘价与 SMA5 判离场</div>')
 
     # ---------------- 账户卡片（P2：分层 + 消重复；P3 R4/R5：折叠 + 主从）----------------
     # 分两层：顶层关键数（大字，手机一眼读）＋ 次级项收进 <details>「资金明细」
