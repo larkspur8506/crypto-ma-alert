@@ -1867,9 +1867,10 @@ def _mr_card_line(p: Dict[str, Any]) -> str:
         ok = thr is not None and mr["rsi2"] < thr
         parts.append(f"RSI2 {mr['rsi2']:.2f}{' ✔' if ok else ''}"
                      + (f"（阈 {thr:.0f}）" if thr is not None else ""))
-    if mr.get("exit_line"):
+    # 离场线/距离场只在持仓时显示（空仓时是假想值，2026-11-02 用户指出）
+    if mr["holding"] and mr.get("exit_line"):
         parts.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
-    if mr.get("dist_to_exit_pct") is not None:
+    if mr["holding"] and mr.get("dist_to_exit_pct") is not None:
         d = mr["dist_to_exit_pct"]
         cls = "warn" if d < 0 else "muted"
         parts.append(f"距离场 <span class='{cls}'>{d:+.2f}%</span>"
