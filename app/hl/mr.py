@@ -23,6 +23,11 @@
   （fee_quote 列），funding 用 `userFundingHistory` 实际值。
 - **对账 fail-closed**、**kill/开关只挡入场不挡离场**、**MR 异常不拖死主腿**
   与 Lighter 侧完全一致。
+- **基金级闸门走 `hl_kill`**（2026-11-02 第五轮核对）：HL 的回撤熔断会
+  `hl_set_kill(origin="dd")`、当日亏损同理，MR 读 `db.hl_kill()` ⇒ 两类熔断都挡得住。
+  （Lighter 侧没有这条链路，已在那边显式接 `RiskState`。）
+- **占用口径 = 价格敞口（名义 = 数量 × 标记价）**，不是保证金：5x 下保证金只有名义的
+  1/5，按保证金扣会让 crypto 腿在 MR 持仓期间被放大 1.8 倍（Lighter 侧是 1x，扣满额）。
 - 开关：configuration `mr_enabled`（默认 '0'）+ `/admin/hl/mr` 写入并落
   `mr_admin` 事件；全局 `hl_kill()` 同样挡 MR 入场。
 """
@@ -34,7 +39,8 @@ import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 from app import mr_signal
 from app.hl.exchange import _clean_alert_text, make_cloid
@@ -171,6 +177,7 @@ class HlMrLeg:
         attempts = 1 if poll <= 0 or budget <= 0 else int(budget / poll) + 1
         pos = None
         read_ok = False
+        started = time.monotonic()
         for i in range(max(attempts, 1)):
             try:
                 pos = (self._read_account(address) or {}).get("mr_pos")
@@ -182,8 +189,16 @@ class HlMrLeg:
                 read_ok = True
                 if (pos is not None) is bool(want):
                     return pos, True
+            # 墙钟上限（2026-11-02 第五轮）：HL 一次失败读含 3 次重试 + 1/3/9s 退避，
+            # 实测 ≈26s；固定 13 次会变成 5 分钟以上的阻塞，而 MR tick 持 `_tick_lock`，
+            # 会把 :03/:33 主 tick（对账/离场/补挂止损）一起顶住。
+            elapsed = time.monotonic() - started
+            if elapsed >= budget:
+                logger.warning("mr: 成交确认超时（%.1fs ≥ %.1fs，%d 次读），按当前真相返回",
+                               elapsed, budget, i + 1)
+                break
             if i + 1 < attempts:
-                time.sleep(poll)
+                time.sleep(max(min(poll, budget - elapsed), 0.0))
         return pos, read_ok
 
     def _auto_disable(self, reason: str) -> None:
@@ -265,9 +280,12 @@ class HlMrLeg:
         dms = dex_state.get("marginSummary") or {}
         mr_margin_used = float(dms.get("marginUsed") or 0.0)
         mr_pos = None
+        bare = cfg.coin.split(":")[-1]
         for item in dex_state.get("assetPositions") or []:
             p = item.get("position") or {}
-            if (p.get("coin") or "") != cfg.coin:
+            # HIP-3 的 coin 命名两可（`xyz:XYZ100` 或裸 `XYZ100`）：meta 与 allMids 实测带前缀，
+            # 但持仓行的命名没有仓时无法实测 —— 两种都认，避免「有仓却看不见」（第五轮）。
+            if (p.get("coin") or "") not in (cfg.coin, bare):
                 continue
             szi = float(p.get("szi") or 0.0)
             if szi == 0:
@@ -281,12 +299,18 @@ class HlMrLeg:
                 "unrealized_pnl": float(p.get("unrealizedPnl") or 0.0),
             }
             break
-        # 占用 = 保证金 + 浮盈亏（与 Lighter 侧同口径：把 MR 腿整个从定仓基数里剔除）。
-        # 只减正数；取不到 uPnL 时退回保证金。
+        # 占用口径 = **价格敞口（数量 × 标记价）**，不是保证金（2026-11-02 第五轮）。
+        # 按保证金扣时，同一个 MR 敞口在 5x 下只扣 1/5 —— 扣多少取决于杠杆设置，
+        # 而 Lighter 侧是 1x（扣满额）⇒ 同样 exposure，HL 的 crypto 腿会被放大 1.8 倍。
+        # 保证金值单独保留在 `mr_margin_reserved` 里做展示，不参与定仓。
         occupied = mr_margin_used
         if mr_pos is not None:
-            occupied = max(mr_margin_used + mr_pos["unrealized_pnl"], 0.0)
+            value = mr_pos["position_value"]
+            if not value:
+                value = abs(mr_pos["szi"]) * mr_pos["entry_px"]
+            occupied = max(abs(value), 0.0)
         return {"equity_total": equity_total, "mr_margin_used": occupied,
+                "mr_margin_reserved": mr_margin_used,
                 "mr_margin_raw": mr_margin_used, "mr_pos": mr_pos}
 
     # ------------------------------------------------------------------ 认领
@@ -320,6 +344,11 @@ class HlMrLeg:
         if not signal_date or self.db.mr_trade_by_signal(signal_date) is not None:
             return False
         filled_sz = abs(float(pos.get("szi") or 0.0))
+        if float(pos.get("szi") or 0.0) <= 0:
+            # MR 只做多：空头仓不按 MR 入场认领（手工/别的系统开的）。
+            logger.warning("mr: xyz dex 的 XYZ100 是空头（szi=%s），跳过入场认领",
+                           pos.get("szi"))
+            return False
         entry_px = float(pos.get("entry_px") or 0.0) or float(payload.get("ref_price") or 0.0)
         if filled_sz <= 0 or entry_px <= 0:
             return False
@@ -410,7 +439,9 @@ class HlMrLeg:
             logger.exception("mr: tick failed")
             status.update(state="error", error=f"{type(exc).__name__}: {exc}",
                           updated_at=self.clock())
-            self._alert(f"MR tick 异常：{type(exc).__name__}: {exc}")
+            # 去重：维护窗口里每 5 分钟一条会把告警淹掉（第五轮）。
+            self._alert_throttled("tick_error",
+                                  f"MR tick 异常：{type(exc).__name__}: {exc}")
             return status
 
     def _tick_inner(self, now: int, status: Dict[str, Any]) -> dict:
@@ -429,6 +460,7 @@ class HlMrLeg:
         # 给 crypto 腿定仓用的「MR 占用」：必须在 recon 分支之前写 —— recon_err 时
         # MR 仍可能占着保证金，crypto 腿不该按全权益放大。
         status["margin_used"] = float(account.get("mr_margin_used") or 0.0)
+        status["margin_reserved"] = float(account.get("mr_margin_reserved") or 0.0)
 
         # ---- 认领：确认窗口丢失的成交（读错误 / 进程重启）-------------------------
         fresh = bool(open_row is not None and open_row["entry_ts"]
@@ -471,7 +503,8 @@ class HlMrLeg:
 
         # ---- 会话与信号 --------------------------------------------------------
         rows = self._candles(now)
-        sessions = mr_signal.aggregate_sessions(rows)
+        sessions, dropped = mr_signal.aggregate_sessions_ex(rows)
+        self._note_dropped_sessions(dropped, now, status)
         if len(sessions) < 6:
             status["state"] = "no_data"
             status["error"] = f"usable sessions={len(sessions)}"
@@ -489,6 +522,54 @@ class HlMrLeg:
             self._recon_alerted_at = now_s
             self._alert(f"MR 对账不平：{message}")
         logger.error("mr recon: %s", message)
+
+    def _note_dropped_sessions(self, dropped, now_ms: int, status: Dict[str, Any]) -> None:
+        """「整个会话因数据不足被弃用」→ 落一条审计事件（同一会话只报一次）。
+
+        2026-11-02 第五轮：末根闸把「用错收盘价」换成了「整天静默丢弃」——
+        信号日整天消失、连事件都没有。这里只报**已收盘**的会话，也不推送。
+        """
+        if not dropped:
+            return
+        tz = ZoneInfo(mr_signal.SESSION_TZ)
+        reported = []
+        for item in dropped[-5:]:
+            try:
+                close_ms = int(datetime.strptime(str(item["date"]), "%Y-%m-%d")
+                               .replace(hour=16, minute=0, tzinfo=tz).timestamp() * 1000)
+            except (TypeError, ValueError):
+                continue
+            if close_ms + 3600_000 > now_ms:                  # 还没收盘：正常
+                continue
+            key = "session_dropped:" + str(item["date"])
+            if self._order_alerted_at.get(key):
+                continue
+            self._order_alerted_at[key] = now_ms / 1000.0
+            reported.append(item)
+            try:
+                self.db.hl_log_event(
+                    "mr_session_dropped",
+                    f"MR 会话 {item['date']} 数据不足已弃用（bars={item['bars']}、"
+                    f"末根 {item['last_bar_et']} ET、{item['reason']}）",
+                    data=item)
+            except Exception:                                 # noqa: BLE001
+                logger.warning("mr: 写 mr_session_dropped 失败", exc_info=True)
+        if reported:
+            status["dropped_sessions"] = [str(r["date"]) for r in reported]
+
+    def _enabled_since(self) -> float:
+        """最近一次「启用」事件的时刻（0 = 从未启用）。给 `_mark_expired_signal` 去噪。"""
+        try:
+            rows = self.db.hl_recent_events(5, kind=MR_EVENT_KIND)
+        except Exception:                                     # noqa: BLE001
+            return 0.0
+        for row in rows:
+            if _event_data(row.get("data") if isinstance(row, Mapping) else None).get("enabled"):
+                try:
+                    return float(row["created_at"] or 0.0)
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return 0.0
 
     # ------------------------------------------------------------------ 入场
 
@@ -610,6 +691,7 @@ class HlMrLeg:
         sigs = mr_signal.session_signals(sessions)
         k = mr_signal.completed_upto(sessions, now_ms)
         tz = mr_signal.ZoneInfo(mr_signal.SESSION_TZ)
+        enabled_since = self._enabled_since()
         for i in range(max(k - 5, 0), k):
             if not sigs[i]["entry"]:
                 continue
@@ -621,6 +703,9 @@ class HlMrLeg:
             if now_ms <= deadline_ms:
                 continue
             if now_ms - deadline_ms > 14 * 86400_000:
+                continue
+            if enabled_since and deadline_ms / 1000.0 < enabled_since:
+                # 停用期间过期的信号不补 SKIPPED（第五轮去噪）。
                 continue
             if self.db.mr_trade_by_signal(s.date) is None:
                 self.db.mr_mark_skipped(s.date, "窗口错过（停机/延迟）")
@@ -681,6 +766,22 @@ class HlMrLeg:
         left, left_seen = self._await_position(self.address_fn() or "", want=False)
         if (left is not None or not left_seen
                 or str(result.get("status") or "") != "filled"):
+            if left is not None and left_seen:
+                # 部分成交：先把已平掉的片段入账，否则最终决算只按剩余数量算盈亏。
+                prev_sz = abs(float(pos["szi"])) if pos else float(open_row["qty"] or 0.0)
+                left_sz = abs(float(left.get("szi") or 0.0))
+                filled_sz = prev_sz - left_sz
+                if filled_sz > 1e-12:
+                    try:
+                        self.db.mr_trade_append_partial(
+                            int(open_row["id"]), qty=filled_sz, price=mark,
+                            ts=now / 1000.0)
+                        self.db.hl_log_event(
+                            "mr_exit_partial",
+                            f"MR 离场部分成交 {filled_sz:g}（剩余 {left_sz:g}）—— "
+                            f"该片段按参考价 {mark:.2f} 记账")
+                    except Exception:                         # noqa: BLE001
+                        logger.warning("mr: 记录部分成交片段失败", exc_info=True)
             remain = (left or {}).get("szi", "?") if isinstance(left, dict) else "?"
             status["state"] = "exit_not_filled"
             status["error"] = f"回执 status={result.get('status')!r}，剩余 {remain}"
@@ -694,9 +795,14 @@ class HlMrLeg:
         entry_price = float(open_row["entry_price"] or 0.0)
         # 离场成交价用回执 avg_px（filled 时可用）；取不到才退回 mid。
         exit_px = float(result.get("avg_px") or 0.0) or mark
-        fee_est = TAKER_FEE_RATE * (notional + sz * exit_px)
+        partials = _partial_exits(open_row)
+        partial_notional = sum(abs(float(p.get("qty") or 0.0))
+                               * float(p.get("price") or 0.0) for p in partials)
+        partial_pnl = sum((float(p.get("price") or 0.0) - entry_price)
+                          * float(p.get("qty") or 0.0) for p in partials)
+        fee_est = TAKER_FEE_RATE * (notional + sz * exit_px + partial_notional)
         funding_pct = (funding_paid / notional * 100.0 if notional > 0 else None)
-        net_pnl = ((exit_px - entry_price) * sz - funding_paid - fee_est)
+        net_pnl = ((exit_px - entry_price) * sz - funding_paid - fee_est + partial_pnl)
         self.db.mr_close_trade(
             int(open_row["id"]), exit_price=exit_px,
             exit_order_id=str(result.get("oid") or ""),
@@ -706,6 +812,7 @@ class HlMrLeg:
                  "price_source": "avg_px" if result.get("avg_px") else "mid",
                  "limit_px": limit_px, "cloid": cloid,
                  "funding_paid_usdc": funding_paid, "fee_est": fee_est,
+                 "partial_exits": partials, "partial_pnl": partial_pnl,
                  "result_status": str(result.get("status"))})
         self._slippage_guard(result, mark, side="离场")
         self._funding_guard(funding_pct, float(open_row["entry_ts"] or 0.0),
@@ -737,6 +844,31 @@ class HlMrLeg:
         except Exception as exc:                              # noqa: BLE001
             logger.warning("mr: funding history failed: %s", exc)
             return 0.0
+
+
+def _partial_exits(row: Any) -> List[dict]:
+    """台账 `raw.partial_exits`（部分成交片段）→ list；解析失败返回 []。
+
+    注意行可能是 `sqlite3.Row`（不是 Mapping，没有 `.get`）—— 统一走下标。
+    """
+    if isinstance(row, Mapping):
+        raw = row.get("raw")
+    else:
+        try:
+            raw = row["raw"]
+        except (KeyError, IndexError, TypeError):
+            raw = None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except ValueError:
+            return []
+    if not isinstance(raw, Mapping):
+        return []
+    parts = raw.get("partial_exits")
+    if not isinstance(parts, list):
+        return []
+    return [dict(p) for p in parts if isinstance(p, Mapping)]
 
 
 def _event_data(raw: Any) -> Dict[str, Any]:

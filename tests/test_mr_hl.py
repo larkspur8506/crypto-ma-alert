@@ -638,5 +638,121 @@ class TestMrGuardsRound4(unittest.TestCase):
             self.assertEqual(row["state"], "SKIPPED")
 
 
+class TestFifthRoundResiduals(unittest.TestCase):
+    """2026-11-02 第五轮：占用口径 / 墙钟上限 / 部分成交 / 认领方向 / 丢会话审计。"""
+
+    def test_occupancy_is_notional_not_margin(self):
+        """5x 下 marginUsed 只占名义的 1/5 —— 定仓基数必须扣名义（价格敞口）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.6881")
+            info.user_state_dex = lambda a, d: {
+                "marginSummary": {"marginUsed": "50"},
+                "assetPositions": [{"position": {
+                    "coin": "xyz:XYZ100", "szi": "2.6881", "entryPx": "93.0",
+                    "positionValue": "250.0", "unrealizedPnl": "0",
+                    "leverage": {"marginUsed": "50"}}}]}
+            acct = leg._read_account(ADDR)
+            self.assertAlmostEqual(acct["mr_margin_used"], 250.0, places=6)
+            self.assertAlmostEqual(acct["mr_margin_reserved"], 50.0, places=6)
+
+    def test_bare_coin_name_is_recognised(self):
+        """持仓行为裸名 `XYZ100` 时也要认出来（无仓无法实测，两种都认）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.6881")
+            info.user_state_dex = lambda a, d: {
+                "marginSummary": {"marginUsed": "250"},
+                "assetPositions": [{"position": {
+                    "coin": "XYZ100", "szi": "2.6881", "entryPx": "93.0",
+                    "positionValue": "250.0", "unrealizedPnl": "0",
+                    "leverage": {"marginUsed": "250"}}}]}
+            acct = leg._read_account(ADDR)
+            self.assertIsNotNone(acct["mr_pos"])
+
+    def test_confirm_poll_bounded_by_wall_clock(self):
+        """确认轮询必须有墙钟上限：慢读 / 重试不能把 `_tick_lock` 顶住几分钟。"""
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            calls = {"n": 0}
+
+            def boom(address):
+                calls["n"] += 1
+                _time.sleep(0.12)
+                raise RuntimeError("503")
+
+            leg._read_account = boom
+            leg.config = HlMrConfig(fill_confirm_s=0.3, fill_poll_s=0.05)
+            started = _time.monotonic()
+            pos, ok = leg._await_position(ADDR, want=True)
+            elapsed = _time.monotonic() - started
+            self.assertIsNone(pos)
+            self.assertFalse(ok)
+            self.assertLess(elapsed, 0.9)          # 无闸门时 = 7×0.12s
+            self.assertLessEqual(calls["n"], 3)
+
+    def test_partial_exit_pnl_includes_filled_leg(self):
+        """部分成交离场：两块加起来必须等于「全量盈亏」。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            info.now_ms = EXIT_NOW_MS
+            _enable(db)
+            db.mr_record_entry(signal_date="2026-04-15", entry_session="2026-04-16",
+                               qty=2.68, qty_int=26800, entry_price=93.5,
+                               entry_order_id="x", entry_ts=ENTRY_NOW_MS / 1000.0,
+                               notional=2.68 * 93.5, margin=2.68 * 93.5,
+                               equity_at_entry=500.0)
+            original = ex.place_order
+
+            def partial(coin, is_buy, sz, limit_px, **kw):
+                ex.orders.append(dict(coin=coin, is_buy=is_buy, sz=sz,
+                                      limit_px=limit_px, **kw))
+                info.mr_szi = "1.68"                     # 只平掉 1.0
+                return {"ok": True, "status": "filled", "oid": 999,
+                        "avg_px": limit_px, "filled_sz": 1.0, "error": None, "raw": {}}
+
+            ex.place_order = partial
+            first = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(first["state"], "exit_not_filled")
+            row = db.mr_open_trade()
+            partials = json.loads(row["raw"])["partial_exits"]
+            self.assertAlmostEqual(partials[0]["qty"], 1.0, places=6)
+
+            ex.place_order = original
+            leg.tick(now_ms=EXIT_NOW_MS + 300_000)
+            row = db.mr_trade_by_signal("2026-04-15")
+            self.assertEqual(row["state"], "CLOSED")
+            px = row["exit_price"]
+            # 剩余腿按回执成交价；先平掉的那 1.0 按当时的参考价（mark 95.5）估算
+            expected = ((px - 93.5) * 1.68 + (95.5 - 93.5) * 1.0
+                        - 0.03 - row["fee_quote"])
+            self.assertAlmostEqual(row["net_pnl"], expected, places=4)
+
+    def test_adoption_rejects_short_position(self):
+        """交易所有空头仓时，绝不按 MR 入场认领。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            _enable(db)
+            ex.fill = False                                    # 意图在、无仓
+            leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertTrue(db.hl_recent_events(1, kind="mr_entry_intent"))
+            info.mr_szi = "-2.68"
+            status = leg.tick(now_ms=ENTRY_NOW_MS + 60_000)
+            self.assertIsNone(db.mr_open_trade())
+            self.assertEqual(status["recon"], "err")
+
+    def test_dropped_session_lands_one_event(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            dropped = [{"date": "2026-04-15", "bars": 4, "last_bar_et": "13:00",
+                        "reason": "missing_close_bar"}]
+            status = {}
+            leg._note_dropped_sessions(dropped, EXIT_NOW_MS, status)
+            self.assertEqual(len(db.hl_recent_events(5, kind="mr_session_dropped")), 1)
+            self.assertEqual(status["dropped_sessions"], ["2026-04-15"])
+            leg._note_dropped_sessions(dropped, EXIT_NOW_MS + 60_000, {})
+            self.assertEqual(len(db.hl_recent_events(5, kind="mr_session_dropped")), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -909,6 +909,33 @@ class DB:
              now(), int(trade_id)))
         self.conn.commit()
 
+    @_locked
+    def mr_trade_append_partial(self, trade_id: int, *, qty: float, price: float,
+                                ts: float) -> None:
+        """把一次「部分平仓」片段追加进台账 `raw.partial_exits`。
+
+        2026-11-02 第五轮：离场 IOC 部分成交时，下一轮只按**剩余**数量决算，前面
+        平掉那一截的盈亏会从 `net_pnl` 里消失。这里按参考价先记下来，最终关账时加回。
+        """
+        row = self.conn.execute("SELECT raw FROM mr_trades WHERE id=?",
+                                (int(trade_id),)).fetchone()
+        raw: Dict[str, Any] = {}
+        if row is not None and row["raw"]:
+            try:
+                parsed = json.loads(row["raw"])
+            except ValueError:
+                parsed = None
+            if isinstance(parsed, dict):
+                raw = dict(parsed)
+        parts = list(raw.get("partial_exits") or [])
+        parts.append({"qty": float(qty), "price": float(price), "ts": float(ts)})
+        raw["partial_exits"] = parts
+        self.conn.execute(
+            "UPDATE mr_trades SET raw=?, updated_at=? WHERE id=?",
+            (json.dumps(raw, ensure_ascii=False, sort_keys=True, default=str),
+             now(), int(trade_id)))
+        self.conn.commit()
+
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
                      data: Any = None, code_rev: str = "",
                      ts: Optional[float] = None) -> None:
