@@ -554,6 +554,27 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
             continue
         positions = [p for p in (snap.get("positions") or [])
                      if _f((p or {}).get("size")) > 0]
+        # HIP-3 builder dex（MR 腿 xyz:XYZ100）的仓位**不在** info.snapshot() 里。
+        # 到期清仓必须一并平掉：key 失效后 MR 仓既没有策略离场、也没有止损。
+        dex_reader = getattr(info, "user_state_dex", None)
+        if callable(dex_reader):
+            try:
+                dex_state = dex_reader(address, "xyz") or {}
+            except Exception as e:                                # noqa: BLE001
+                last_err = f"读取 xyz dex 仓位失败：{type(e).__name__}"
+                _ev(f"清仓：{last_err}")
+                continue
+            for item in dex_state.get("assetPositions") or []:
+                p = item.get("position") or {}
+                szi = _f(p.get("szi"))
+                if not szi:
+                    continue
+                positions.append({
+                    "coin": p.get("coin") or "",
+                    "size": abs(szi),
+                    "side": 1 if szi > 0 else -1,
+                    "mark_px": (_f(p.get("positionValue")) / abs(szi)) if szi else 0.0,
+                })
 
         # ---- 3) 逐仓平（市价 = 激进 IOC 限价，reduce_only，方向 = 平仓方向）
         for pos in positions:
@@ -567,7 +588,14 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
                 continue
             is_buy = side != 1          # 平多 = 卖；平空 = 买（与 executor 同一口径）
             try:
-                sz_dec = int((info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
+                if ":" in coin:
+                    # builder dex（xyz:XYZ100）的规格只能在 meta?dex=xyz 里查
+                    dex = coin.split(":", 1)[0]
+                    sz_dec = next(
+                        (int(r.get("szDecimals")) for r in (info.perp_meta_dex(dex) or [])
+                         if (r.get("name") or "") == coin), 5)
+                else:
+                    sz_dec = int((info.specs([coin]).get(coin) or {}).get("sz_decimals", 5))
             except Exception:                                     # noqa: BLE001
                 sz_dec = 5
             try:
@@ -608,6 +636,17 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
             last_err = f"复查账户失败：{type(e).__name__}"
             continue
         left = [p for p in (snap2.get("positions") or []) if _f((p or {}).get("size")) > 0]
+        if callable(dex_reader):
+            try:
+                dex_left = dex_reader(address, "xyz") or {}
+            except Exception as e:                                # noqa: BLE001
+                last_err = f"复查 xyz dex 失败：{type(e).__name__}"
+                _ev(f"清仓：{last_err}")
+                continue
+            for item in dex_left.get("assetPositions") or []:
+                p = item.get("position") or {}
+                if _f(p.get("szi")):
+                    left.append({"coin": p.get("coin") or "?", "size": abs(_f(p.get("szi")))})
         if left:
             last_err = (f"复查仍有 {len(left)} 个仓位未平（"
                         + "、".join(str((p or {}).get("coin") or "?") for p in left) + "）")
@@ -627,6 +666,26 @@ def flatten_all(db: Any, params: Any, info: Any, ex: Any, notifier: Any = None, 
             c = str((p or {}).get("coin") or "")
             prices.setdefault(c, _f((p or {}).get("mark_px")))
         booked = _close_local_positions(db, params, still, prices, _ev, book_pnl=book_pnl)
+        # MR 台账（mr_trades）同步关账：否则下一轮 MR tick 会把「台账 OPEN + 交易所空仓」
+        # 判成 recon_err —— 而这时 key 快/已失效，没人能再人工修。
+        try:
+            mr_row = db.mr_open_trade()
+            if mr_row is not None:
+                px = _f(touched.get("xyz:XYZ100")) or _f(mr_row["entry_price"])
+                qty = _f(mr_row["qty"])
+                entry_px = _f(mr_row["entry_price"])
+                notional = _f(mr_row["notional"])
+                if px > 0 and qty > 0:
+                    fee = 0.0009 * (notional + qty * px)
+                    db.mr_close_trade(
+                        int(mr_row["id"]), exit_price=px, exit_order_id="",
+                        exit_ts=time.time(), exit_reason=EXIT_REASON_EXPIRY,
+                        exit_signal_date=None, funding_pct=None, fee_quote=fee,
+                        net_pnl=(px - entry_px) * qty - fee,
+                        raw={"by": "agent_expiry", "price_source": "fill_or_entry"})
+                    _ev(f"清仓：MR 台账 #{mr_row['id']} 已关账 @ {px:,.2f}")
+        except Exception as e:                                    # noqa: BLE001
+            logger.warning("[agent] MR 台账关账失败：%s", e)
         return {"ok": True, "error": "", "closed": closed, "attempts": attempts,
                 "dry": False, "cancelled": len(cancelled),
                 "closed_local": booked, "cancel_failed": cancel_failed}

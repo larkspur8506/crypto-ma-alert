@@ -124,7 +124,8 @@ class HlExchange:
 
     def __init__(self, account_address: str = "", private_key: str = "", base_url: str = MAINNET,
                  dry_run: bool = True, timeout: float = 15.0, max_slippage_pct: float = 0.003,
-                 info: Any = None, sdk: Any = None, wallet: Any = None):
+                 info: Any = None, sdk: Any = None, wallet: Any = None,
+                 perp_dexs: Optional[List[str]] = None):
         self.account_address = account_address or ""
         self.private_key = private_key or ""
         self.base_url = (base_url or MAINNET).rstrip("/")
@@ -135,6 +136,11 @@ class HlExchange:
         self._exchange = sdk
         self._wallet = wallet
         self._init_error = ""
+        #: 官方 SDK 要显式列出 builder perp dex 才会把 `xyz:XYZ100` 装进 name_to_coin；
+        #: 不传时 `name_to_asset()` 直接 KeyError（下单/设置杠杆全部失败）。
+        #: **必须同时带空串（主 dex）**：SDK 的 perp_dexs 是「全量替换」而不是追加 ——
+        #: 只传 ["xyz"] 时 BTC/ETH/SOL 会从 name_to_coin 里消失，主腿全部下不了单。
+        self.perp_dexs = list(perp_dexs) if perp_dexs is not None else ["", "xyz"]
 
     # ------------------------------------------------------------ 初始化
     @property
@@ -154,7 +160,8 @@ class HlExchange:
             from hyperliquid.utils.types import Cloid
             self._wallet = self._wallet or Account.from_key(self.private_key)
             self._exchange = Exchange(self._wallet, self.base_url,
-                                      account_address=self.account_address, timeout=self.timeout)
+                                      account_address=self.account_address, timeout=self.timeout,
+                                      perp_dexs=self.perp_dexs)
             return True
         except Exception as e:                                       # noqa: BLE001
             self._init_error = _exc_text(f"初始化 SDK 失败：{e}")
