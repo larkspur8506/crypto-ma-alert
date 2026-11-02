@@ -890,6 +890,8 @@ def _admin_deps():
         cleanup_enabled_fn=lambda: _cleanup_on(),
         # /why 诊断（只读）：阶段 B 起优先读快照里的六步结论，缺失才现取
         why_rows_fn=lambda: _why_rows(),
+        # MR 腿运行态（开关本身由面板读 DB `mr_enabled`；这里只给「状态/对账/持仓」一行）
+        mr_fn=lambda: dict(_MR_STATUS) if _MR_STATUS else None,
         # 取不到现价时预览降级成「无法取价」，不硬编一个假价格
         price_fallback=0.0,
     )

@@ -403,15 +403,44 @@ class TestMrFillConfirmation(unittest.TestCase):
 class TestMrPanelAndSizing(unittest.TestCase):
     """复核 P2/P3：面板要有 MR 区块；crypto 腿定仓基数要剔除 MR 占用。"""
 
-    def test_panel_block_renders_switch_and_state(self):
-        from app.hl.views import _mr_block
-        html = _mr_block({"admin_k": "tok", "mr": {
-            "enabled": False, "state": "disabled", "recon": "ok"}})
-        self.assertIn("/admin/hl/mr", html)
-        self.assertIn("name='on' value='1'", html)
-        self.assertIn("name='on' value='0'", html)
-        self.assertIn("停用", html)
-        self.assertIn("value='tok'", html)
+    def test_mr_switch_lives_in_the_admin_card(self):
+        """MR 开关在页尾「管理」卡里（与拉闸同卡），不单独占一栏。"""
+        from types import SimpleNamespace
+        from app.admin_ui import AdminDeps, render_admin_card
+
+        class _DB:
+            def __init__(self, cfg=None):
+                self.cfg = dict(cfg or {})
+
+            def get_config_str(self, key, default=""):
+                return self.cfg.get(key, default)
+
+            def get_config(self):
+                return dict(self.cfg)
+
+            def set_config(self, key, value):
+                self.cfg[key] = value
+
+            def hl_kill(self):
+                return False
+
+            def hl_log_event(self, *a, **k):
+                pass
+
+        for flag, want_on in (("0", False), ("1", True)):
+            deps = AdminDeps(
+                db=_DB({"mr_enabled": flag}), config_fn=lambda: SimpleNamespace(),
+                hl_deps=None, mode_fn=lambda: "live", token_fn=lambda: "tok",
+                mr_fn=lambda: {"state": "disabled" if not want_on else "flat",
+                               "recon": "ok", "enabled": want_on})
+            html = render_admin_card(deps)
+            self.assertIn("/admin/hl/mr", html)
+            self.assertIn("name='on' value='1'", html)
+            self.assertIn("name='on' value='0'", html)
+            self.assertIn("value='tok'", html)
+            self.assertIn("已启用" if want_on else "已停用（默认）", html)
+            # 开关卡片必须与拉闸同一张卡（页尾唯一写入口）
+            self.assertLess(html.index("拉闸（kill switch）"), html.index("MR 腿（QQQ 超跌反弹）"))
 
     def test_effective_equity_subtracts_mr_margin(self):
         from app.hl.executor import ExecParams, Executor
