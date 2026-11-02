@@ -163,6 +163,8 @@ class AdminDeps:
     # 「为什么没开仓」（PR-5 /why）：可注入的行数据源，便于测试固定输出（不触网）。
     # 缺省时总览会走 app.why.build_rows（现取 4h K 线、只读）。
     why_rows_fn: Optional[Callable[[], Any]] = None
+    #: MR 腿运行态（`main._MR_STATUS` 的快照）；开关本身读 DB `mr_enabled`。
+    mr_fn: Optional[Callable[[], Any]] = None
 
     def __post_init__(self) -> None:
         if self.set_config is None:
@@ -1531,6 +1533,23 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
     o.append("<div class='hint'>origin=dd（回撤熔断）时「解除」会在同一请求里重置回撤基线，"
              "否则下一轮又立刻熔断；其它来源的停手只解锁、不动基线。</div>")
 
+    # ---- MR 腿（QQQ 超跌反弹）：与拉闸同一张卡，不单独占一栏（2026-11-02 用户要求）----
+    # 它是**独立腿**（xyz dex 的 XYZ100，默认停用），但开关语义与拉闸一致：
+    # 只挡新入场，已持仓照常按信号离场。所以放在这里而不是单开一张卡 ——
+    # 页尾这张卡是面板唯一的写入口，MR 开关排在应急动作之后、续期之前。
+    o.append("<div class='sec'>MR 腿（QQQ 超跌反弹）</div>")
+    mr_on, mr_bits = _mr_switch(deps)
+    o.append("<div class='hint'>当前：<b>" + ("已启用" if mr_on else "已停用（默认）") + "</b>"
+             + (f" · {_esc(mr_bits)}" if mr_bits else "")
+             + "&nbsp;｜ 只挡新入场，已持仓仍按信号离场（与拉闸同理）。"
+             + "&nbsp;xyz:XYZ100 · 名义 = 权益×0.5。</div>")
+    o.append("<form method='post' action='/admin/hl/mr'>"
+             f"<input type='hidden' name='k' value='{_esc(_token_of(deps))}'>"
+             f"<button class='{'red' if not mr_on else 'gray'}' type='submit' name='on' value='1'>"
+             "启用 MR 腿</button>"
+             f"<button class='{'gray' if mr_on else 'red'}' type='submit' name='on' value='0'>"
+             "停用 MR 腿</button></form>")
+
     # ---- 更新 API（续期）----
     o.append("<div class='sec'>更新 API（续期）</div>")
     o.append(render_agent_renew_block(deps))
@@ -1546,6 +1565,46 @@ def render_admin_card(deps: AdminDeps, cfg: Any = None) -> str:
                  "<button class='gray' type='submit'>清除兜底</button></form>")
     o.append("</div>")
     return "".join(o)
+
+
+_MR_STATE_TXT = {
+    "disabled": "停用", "flat": "空仓等信号", "holding": "持仓中",
+    "entered": "刚入场", "exited": "刚离场", "order_rejected": "下单被拒",
+    "entry_not_filled": "入场未成交", "exit_not_filled": "离场未成交（仍有仓）",
+    "recon_err": "对账不平（需人工）", "no_data": "数据不足", "no_equity": "权益不可读",
+    "error": "异常", "mode_off": "执行器 off", "margin_mode_failed": "保证金设置失败",
+}
+
+
+def _mr_switch(deps: AdminDeps) -> tuple:
+    """MR 腿开关 → (是否启用, 运行态人话)。
+
+    开关**读 DB**（`configuration.mr_enabled`）—— 它是唯一权威；运行态来自 main 的
+    `_MR_STATUS`（读不到就留空，不冒充「正常」）。
+    """
+    raw = ""
+    try:
+        raw = str(deps.db.get_config_str("mr_enabled", "0") or "0").strip().lower()
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[admin] 读 mr_enabled 失败：%s", e)
+        raw = str(deps.get_all().get("mr_enabled") or "0").strip().strip('"').lower()
+    on = raw in ("1", "true", "on")
+    bits: List[str] = []
+    try:
+        mr = deps.mr_fn() if deps.mr_fn is not None else None
+    except Exception:                                             # noqa: BLE001
+        mr = None
+    if isinstance(mr, dict) and mr:
+        state = str(mr.get("state") or "")
+        bits.append(_MR_STATE_TXT.get(state, state or "—"))
+        if mr.get("recon"):
+            bits.append(f"对账 {mr['recon']}")
+        pos = mr.get("pos")
+        if isinstance(pos, dict) and pos.get("qty"):
+            bits.append(f"持仓 {pos.get('qty')}")
+        if mr.get("error"):
+            bits.append(f"错误 {str(mr['error'])[:80]}")
+    return on, " · ".join(bits)
 
 
 def _token_of(deps: AdminDeps) -> str:
