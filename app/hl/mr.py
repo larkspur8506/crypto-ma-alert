@@ -10,8 +10,12 @@
   xyz dex 的 marginUsed（MR 仓占用）。uPnL 不用再减——它已经在两边。
 - **市价单**：HL 没有真市价，用激进 IOC 限价（mid ± slippage_bps 带宽），
   价格按官方规则取整（≤5 位有效数字、≤6−szDecimals 位小数）。
-- **幂等**：cloid 由 `make_cloid(coin, signal_ms, purpose)` 确定性推导；
-  台账 `signal_date` 唯一约束兜底。
+- **成交只认持仓**：回执 `status=filled` 之外还要看到 xyz dex 的仓真的出现/消失；
+  `resting`/`dry`/零成交一律不记账（离场未清干净保持 OPEN 重试）。
+- **杠杆**：入场前 `update_leverage(coin, 5x, cross)`（幂等）——否则该 dex 若是
+  30x 逐仓，−3.3% 就强平，而 MR 本身不挂止损。
+- **幂等**：台账 `signal_date` 唯一约束 + 「只在空仓时入场」是护栏；cloid 按 tick 分钟
+  派生（同一轮重放同键，跨轮重试换键 —— 已用过的 cloid 重试会被拒）。
 - **费用**：HIP-3 taker 0.09%/边，净盈亏按 0.0009×名义×2 边估算入账
   （fee_quote 列），funding 用 `userFundingHistory` 实际值。
 - **对账 fail-closed**、**kill/开关只挡入场不挡离场**、**MR 异常不拖死主腿**
@@ -56,6 +60,15 @@ class HlMrConfig:
     funding_baseline_pct_per_h: float = 0.0004
     #: 即时止损触发器：成交滑点（|avg_px−ref|/ref）超过该 bp → 自动停用 MR 腿。
     max_slippage_bps: float = 20.0
+    #: 显式杠杆/保证金模式：Lighter 侧有 `ensure_isolated(1x)`，HL 侧原来完全没设 ——
+    #: 若该 dex 落成 30x 逐仓，−3.3% 就强平（MR 无止损、历史最差 −17.8%）。
+    #: 入场前按这里设一次（幂等）；调用失败只告警不阻断（退回今天的实际设置）。
+    leverage: int = 5
+    cross_margin: bool = True
+    #: 成交确认：IOC 回执 `filled` 之外，还要看到 xyz dex 的持仓真的出现/消失才记账
+    #: （`resting`/`dry`/部分成交都不算成交；2026-11-02 复核 P1）。
+    fill_confirm_s: float = 12.0
+    fill_poll_s: float = 1.0
 
 
 def _round_px(px: float, sz_decimals: int) -> float:
@@ -83,6 +96,8 @@ class HlMrLeg:
         self.notifier = notifier
         self.clock = clock
         self._recon_alerted_at = 0.0
+        #: 订单类告警去重（key → 上次发送时刻）；入场窗口内每 5 分钟重试不刷屏。
+        self._order_alerted_at: Dict[str, float] = {}
 
     # ------------------------------------------------------------------ 读
 
@@ -110,6 +125,37 @@ class HlMrLeg:
                 self.notifier.send_message(clean)
             except Exception:                                 # noqa: BLE001
                 logger.exception("MR 告警通知失败")
+
+    def _alert_throttled(self, key: str, text: str,
+                         interval_s: float = 30 * 60.0) -> None:
+        """同一类订单问题在 `interval_s` 内只发一次（入场窗口每轮重试不刷屏）。"""
+        now_s = self.clock()
+        last = float(self._order_alerted_at.get(key, 0.0) or 0.0)
+        if last and now_s - last < interval_s:
+            logger.warning("mr: %s（同类告警已去重）", text)
+            return
+        self._order_alerted_at[key] = now_s
+        self._alert(text)
+
+    def _await_position(self, address: str, *, want: bool,
+                        confirm_s: Optional[float] = None) -> Optional[dict]:
+        """轮询 xyz dex 持仓，直到「出现」（want=True）或「消失」（want=False）。
+
+        返回最后一次读到的持仓（None = 没有仓）。成交只认持仓，不认回执 ——
+        HL 的 `status=filled` 也可能只成交一部分，数量以持仓为准。
+        """
+        cfg = self.config
+        budget = float(cfg.fill_confirm_s if confirm_s is None else confirm_s)
+        poll = max(float(cfg.fill_poll_s), 0.0)
+        attempts = 1 if poll <= 0 or budget <= 0 else int(budget / poll) + 1
+        pos = None
+        for i in range(max(attempts, 1)):
+            pos = (self._read_account(address) or {}).get("mr_pos")
+            if (pos is not None) is bool(want):
+                return pos
+            if i + 1 < attempts:
+                time.sleep(poll)
+        return pos
 
     def _auto_disable(self, reason: str) -> None:
         """即时止损触发器：写 mr_enabled=0（只挡新入场）+ 审计事件 + 告警。"""
@@ -145,6 +191,20 @@ class HlMrLeg:
         if expected > 0 and funding_pct > 2.0 * expected and funding_pct > 0.01:
             self._auto_disable(f"funding {funding_pct:.3f}% 超基线 2 倍"
                                f"（预期 {expected:.3f}%，持仓 {hours:.1f}h）")
+
+    def _ensure_leverage(self, status: Dict[str, Any]) -> None:
+        """入场前把该 coin 的杠杆/保证金模式设成配置值（幂等；失败只告警不阻断）。"""
+        cfg = self.config
+        try:
+            res = self.exchange.update_leverage(
+                cfg.coin, int(cfg.leverage), cross=bool(cfg.cross_margin))
+            if not res.get("ok"):
+                raise RuntimeError(str(res.get("error") or res.get("status") or "unknown"))
+            status["leverage"] = f"{cfg.leverage}x/{'cross' if cfg.cross_margin else 'isolated'}"
+        except Exception as exc:                              # noqa: BLE001
+            status["leverage_error"] = f"{type(exc).__name__}: {exc}"
+            self._alert_throttled(
+                "leverage", f"MR 杠杆设置失败（按账户现有设置继续）：{type(exc).__name__}: {exc}")
 
     # ------------------------------------------------------------------ 入场
 
@@ -197,7 +257,7 @@ class HlMrLeg:
     def _mark(self, rows: List[dict], mr_pos: Optional[dict]) -> float:
         cfg = self.config
         try:
-            mids = self.info.all_mids() or {}
+            mids = self.info.all_mids(dex=cfg.dex) or {}
             mark = float(mids.get(cfg.coin) or 0.0)
         except Exception:                                     # noqa: BLE001
             mark = 0.0
@@ -262,6 +322,14 @@ class HlMrLeg:
             status["state"] = "recon_err"
             return status
 
+        # 给 crypto 腿定仓用的「MR 占用」（只在有仓时非 0；读不到保持 0）
+        status["margin_used"] = float(account.get("mr_margin_used") or 0.0)
+
+        # 停用且空仓：连 K 线都不拉（每 5 分钟一轮，停用态不该有取数成本）
+        if not enabled and not holding:
+            status["state"] = "disabled"
+            return status
+
         # ---- 会话与信号 --------------------------------------------------------
         rows = self._candles(now)
         sessions = mr_signal.aggregate_sessions(rows)
@@ -272,9 +340,6 @@ class HlMrLeg:
         status["last_session_date"] = sessions[-1].date
         status["sessions_usable"] = len(sessions)
 
-        if not enabled and not holding:
-            status["state"] = "disabled"
-            return status
         if holding:
             return self._maybe_exit(now, sessions, rows, open_row, pos, status)
         return self._maybe_enter(now, sessions, rows, account, status)
@@ -330,30 +395,62 @@ class HlMrLeg:
             self.db.mr_mark_skipped(signal_date, "notional > equity（保证金不足保护）")
             return status
 
-        cloid = make_cloid(cfg.coin, _signal_ms(signal_date), "mr_entry")
+        self._ensure_leverage(status)
+        cloid = make_cloid(cfg.coin, _attempt_ms(now), "mr_entry")
         limit_px = _round_px(mark * (1 + cfg.slippage_bps / 10000.0), sz_dec)
         result = self.exchange.place_order(
             cfg.coin, True, sz, limit_px, reduce_only=False, tif="Ioc",
             cloid=cloid)
         if not result.get("ok"):
-            # 下单失败：不写台账（下次 tick 同 cloid 重试），告警由 exchange 层清洗
+            # 下单失败：不写台账（下次 tick 换 cloid 重试），告警由 exchange 层清洗
             status["state"] = "order_rejected"
             status["error"] = str(result.get("error") or result.get("raw") or "unknown")
-            self._alert(f"MR 入场被拒：{status['error'][:200]}")
+            self._alert_throttled("entry_rejected", f"MR 入场被拒：{status['error'][:200]}")
             return status
+        # 「受理」不等于「成交」：IOC 只认 filled；再用 xyz dex 持仓核一遍实际数量
+        if str(result.get("status") or "") != "filled":
+            status["state"] = "entry_not_filled"
+            status["error"] = f"回执 status={result.get('status')!r}"
+            self._alert_throttled(
+                "entry_not_filled",
+                "MR 入场单未成交（回执不是 filled）——不写台账，下轮重试")
+            return status
+        filled = self._await_position(self.address_fn() or "", want=True)
+        if filled is None:
+            status["state"] = "entry_not_filled"
+            status["error"] = "确认窗口内 xyz dex 没有持仓"
+            self._alert_throttled(
+                "entry_not_filled",
+                "MR 入场单回执 filled 但 xyz dex 没有出现持仓——不写台账，下轮重试")
+            return status
+        filled_sz = abs(float(filled.get("szi") or 0.0))
+        if filled_sz <= 0:
+            status["state"] = "entry_not_filled"
+            return status
+        entry_px = float(filled.get("entry_px") or 0.0)
+        if entry_px <= 0:
+            entry_px = float(result.get("avg_px") or mark)
         trade_id = self.db.mr_record_entry(
             signal_date=signal_date, entry_session=decision["entry_session_date"],
-            qty=sz, qty_int=int(round(sz * 10 ** 4)), entry_price=mark,
-            entry_order_id=str(result.get("oid") or ""),
-            entry_ts=now / 1000.0, notional=sz * mark, margin=sz * mark,
-            equity_at_entry=equity_total,
+            qty=filled_sz, qty_int=int(round(filled_sz * 10 ** 4)),
+            entry_price=entry_px, entry_order_id=str(result.get("oid") or ""),
+            entry_ts=now / 1000.0, notional=filled_sz * entry_px,
+            margin=filled_sz * entry_px, equity_at_entry=equity_total,
             raw={"ref_price": mark, "limit_px": limit_px, "cloid": cloid,
+                 "planned_sz": sz, "filled_sz": filled_sz,
+                 "fill_source": "xyz_dex_position",
                  "result_status": str(result.get("status"))})
+        if abs(filled_sz - sz) > 1e-9:
+            try:
+                self.db.hl_log_event("mr_entry_partial_fill",
+                                     f"MR 入场部分成交：计划 {sz} / 实际 {filled_sz}")
+            except Exception:                             # noqa: BLE001
+                pass
         self._slippage_guard(result, mark, side="入场")
         status["state"] = "entered"
         status["last_fill_at"] = now / 1000.0
-        self._alert(f"MR 入场：{cfg.coin} {sz} @≈{mark:.2f}"
-                    f"（名义 {sz * mark:.2f}，信号 {signal_date}），台账 #{trade_id}")
+        self._alert(f"MR 入场：{cfg.coin} {filled_sz} @≈{entry_px:.2f}"
+                    f"（名义 {filled_sz * entry_px:.2f}，信号 {signal_date}），台账 #{trade_id}")
         return status
 
     def _mark_expired_signal(self, sessions, now_ms: int) -> None:
@@ -389,6 +486,10 @@ class HlMrLeg:
         }
         if exit_date is None:
             return status
+        if pos is None:
+            # 台账有 OPEN 但 xyz dex 还没看到仓（刚下单的宽限窗口）——没有仓可平
+            status["state"] = "holding"
+            return status
         sz_dec = self._sz_decimals()
         if sz_dec is None:
             status["state"] = "error"
@@ -401,7 +502,7 @@ class HlMrLeg:
             status["error"] = "无可用标记价"
             return status
         sz = abs(float(pos["szi"])) if pos else float(open_row["qty"])
-        cloid = make_cloid(cfg.coin, _signal_ms(str(exit_date)), "mr_exit")
+        cloid = make_cloid(cfg.coin, _attempt_ms(now), "mr_exit")
         limit_px = _round_px(mark * (1 - cfg.slippage_bps / 10000.0), sz_dec)
         result = self.exchange.place_order(
             cfg.coin, False, sz, limit_px, reduce_only=True, tif="Ioc",
@@ -409,7 +510,19 @@ class HlMrLeg:
         if not result.get("ok"):
             status["state"] = "holding"
             status["error"] = str(result.get("error") or result.get("raw") or "unknown")
-            self._alert(f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+            self._alert_throttled("exit_rejected",
+                                  f"MR 离场被拒（下轮重试）：{status['error'][:200]}")
+            return status
+        # 受理 ≠ 成交：必须看到 xyz dex 的仓真的没了才关账（否则台账 CLOSED + 裸仓）
+        left = self._await_position(self.address_fn() or "", want=False)
+        if left is not None or str(result.get("status") or "") != "filled":
+            remain = (left or {}).get("szi", "?") if isinstance(left, dict) else "?"
+            status["state"] = "exit_not_filled"
+            status["error"] = f"回执 status={result.get('status')!r}，剩余 {remain}"
+            self._alert_throttled(
+                "exit_not_filled",
+                "MR 离场单已受理但 xyz dex 仍有持仓（零成交/部分成交）——台账保持 OPEN，"
+                "下轮重试")
             return status
         funding_paid = self._funding_paid(open_row, now)
         notional = float(open_row["notional"] or 0.0)
@@ -443,9 +556,13 @@ class HlMrLeg:
             start_ms = int(float(open_row["entry_ts"]) * 1000) - 3600_000
             rows = self.info.user_funding_history(self.address_fn(), start_ms, now_ms)
             total = 0.0
+            bare = cfg.coin.split(":")[-1]
             for item in rows or []:
                 delta = item.get("delta") or {}
-                if delta.get("type") == "funding" and delta.get("coin") == cfg.coin:
+                # HIP-3 的 coin 命名两可（`xyz:XYZ100` 或裸 `XYZ100`），两种都认；
+                # 实测主 dex 记录给的是裸名，HIP-3 无历史可证 ⇒ 不做单边假设。
+                if (delta.get("type") == "funding"
+                        and delta.get("coin") in (cfg.coin, bare)):
                     total += float(delta.get("usdc") or 0.0)
             return -total          # HL：usdc 负 = 多头支付 → 取反变「已付为正」
         except Exception as exc:                              # noqa: BLE001
@@ -453,7 +570,10 @@ class HlMrLeg:
             return 0.0
 
 
-def _signal_ms(signal_date: str) -> int:
-    """会话日期 → 确定性毫秒键（UTC 零点）。cloid 只需要稳定。"""
-    dt = datetime.strptime(signal_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-    return int(dt.timestamp() * 1000)
+def _attempt_ms(now_ms: int) -> int:
+    """按「当前 tick 分钟」派生 cloid 键：同一轮重放同键，跨轮重试换键。
+
+    交易所会拒**已用过**的 cloid；固定用信号日期会让零成交后的重试永远被拒。
+    真正的幂等护栏是台账 `mr_trades.signal_date` 唯一约束 + 只在空仓时入场。
+    """
+    return max(int(now_ms) // 60_000, 1)

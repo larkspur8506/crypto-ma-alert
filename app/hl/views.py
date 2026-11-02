@@ -996,12 +996,22 @@ def status_payload(deps: DashboardDeps) -> dict:
     except Exception as e:                                            # noqa: BLE001
         logger.warning("[hl-views] 读 API 有效期状态失败（徽章显 —）：%s", e)
 
+    # MR 腿状态块：JSON 与面板 HTML 共用（原来只挂在 /api/hl/status 里，面板看不到）
+    mr_out: Optional[dict] = None
+    if deps.mr_fn is not None:
+        try:
+            raw_mr = deps.mr_fn()
+        except Exception:                                         # noqa: BLE001
+            raw_mr = {"state": "error", "error": "mr status read failed"}
+        mr_out = dict(raw_mr) if raw_mr else None
+
     return {
         "schema_version": SCHEMA_VERSION,
         "ts": now,
         "mode": mode,
         "kill": bool(kill),
         "kill_reason": kill_reason,
+        "mr": mr_out,
         "network": {
             "base_url": base_url,
             "testnet": "testnet" in base_url.lower(),
@@ -1703,6 +1713,66 @@ def _feed_line(r: Dict[str, Any], feed_map: Dict[str, Dict[str, Any]],
     return _whyline(f"数据源 {src} 失败（最后错误 {err_at}） · 已处理到 {bar_txt}", "neg")
 
 
+# ---------------------------------------------------------------- MR 腿区块
+_MR_STATE_TXT = {
+    "disabled": "停用（默认）", "flat": "空仓等信号", "holding": "持仓中",
+    "entered": "刚入场", "exited": "刚离场", "order_rejected": "下单被拒",
+    "entry_not_filled": "入场未成交", "exit_not_filled": "离场未成交（仍有仓）",
+    "recon_err": "对账不平（需人工）", "no_data": "数据不足", "no_equity": "权益不可读",
+    "error": "异常", "mode_off": "执行器 off", "margin_mode_failed": "保证金设置失败",
+}
+
+
+def _mr_block(p: dict) -> str:
+    """「MR 腿（QQQ 超跌反弹）」卡片：状态 + 开/关按钮。
+
+    MR 是独立腿（xyz dex 的 XYZ100），默认停用；这个开关只挡**新入场**，
+    已持仓仍按信号离场。`p["mr"]` 是 main 里 MR tick 写的状态块（读不到 = None）。
+    """
+    raw = p.get("mr")
+    k = str(p.get("admin_k") or "")
+    mr = _as_dict(raw) if raw else None
+    o = ["<h2>MR 腿（QQQ 超跌反弹）<span class=\"muted\">xyz:XYZ100 · 默认停用 · 单独资金口径</span></h2>",
+         "<div class='card'>"]
+    if not mr:
+        o.append("<div class='kv dim'>状态未知（MR tick 还没跑过或执行器 off）</div>")
+    else:
+        state = str(mr.get("state") or "")
+        enabled = bool(mr.get("enabled"))
+        err = str(mr.get("error") or "")
+        lines = [
+            f"开关 <b class='{'pos' if enabled else 'dim'}'>{'启用' if enabled else '停用'}</b>",
+            f"状态 {_esc(_MR_STATE_TXT.get(state, state or '—'))}",
+            f"对账 {_esc(str(mr.get('recon') or '—'))}",
+        ]
+        if mr.get("kill"):
+            lines.append("<b class='neg'>全局 kill 生效（挡新入场）</b>")
+        pos = _as_dict(mr.get("pos")) if mr.get("pos") else None
+        if pos:
+            upnl = _opt_num(pos.get("upnl"))
+            lines.append(f"持仓 {_esc(str(pos.get('qty') or '—'))} @ "
+                         f"{_num(pos.get('entry_price')):,.2f}"
+                         + (f"（浮盈 <b class='{'pos' if (upnl or 0) >= 0 else 'neg'}'>"
+                            f"{upnl:+,.2f} U</b>）" if upnl is not None else ""))
+        if mr.get("last_session_date"):
+            lines.append(f"最后会话 {_esc(str(mr.get('last_session_date')))}")
+        if err:
+            lines.append(f"<span class='neg'>错误 {_esc(err[:160])}</span>")
+        o.append("<div class='kv'>" + " · ".join(lines) + "</div>")
+
+    o.append("<div style='margin-top:8px'>")
+    for want, label, note in ((1, "＋ 启用 MR 腿", "启用后按信号自动开仓（首次建议先核对一笔最小单）"),
+                              (0, "− 停用 MR 腿", "停用只挡新入场，已持仓照常离场")):
+        o.append(
+            f"<form method='post' action='/admin/hl/mr' style='display:inline-block;margin-right:8px'>"
+            f"<input type='hidden' name='k' value='{_esc(k)}'>"
+            f"<input type='hidden' name='on' value='{want}'>"
+            f"<button class='btn{' gray' if not want else ''}' type='submit' "
+            f"title='{_esc(note)}'>{label}</button></form>")
+    o.append("</div></div>")
+    return "".join(o)
+
+
 def _symbol_dynamics(p: dict) -> str:
     """「三标的动态」区块（2026-10-29 起与「仓位」表对换：仓位在最顶，本块在其后）。
 
@@ -2190,6 +2260,12 @@ def _render_body(p: dict) -> str:
         logger.warning("[hl-views] 上线以来统计行渲染失败：%s", e)
     o.append("</div>")
 
+    # ---------------- MR 腿（QQQ 超跌反弹，独立腿） ----------------
+    try:
+        o.append(_mr_block(p))
+    except Exception as e:                                        # noqa: BLE001
+        logger.warning("[hl-views] MR 区块渲染失败：%s", e)
+
     # ---------------- 三标的动态（含 /why 原因行与闸门） ----------------
     # 2026-10-29 用户要求与「仓位」表对换：仓位移到最顶，本块跟在盈亏曲线之后。
     # 距离行 + 原因行 + 闸门异常行都在这一块里 —— 原「为什么没开仓」表格已合并进来。
@@ -2339,17 +2415,7 @@ def build_router(deps: DashboardDeps) -> Any:
     def hl_status(request: Request, k: str = ""):
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-        payload = status_payload(deps)
-        # MR 腿状态块（feat/mr-leg）：独立于主策略，字段见 app/hl/mr.py 的 tick()。
-        # 读不到 = None（面板/聚合页显示「未知」，不冒充「正常」）。
-        if deps.mr_fn is not None:
-            try:
-                mr = deps.mr_fn()
-            except Exception:                                     # noqa: BLE001
-                mr = {"state": "error", "error": "mr status read failed"}
-            if mr:
-                payload["mr"] = mr
-        return payload
+        return status_payload(deps)
 
     @router.get("/api/hl/equity")
     def hl_equity(request: Request, k: str = ""):
