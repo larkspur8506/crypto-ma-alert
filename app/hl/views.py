@@ -1244,7 +1244,7 @@ def _pnl_svg(pnl: List[List[float]], twr: List[List[float]],
 # ---------------------------------------------------------------- HTML 渲染
 DASH_CSS = """<style>
 *{box-sizing:border-box}
-html,body{margin:0;padding:0}
+html,body{margin:0;padding:0;-webkit-text-size-adjust:100%;text-size-adjust:100%}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
      background:var(--bg);color:var(--fg);line-height:1.55;font-size:14px;padding:14px}
 .wrap{max-width:1180px;margin:0 auto}
@@ -1319,7 +1319,8 @@ details.card>summary{font-size:12px;color:var(--h2)}
 /* 仓位表窄屏适配（P2）：小字行 tr.subm 默认隐藏（宽屏 13 列齐全）；≤640px 时
    隐藏 .hidem 列、显示小字行 —— 显隐只靠 CSS media query，零 JS。 */
 tr.subm{display:none}
-tr.subm td{white-space:normal;font-size:11.5px;color:var(--muted)}
+tr.subm td{white-space:normal;font-size:11px;line-height:1.4;color:var(--muted);
+            overflow-wrap:anywhere}
 @media (max-width:640px){body{padding:9px;font-size:13px}h1{font-size:17px}
     .badge{padding:5px 10px;font-size:11px}.grid{grid-template-columns:1fr}
     .hidem{display:none}tr.subm{display:table-row}}
@@ -2203,8 +2204,7 @@ def _render_body(p: dict) -> str:
                  f"强平 {_fmt(pos.get('liq_px')) if _opt_num(pos.get('liq_px')) else '—'} · "
                  f"本单资金费 {fund_txt}</td></tr>")
     mr = _mr_view(p)
-    if mr is not None:
-        if mr["holding"]:
+    if mr is not None and mr["holding"]:
             upnl_txt, upnl_cls = _sign(mr["upnl"])
             pct = mr["upnl_pct"]
             pct_txt = f" · {pct:+.2f}%" if pct is not None else ""
@@ -2230,37 +2230,7 @@ def _render_body(p: dict) -> str:
                      f"离场线(SMA5) {_fmt(mr.get('exit_line'))} · 距离场 {dist_txt} · "
                      f"数量 {_fmt_sz(mr.get('qty'))} · 保证金 {_fmt(mr.get('margin'))} U · "
                      f"下一次评估 {_et_iso_local(mr.get('next_eval_et'))}</td></tr>")
-        else:
-            extra = []
-            if mr.get("rsi2") is not None:
-                extra.append(f"RSI2 {mr['rsi2']:.2f}")
-            if mr.get("exit_line"):
-                extra.append(f"离场线(SMA5) {_fmt(mr['exit_line'])}")
-            # 空仓也走「一行数字 + subm 小字行」，与上面 crypto 持仓行同字形同网格：
-            # 只用 colspan 脚注会和整张表对不齐（用户 2026-11-02 反馈「字体太怪」）。
-            o.append("<tr>"
-                     + _td("<b>QQQ</b> <span class='muted'>MR</span>")
-                     + _td("—")
-                     + _td("—", "num hidem")
-                     + _td("—", "num")
-                     + _td(_fmt(mr.get("mark")) if mr.get("mark") else "—", "num")
-                     + _td("—", "num")
-                     + _td("—", "num")
-                     + _td("—", "num")
-                     + _td("—", "num")
-                     + _td("—", "num hidem")
-                     + _td("—", "num hidem")
-                     + _td("—", "num hidem")
-                     + _td("—", "num hidem")
-                     + "</tr>")
-            o.append("<tr class='subm'><td colspan='13'>"
-                     f"超跌腿空仓 · {_esc(mr['status'])}"
-                     + (" · " + " · ".join(extra) if extra else "")
-                     + (f" · 下一次评估 {_et_iso_local(mr.get('next_eval_et'))}"
-                        if mr.get("next_eval_et") else "")
-                     + "</td></tr>")
-    # MR 块存在时（哪怕空仓）已有 QQQ 行，不再追加「交易所无持仓」以免自相矛盾
-    if not positions and mr is None:
+    if not positions and not (mr is not None and mr["holding"]):
         o.append(f"<tr><td colspan='13' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
