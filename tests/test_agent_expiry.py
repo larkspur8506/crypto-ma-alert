@@ -50,8 +50,10 @@ class FakeInfo:
     """HlInfo 替身：只实现到期检查与清仓用到的那几个方法。"""
 
     def __init__(self, snap=None, agents=None, raise_agents=None, raise_snapshot=None,
-                 specs=None):
+                 specs=None, dex_snap=None):
         self._snap = snap or {"positions": [], "open_orders": []}
+        #: xyz dex（MR 腿）的账户状态；默认空仓
+        self._dex = dex_snap or {"assetPositions": [], "marginSummary": {"marginUsed": "0"}}
         self._agents = agents if agents is not None else []
         self.raise_agents = raise_agents
         self.raise_snapshot = raise_snapshot
@@ -78,6 +80,12 @@ class FakeInfo:
         return {k: v for k, v in self._specs.items()
                 if coins is None or k in coins}
 
+    def user_state_dex(self, address, dex):
+        return dict(self._dex)
+
+    def perp_meta_dex(self, dex):
+        return [{"name": "xyz:XYZ100", "szDecimals": 2}]
+
 
 def _pos(coin="BTC", size=0.01, side=1, mark=83000.0):
     return {"coin": coin, "side": side, "size": size, "entry_px": mark - 100,
@@ -100,6 +108,8 @@ class FakeExchange:
         self.info = info
 
     def mid(self, coin):
+        if coin == "xyz:XYZ100":
+            return 100.0
         return 83000.0 if coin == "BTC" else 2500.0
 
     def slippage_limit(self, coin, is_buy, mid=None):
@@ -125,6 +135,9 @@ class FakeExchange:
             # 真实交易所平掉后仓位就没了：替身同步摘掉，供「复查」用
             self.info._snap["positions"] = [p for p in self.info._snap.get("positions", [])
                                             if p.get("coin") != coin]
+            self.info._dex["assetPositions"] = [
+                item for item in self.info._dex.get("assetPositions", [])
+                if (item.get("position") or {}).get("coin") != coin]
         return res
 
 
@@ -688,6 +701,30 @@ class TestFlattenAll(Base):
         info = FakeInfo(snap={"positions": list(positions), "open_orders": []})
         ex = FakeExchange(info=info, **kw)
         return self.flatten(ex, info), ex, info
+
+    def test_flattens_xyz_dex_position_and_closes_mr_ledger(self):
+        """2026-11-02 第四轮复核：到期清仓必须覆盖 xyz dex（MR 腿）。
+
+        MR 设计上不挂止损；key 到期后若只剩这一笔没平，就永远没人管了。
+        """
+        mr_pos = {"position": {"coin": "xyz:XYZ100", "szi": "2.5", "entryPx": "93",
+                               "positionValue": "250", "unrealizedPnl": "3",
+                               "leverage": {"marginUsed": "50"}}}
+        info = FakeInfo(snap={"positions": [], "open_orders": []},
+                        dex_snap={"assetPositions": [mr_pos],
+                                  "marginSummary": {"marginUsed": "50"}})
+        ex = FakeExchange(info=info)
+        self.db.mr_record_entry(
+            signal_date="2026-04-15", entry_session="2026-04-16", qty=2.5,
+            qty_int=25000, entry_price=93.0, entry_order_id="x",
+            entry_ts=0.0, notional=232.5, margin=232.5, equity_at_entry=500.0)
+        res = self.flatten(ex, info)
+        self.assertTrue(res["ok"], res)
+        self.assertTrue(any(c[0] == "order" and c[1] == "xyz:XYZ100" for c in ex.calls))
+        self.assertIsNone(self.db.mr_open_trade())
+        row = self.db.mr_recent_trades(1)[0]
+        self.assertEqual(row["state"], "CLOSED")
+        self.assertEqual(row["exit_reason"], "agent_expiry_cleanup")
 
     def test_closes_each_position_reduce_only(self):
         res, ex, _info = self.flatten_ok([_pos("BTC", 0.01, 1), _pos("ETH", 2.0, -1)])

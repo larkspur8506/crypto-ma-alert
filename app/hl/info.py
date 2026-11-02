@@ -278,6 +278,26 @@ class HlInfo:
         except (TypeError, ValueError):
             return default
 
+    def account_equity(self, address: str) -> float:
+        """账户总值（MR 腿的定仓基数）：与 `snapshot()["equity_total"]` 同口径，但只打一个端点。
+
+        统一账户：`spotClearinghouseState` 的 USDC `total` 之和 —— 它已含全部 perp dex
+        的浮盈亏（2026-10-22 两次样本对账；**没有** `marginSummary` 字段！）。
+        标准账户：主 dex `clearinghouseState.marginSummary.accountValue`。
+
+        2026-11-02 第四轮复核：MR 腿原来读 `spot_state()["marginSummary"]["accountValue"]`，
+        真实端点只回 `balances` ⇒ `equity_total` 恒 0、`no_equity` 静默不进场。
+        """
+        if self.unified:
+            spot = self.spot_state(address) or {}
+            total = 0.0
+            for b in spot.get("balances") or []:
+                if str(b.get("coin") or "") == "USDC":
+                    total += self._num(b.get("total"))
+            return total
+        st = self.user_state(address) or {}
+        return self._num((st.get("marginSummary") or {}).get("accountValue"))
+
     def snapshot(self, address: str, mids: Optional[Dict[str, float]] = None) -> dict:
         """归一化账户快照（**冻结接口**）。
 

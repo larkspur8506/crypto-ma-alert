@@ -910,11 +910,12 @@ class DB:
         self.conn.commit()
 
     def hl_log_event(self, kind: str, message: str, symbol: Optional[str] = None,
-                     data: Any = None, code_rev: str = "") -> None:
+                     data: Any = None, code_rev: str = "",
+                     ts: Optional[float] = None) -> None:
         self.conn.execute(
             "INSERT INTO hl_events(kind, symbol, message, data, code_rev, created_at) VALUES(?,?,?,?,?,?)",
             (kind, symbol, message, json.dumps(data, ensure_ascii=False) if data is not None else None,
-             code_rev, now()))
+             code_rev, now() if ts is None else float(ts)))
         self.conn.commit()
 
     @_locked

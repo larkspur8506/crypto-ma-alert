@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -52,7 +53,12 @@ class FakeInfo:
         self.now_ms = EXIT_NOW_MS
 
     def spot_state(self, address: str) -> dict:
-        return {"marginSummary": {"accountValue": str(self.equity)}}
+        # 真实 spotClearinghouseState 只回 balances（没有 marginSummary）；
+        # 2026-11-02 第四轮复核对齐形状，避免夹具再照着 bug 写。
+        return {"balances": [{"coin": "USDC", "total": str(self.equity), "hold": "0"}]}
+
+    def account_equity(self, address: str) -> float:
+        return self.equity
 
     def user_state_dex(self, address: str, dex: str) -> dict:
         if self.mr_szi == "0":
@@ -224,9 +230,13 @@ class TestMrExit(unittest.TestCase):
             self.assertEqual(row["exit_signal_date"], "2026-04-17")
             # funding = 0.03/249.24×100 ≈ 0.0120（贴近 0.0004%/h × 30.5h 基线）
             self.assertAlmostEqual(row["funding_pct"], 0.012037, places=4)
-            # net = (95.5 − 93)×2.68 − 0.03 − 0.0009×(249.24 + 2.68×95.5)
-            fee = 0.0009 * (249.24 + 2.68 * 95.5)
-            self.assertAlmostEqual(row["net_pnl"], 6.7 - 0.03 - fee, places=3)
+            # 离场成交价 = 回执 avg_px（假件 = limit_px = mid×(1−15bp)），
+            # 不是 mid —— 台账必须记实际成交口径。
+            exit_px = order["limit_px"]
+            self.assertAlmostEqual(row["exit_price"], exit_px, places=6)
+            fee = 0.0009 * (249.24 + 2.68 * exit_px)
+            self.assertAlmostEqual(row["net_pnl"],
+                                   (exit_px - 93.0) * 2.68 - 0.03 - fee, places=3)
             self.assertEqual(status["state"], "exited")
 
 
@@ -258,10 +268,10 @@ class TestMrTriggers(unittest.TestCase):
             leg.tick(now_ms=ENTRY_NOW_MS)                  # 默认 avg=limit → 15bp
             self.assertEqual(db.get_config_str("mr_enabled", "1"), "1")
 
-    def test_funding_over_twice_baseline_disables(self):
+    def test_funding_spike_over_10x_baseline_disables(self):
         with tempfile.TemporaryDirectory() as tmp:
             leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
-            info.funding_usdc = "-0.25"                    # 0.1003% >> 2×0.0122%
+            info.funding_usdc = "-0.40"                    # 0.1605% > 10×0.0122% 且 >0.10%
             _enable(db)
             db.mr_record_entry(
                 signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
@@ -462,6 +472,170 @@ class TestMrPanelAndSizing(unittest.TestCase):
         ex._note_equity_change = lambda a, b: None
         self.assertEqual(ex.effective_equity({"equity_total": 500.0, "spot_ok": True}),
                          500.0)
+
+
+class _Resp:
+    def __init__(self, payload):
+        self._body = json.dumps(payload).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestMrEquityRead(unittest.TestCase):
+    """2026-11-02 第四轮复核 P1：spotClearinghouseState **没有** marginSummary。
+
+    旧实现读 `spot["marginSummary"]["accountValue"]` ⇒ equity_total 恒 0 ⇒ no_equity
+    静默不进场；测试假件还照着 bug 造了 marginSummary，所以 CI 全绿。
+    """
+
+    def test_account_equity_uses_spot_balances(self):
+        from app.hl.info import HlInfo
+        seen = []
+
+        def opener(req, timeout=0):
+            seen.append(json.loads(req.data)["type"])
+            return _Resp({"balances": [{"coin": "USDC", "total": "499.87", "hold": "28.49"}]})
+
+        info = HlInfo(base_url="https://api.test", unified=True, opener=opener)
+        self.assertAlmostEqual(info.account_equity(ADDR), 499.87, places=6)
+        self.assertEqual(seen, ["spotClearinghouseState"])
+
+    def test_read_account_uses_account_equity(self):
+        class _Info:
+            def account_equity(self, address):
+                return 500.0
+
+            def user_state_dex(self, address, dex):
+                return {"marginSummary": {"marginUsed": "0"}, "assetPositions": []}
+
+            def spot_state(self, address):
+                raise AssertionError("不该再读 spot_state 的 marginSummary")
+
+        leg = HlMrLeg(db=None, info=_Info(), exchange=None, address_fn=lambda: ADDR)
+        self.assertEqual(leg._read_account(ADDR)["equity_total"], 500.0)
+
+
+class TestHlExchangePerpDex(unittest.TestCase):
+    """2026-11-02 第四轮复核 P1：SDK 必须带 perp_dexs 才认识 xyz:XYZ100。"""
+
+    def test_sdk_gets_xyz_perp_dex(self):
+        import hyperliquid.exchange as hx
+        captured = {}
+
+        class _Rec:
+            def __init__(self, *a, **kw):
+                captured.update(kw)
+
+        orig = hx.Exchange
+        hx.Exchange = _Rec
+        try:
+            from app.hl.exchange import HlExchange
+            ex = HlExchange(account_address=ADDR, private_key="0x" + "11" * 32,
+                            dry_run=False)
+            self.assertTrue(ex._ensure())
+            self.assertEqual(captured.get("perp_dexs"), ["", "xyz"])
+        finally:
+            hx.Exchange = orig
+
+
+class TestMrGuardsRound4(unittest.TestCase):
+    def test_leverage_failure_blocks_entry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            _enable(db)
+            ex.update_leverage = lambda *a, **k: {"ok": False, "error": "boom"}
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "margin_mode_failed")
+            self.assertEqual(ex.orders, [])
+            self.assertIsNone(db.mr_open_trade())
+
+    def test_entry_adopted_after_confirmation_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            _enable(db)
+            ex.fill = False                       # 受理成功，但确认窗口内看不到仓
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "entry_not_filled")
+            self.assertIsNone(db.mr_open_trade())
+            info.mr_szi = "2.68"                   # 下一轮：交易所其实有仓
+            again = leg.tick(now_ms=ENTRY_NOW_MS + 300_000)
+            self.assertEqual(again.get("adopted"), "entry")
+            row = db.mr_open_trade()
+            self.assertIsNotNone(row)
+            self.assertAlmostEqual(row["qty"], 2.68, places=6)
+
+    def test_exit_adopted_after_confirmation_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            _enable(db)
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0,
+                margin=249.24, equity_at_entry=500.0)
+            ex.fill = False                       # 卖单受理，但确认仍读到仓
+            status = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(db.mr_open_trade()["state"], "OPEN")
+            info.mr_szi = "0"                     # 下一轮：交易所已经空仓
+            again = leg.tick(now_ms=EXIT_NOW_MS + 300_000)
+            self.assertEqual(again.get("adopted"), "exit")
+            self.assertIsNone(db.mr_open_trade())
+            row = db.mr_recent_trades(1)[0]
+            self.assertEqual(row["state"], "CLOSED")
+            self.assertEqual(row["exit_reason"], "sma5_adopted")
+
+    def test_blind_confirmation_never_closes_position(self):
+        """确认窗口整轮读不到真相 ≠ 仓位已消失：绝不许写出假 CLOSED。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            _enable(db)
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=2.68 * 93.0,
+                margin=249.24, equity_at_entry=500.0)
+            orig = leg._read_account
+            calls = {"n": 0}
+
+            def blind(address):
+                calls["n"] += 1
+                if calls["n"] > 1:
+                    raise RuntimeError("503 simulated")
+                return orig(address)
+
+            leg._read_account = blind
+            status = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(db.mr_open_trade()["state"], "OPEN")
+
+    def test_adoption_requires_matching_intent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="1.0")
+            _enable(db)
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "recon_err")
+            self.assertIsNone(db.mr_open_trade())
+
+    def test_same_day_missed_window_marks_skipped(self):
+        after = int(datetime.fromisoformat("2026-04-16T20:00:00+00:00").timestamp() * 1000)
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = after
+            _enable(db)
+            leg.tick(now_ms=after)
+            row = db.mr_trade_by_signal("2026-04-15")
+            self.assertIsNotNone(row)
+            self.assertEqual(row["state"], "SKIPPED")
 
 
 if __name__ == "__main__":
