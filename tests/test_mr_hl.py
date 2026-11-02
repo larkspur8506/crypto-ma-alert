@@ -792,6 +792,8 @@ class TestMrSignalStatusForPanel(unittest.TestCase):
         self.assertEqual(st["mark"], 96.0)
         self.assertEqual(sig["phase"], "in_window")          # 10-30 信号 → 11-02 开盘窗口
         self.assertEqual(sig["window"]["date"], "2026-11-02")
+        self.assertEqual(sig["window"]["start_et"], "09:30")
+        self.assertEqual(sig["window"]["deadline_et"], "12:30")   # 09:30 + 3h，不是 12:00
         self.assertEqual(sig["next_eval_et"][:10], "2026-11-02")
 
     def test_phase_expired_after_deadline(self):
