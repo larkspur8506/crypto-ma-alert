@@ -68,8 +68,13 @@ class HlInfo:
     def meta(self) -> dict:
         return self.post({"type": "meta"})
 
-    def all_mids(self) -> Dict[str, float]:
-        raw = self.post({"type": "allMids"})
+    def all_mids(self, dex: str = "") -> Dict[str, float]:
+        """全部 mid 价。**HIP-3 的币必须传 `dex`**：不传只回主 dex（实测 1422 个键，
+        没有 `xyz:*`；传 `dex="xyz"` 才回 141 个键、含 `xyz:XYZ100`）。"""
+        payload: Dict[str, Any] = {"type": "allMids"}
+        if dex:
+            payload["dex"] = dex
+        raw = self.post(payload)
         if not isinstance(raw, dict):
             raise HlInfoError(f"allMids 返回了非预期结构：{str(raw)[:120]}")
         out: Dict[str, float] = {}

@@ -70,7 +70,10 @@ class FakeInfo:
     def candles(self, coin: str, interval: str, start_ms: int, end_ms: int) -> list:
         return [r for r in CANDLES if start_ms <= r["t"] <= end_ms]
 
-    def all_mids(self) -> dict:
+    def all_mids(self, dex: str = "") -> dict:
+        # 真接口：不传 dex 只回主 dex（没有 xyz:*）；传 dex="xyz" 才回限定名
+        if dex == "xyz":
+            return {"xyz:XYZ100": self.mid}
         return {"XYZ100": self.mid}
 
     def user_funding_history(self, address: str, start_ms: int, end_ms: int) -> list:
@@ -79,20 +82,37 @@ class FakeInfo:
 
 
 class FakeExchange:
+    """假 HL：**默认成交**（买单改 info.mr_szi、卖单清零），可切「受理但没成交」。"""
+
     def __init__(self):
         self.orders = []
+        self.info: FakeInfo | None = None
+        self.fill = True                 # False = 回执 filled 但 xyz dex 没有仓
+        self.status = "filled"           # 可改成 resting/dry 模拟未成交回执
+        self.fill_sz = None              # 给数 = 部分成交
+
+    def update_leverage(self, coin, leverage, cross=False):
+        self.leverage_calls = getattr(self, "leverage_calls", [])
+        self.leverage_calls.append((coin, leverage, cross))
+        return {"ok": True, "status": "ok", "raw": {}}
 
     def place_order(self, coin, is_buy, sz, limit_px, **kw):
         self.orders.append(dict(coin=coin, is_buy=is_buy, sz=sz, limit_px=limit_px, **kw))
-        return {"ok": True, "status": "filled", "oid": 100 + len(self.orders),
-                "avg_px": limit_px, "filled_sz": sz, "error": None, "raw": {}}
+        done = float(self.fill_sz if self.fill_sz is not None else sz)
+        if self.fill and self.info is not None and self.status == "filled":
+            self.info.mr_szi = str(done) if is_buy else "0"
+        return {"ok": True, "status": self.status, "oid": 100 + len(self.orders),
+                "avg_px": limit_px, "filled_sz": done if self.fill else 0.0,
+                "error": None, "raw": {}}
 
 
 def _leg(tmpdir: str, **kw):
     db = DB(f"{tmpdir}/mr_{abs(hash(tmpdir)) % 99999}.db")
     info = FakeInfo(**kw)
     ex = FakeExchange()
+    ex.info = info
     leg = HlMrLeg(db=db, info=info, exchange=ex, address_fn=lambda: ADDR,
+                  config=HlMrConfig(fill_confirm_s=0.0),   # 测试不做真实轮询
                   clock=lambda: EXIT_NOW_MS / 1000.0)
     return leg, db, ex, info
 
@@ -316,6 +336,103 @@ class TestMrKillButExitWorks(unittest.TestCase):
             status = leg.tick(now_ms=EXIT_NOW_MS)
             self.assertEqual(len(ex.orders), 1)      # 离场不受 kill 影响
             self.assertEqual(status["state"], "exited")
+
+
+class TestMrFillConfirmation(unittest.TestCase):
+    """2026-11-02 复核 P1：「受理 ≠ 成交」——成交只认 xyz dex 持仓。
+
+    HL 的 IOC 回执 `status=filled` 也可能只成交一部分；`resting`/`dry` 更是没成交。
+    拿回执当成交会写出假 OPEN / 假 CLOSED（离场零成交 ⇒ 台账说空仓、交易所还有裸仓）。
+    """
+
+    def test_entry_resting_status_writes_no_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            ex.status = "resting"
+            _enable(db)
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "entry_not_filled")
+            self.assertIsNone(db.mr_open_trade())
+
+    def test_entry_filled_receipt_but_no_position_writes_no_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            ex.fill = False                       # 回执 filled，但 xyz dex 没有仓
+            _enable(db)
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "entry_not_filled")
+            self.assertIsNone(db.mr_open_trade())
+
+    def test_partial_fill_records_exchange_qty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            info.now_ms = ENTRY_NOW_MS
+            ex.fill_sz = 1.25                     # 计划 2.68，实际 1.25
+            _enable(db)
+            leg.tick(now_ms=ENTRY_NOW_MS)
+            row = db.mr_open_trade()
+            self.assertAlmostEqual(row["qty"], 1.25, places=6)
+            self.assertAlmostEqual(row["notional"], 1.25 * 93.0, places=6)
+
+    def test_exit_filled_but_position_remains_keeps_open(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp, mr_szi="2.68", mid=95.5)
+            _enable(db)
+            db.mr_record_entry(
+                signal_date="2026-04-15", entry_session="2026-04-16", qty=2.68,
+                qty_int=26800, entry_price=93.0, entry_order_id="100",
+                entry_ts=ENTRY_NOW_MS / 1000.0, notional=249.24, margin=249.24,
+                equity_at_entry=500.0)
+            ex.fill = False                       # 卖单受理但仓还在
+            status = leg.tick(now_ms=EXIT_NOW_MS)
+            self.assertEqual(status["state"], "exit_not_filled")
+            self.assertEqual(db.mr_open_trade()["state"], "OPEN")
+
+    def test_disabled_and_flat_skips_candle_fetch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            leg, db, ex, info = _leg(tmp)
+            calls = []
+            info.candles = lambda *a, **k: calls.append(1) or []
+            status = leg.tick(now_ms=ENTRY_NOW_MS)
+            self.assertEqual(status["state"], "disabled")
+            self.assertEqual(calls, [])
+
+
+class TestMrPanelAndSizing(unittest.TestCase):
+    """复核 P2/P3：面板要有 MR 区块；crypto 腿定仓基数要剔除 MR 占用。"""
+
+    def test_panel_block_renders_switch_and_state(self):
+        from app.hl.views import _mr_block
+        html = _mr_block({"admin_k": "tok", "mr": {
+            "enabled": False, "state": "disabled", "recon": "ok"}})
+        self.assertIn("/admin/hl/mr", html)
+        self.assertIn("name='on' value='1'", html)
+        self.assertIn("name='on' value='0'", html)
+        self.assertIn("停用", html)
+        self.assertIn("value='tok'", html)
+
+    def test_effective_equity_subtracts_mr_margin(self):
+        from app.hl.executor import ExecParams, Executor
+        p = ExecParams(equity_mode="follow", equity=1000.0, equity_min=20.0,
+                       mr_margin_fn=lambda: 250.0)
+        ex = Executor.__new__(Executor)
+        ex.p = p
+        ex._event = lambda *a, **k: None
+        ex._note_equity_change = lambda a, b: None
+        snap = {"equity_total": 500.0, "spot_ok": True}
+        self.assertEqual(ex.effective_equity(snap), 250.0)     # 500 − 250 → floor 250
+
+    def test_effective_equity_without_mr_is_unchanged(self):
+        from app.hl.executor import ExecParams, Executor
+        p = ExecParams(equity_mode="follow", equity=1000.0, equity_min=20.0)
+        ex = Executor.__new__(Executor)
+        ex.p = p
+        ex._event = lambda *a, **k: None
+        ex._note_equity_change = lambda a, b: None
+        self.assertEqual(ex.effective_equity({"equity_total": 500.0, "spot_ok": True}),
+                         500.0)
 
 
 if __name__ == "__main__":

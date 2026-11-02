@@ -21,7 +21,7 @@ import threading
 import weakref
 from dataclasses import dataclass, field
 from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from app.hl import (MODE_DRY, MODE_LIVE, MODE_OFF, PURPOSE_ENTRY, PURPOSE_EXIT, PURPOSE_EXIT_REHANG,
                     PURPOSE_STOP,
@@ -317,6 +317,10 @@ class ExecParams:
     # 且低成交量账户本身就调不通（每轮报错）。要启用必须显式开 hl_use_schedule_cancel。
     use_schedule_cancel: bool = False
     min_notional: float = 10.0
+    #: MR 腿（xyz dex）当前占用（保证金+uPnL）的读取器。定仓基数必须剔除它：
+    #: MR 有仓时 `equity_total` 含这部分，不剔除就等于按更大权益放大 crypto 腿的风险
+    #: （2026-11-02 复核；`equity_total = spot_usdc` 是全口径）。读不到按 0（不比今天更差）。
+    mr_margin_fn: Optional[Callable[[], float]] = None
     snapshot_min_interval_s: float = 240.0
     stop_max_hard: float = 0.10           # 执行时止损距离超此值直接放弃
     # 净 PnL 口径开关（PR-3）：**默认关** = 只用流水口径**观测**（照算 net_pnl、
@@ -2618,6 +2622,15 @@ class Executor:
                            "回落 equity_min=%s", self.p.equity_min)
             return float(self.p.equity_min or 20.0)
         live = float(snap.get("equity_total", snap.get("equity")) or 0.0)
+        # 剔除 MR 腿占用：只减正数、只在仍为正时减（减完 ≤0 说明读数异常，走下面的回落）
+        if self.p.mr_margin_fn is not None:
+            try:
+                mr_used = float(self.p.mr_margin_fn() or 0.0)
+            except Exception as e:                        # noqa: BLE001
+                logger.warning("[hl-exec] MR 占用读取失败：%s", e)
+                mr_used = 0.0
+            if mr_used > 0 and live > mr_used:
+                live -= mr_used
         if live <= 0:
             logger.warning("[hl-exec] 实时权益读到 %.4f，回落 equity_min=%.2f（不再用配置基数，"
                            "防风险放大）", live, self.p.equity_min)

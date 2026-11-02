@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -371,6 +372,7 @@ def build_executor():
     p = hl_params()
     if p.mode == "off":
         return None
+    p.mr_margin_fn = _mr_margin_used          # 定仓基数剔除 MR 占用
     try:
         from app.hl.exchange import HlExchange
         from app.hl.executor import Executor
@@ -537,6 +539,23 @@ def _job_hl_monitor() -> None:
 #: MR 腿（feat/mr-leg）：最近一次 tick 的状态块（/api/hl/status 的 `mr` 字段来源）。
 _MR_STATUS: Dict[str, Any] = {}
 _mr_leg: Optional[Any] = None
+#: 装配 MR 腿时的身份（模式/地址/密钥指纹/端点）；任一项变了就重建 —— 否则轮换
+#: API key 或切 dry/off 之后 MR 仍在用旧实例下单（2026-11-02 复核 P2）。
+_MR_IDENTITY: tuple = ()
+
+
+def _mr_margin_used() -> float:
+    """MR 腿当前占用（xyz dex 保证金 + uPnL），供 crypto 腿定仓剔除。读不到按 0。"""
+    try:
+        return max(float(_MR_STATUS.get("margin_used") or 0.0), 0.0)
+    except Exception:                                                 # noqa: BLE001
+        return 0.0
+
+
+def _mr_identity() -> tuple:
+    p = hl_params()
+    fp = hashlib.sha256((p.private_key or "").encode()).hexdigest()[:12]
+    return (p.mode, p.account_address, fp, p.base_url)
 
 
 def _build_mr_leg() -> Optional[Any]:
@@ -561,11 +580,13 @@ def _build_mr_leg() -> Optional[Any]:
 
 def _job_mr_tick() -> None:
     """每 5 分钟：MR 腿 tick（挂 _tick_lock 与主策略串行；异常只记状态不外抛）。"""
-    global _mr_leg
+    global _mr_leg, _MR_IDENTITY
     with _tick_lock:
         try:
-            if _mr_leg is None:
+            ident = _mr_identity()
+            if _mr_leg is None or ident != _MR_IDENTITY:
                 _mr_leg = _build_mr_leg()
+                _MR_IDENTITY = ident
             if _mr_leg is None:
                 _MR_STATUS.clear()
                 _MR_STATUS.update({"enabled": False, "state": "mode_off",
