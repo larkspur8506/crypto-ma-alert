@@ -157,6 +157,11 @@ class TestEntryAlertEquity(unittest.TestCase):
         from app.hl import executor as E
         sig = inspect.signature(E.fmt_entry_alert)
         self.assertIn("leverage", sig.parameters)
+        self.assertIn("signal_age_min", sig.parameters)
+        # 调用点必须真的传：漏传的话晚成交又会写成「滑点」（2026-11-05 实盘那次）
+        src_call = inspect.getsource(E.Executor._on_entry_locked)
+        self.assertIn("signal_age_min=signal_age_min", src_call)
+        self.assertIn("SIGNAL_BAR_MS", src_call)
         # equity 传的是生效基数（调用点核对）—— on_entry 现在是锁包装 + _on_entry_locked
         src = inspect.getsource(E.Executor._on_entry_locked)
         self.assertIn("equity=eff_equity", src)
