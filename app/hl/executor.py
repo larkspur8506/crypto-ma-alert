@@ -211,15 +211,43 @@ def _fmt_num(v, nd: int = 2) -> str:
         return "—"
 
 
+#: 成交距信号 bar 收盘超过这个分钟数，那一行就不再叫「滑点」—— 那是延迟漂移
+#: （待确认、被闸门挡住后补跑、手工补单），不是下单瞬间的成交质量。
+#: 与 lighter-ma-bot 的 `app/alerts.py::DELAY_LABEL_MIN` 同值同义。
+DELAY_LABEL_MIN = 10.0
+
+
+def _drift_line(drift: float, signal_px: float,
+                signal_age_min: Optional[float]) -> str:
+    """「滑点 / 延迟」那一行（与 Lighter 的 `alerts._drift_row` 同口径）。
+
+    2026-11-05 实盘教训：补单晚了 31 分钟、成交价与信号价差 1.16%，文案写
+    「滑点 +1.16%」等于把「信号过期」报成「下单滑了 1.16%」。正常 tick 在
+    bar 收盘后 2–7 分钟成交，取 10 分钟既能盖住正常抖动，又能把晚成交分出来。
+    """
+    body = f"{drift:+.2f}%（信号价 {_fmt_u(signal_px)}"
+    try:
+        age = None if signal_age_min is None else float(signal_age_min)
+    except (TypeError, ValueError):
+        age = None
+    if age is not None and age > DELAY_LABEL_MIN:
+        return f"延迟      {body}，晚 {age:.0f} 分钟）"
+    return f"滑点      {body}）"
+
+
 def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: float,
                     stop_dist: float, notional: float, margin: float, liq: float,
                     risk_u: float, equity: float, signal_px: float, oid, stop_oid,
                     when: "dt.datetime", tz_label: str,
-                    leverage: float = 5.0) -> str:
+                    leverage: float = 5.0,
+                    signal_age_min: Optional[float] = None) -> str:
     """开仓回报：价格 / 数量 / 保证金 / 强平 / 风险 分行排，别糊成一坨。
 
     equity 传**生效基数**（effective_equity），不是配置 equity —— follow 模式下
     两者默认不同，传错会让「权益的 X%」差一个数量级。
+
+    `signal_age_min` = 成交距信号 bar 收盘的分钟数；> `DELAY_LABEL_MIN` 时那一行
+    的标签从「滑点」改成「延迟」并标出晚了几分钟。
     """
     drift = ((entry_px - signal_px) / signal_px * 100) if signal_px else 0.0
     stop_pct = ((stop - entry_px) / entry_px * 100) if entry_px else 0.0
@@ -233,7 +261,7 @@ def fmt_entry_alert(coin: str, side: int, sz: float, entry_px: float, stop: floa
         f"保证金    ≈{_fmt_u(margin, 1)} U",
         f"强平价    {_fmt_u(liq)}",
         f"风险      {_fmt_u(risk_u)} U（权益的 {pct:.1f}%）",
-        f"滑点      {drift:+.2f}%（信号价 {_fmt_u(signal_px)}）",
+        _drift_line(drift, signal_px, signal_age_min),
         f"时间      {when.strftime('%m-%d %H:%M')} {tz_label}",
         f"单号      开仓 {oid} · 止损 {stop_oid}",
     ])
@@ -2204,13 +2232,22 @@ class Executor:
                                  equity_at_entry=eff_equity)
         plan2 = hl_sizing.HlOrderPlan(**{**plan.__dict__, "entry_price": avg_px,
                                          "sz": filled_sz, "notional": filled_sz * avg_px})
+        # 成交距信号 bar 收盘多少分钟：>10 分钟时那一行不再叫「滑点」（见 _drift_line）。
+        # 待确认卡拖了几小时、或补单晚了，都要能一眼看出是延迟而不是成交质量。
+        signal_age_min = None
+        try:
+            if bar_ms:
+                signal_age_min = max(
+                    0.0, (time.time() * 1000.0 - (int(bar_ms) + SIGNAL_BAR_MS)) / 60_000.0)
+        except (TypeError, ValueError):                       # 脏 bar：按「滑点」显示
+            signal_age_min = None
         self._alert_fill(fmt_entry_alert(
             coin=coin, side=side, sz=filled_sz, entry_px=avg_px, stop=stop,
             stop_dist=plan2.stop_dist, notional=plan2.notional, margin=plan2.margin,
             liq=plan2.liq_price, risk_u=plan2.risk_u, equity=eff_equity,
             signal_px=float(row["entry_price"] or avg_px), oid=res.get("oid"),
             stop_oid=stop_res.get("oid"), when=dt.datetime.now(DISPLAY_TZ), tz_label=TZ_LABEL,
-            leverage=float(self.p.leverage or 5.0)))
+            leverage=float(self.p.leverage or 5.0), signal_age_min=signal_age_min))
         self._event(EV_ORDER, f"{symbol} 开仓完成：{filled_sz} @ {avg_px:,.2f}，止损单已挂",
                     symbol=symbol, data={"risk_u": plan2.risk_u, "notional": plan2.notional})
         # 5) 开仓确认时的数量核对（PR-3）：下单前算的 sz 与真实成交可能差一个 tick

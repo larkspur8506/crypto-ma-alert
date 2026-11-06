@@ -641,6 +641,37 @@ class TestAlertFormat(Base):
         self.assertIn("ETH 做空", txt)
         self.assertIn("+4.00%", txt)          # 空单止损在上方
 
+    def test_late_fill_is_reported_as_delay_not_slippage(self):
+        """成交距信号 bar 收盘 >10 分钟 → 那一行写「延迟 晚 N 分钟」，不再叫「滑点」。
+
+        2026-11-05 实盘教训：补单晚了 31 分钟、成交价与信号价差 1.16%，文案写
+        「滑点 +1.16%」会被读成「下单瞬间滑了 1.16%」。
+        """
+        from app.hl.executor import fmt_entry_alert
+        import datetime as dt
+        txt = fmt_entry_alert(coin="BTC", side=1, sz=0.001, entry_px=10116.0, stop=9800.0,
+                              stop_dist=0.03, notional=10.1, margin=2.0, liq=8000.0,
+                              risk_u=0.3, equity=100.0, signal_px=10000.0, oid=1, stop_oid=2,
+                              when=dt.datetime(2026, 11, 6, 9, 35), tz_label="北京时间",
+                              signal_age_min=31.2)
+        self.assertIn("延迟", txt)
+        self.assertIn("晚 31 分钟", txt)
+        self.assertIn("+1.16%", txt)          # 数字照旧，只是标签换了
+        self.assertNotIn("滑点", txt)
+
+    def test_fresh_fill_keeps_slippage_label(self):
+        """正常 tick（收盘后几分钟）成交仍然是「滑点」；不传年龄时也保持旧文案。"""
+        from app.hl.executor import fmt_entry_alert
+        import datetime as dt
+        kw = dict(coin="BTC", side=1, sz=0.001, entry_px=10010.0, stop=9700.0,
+                  stop_dist=0.03, notional=10.0, margin=2.0, liq=8000.0,
+                  risk_u=0.3, equity=100.0, signal_px=10000.0, oid=1, stop_oid=2,
+                  when=dt.datetime(2026, 11, 6, 9, 35), tz_label="北京时间")
+        for extra in ({"signal_age_min": 3.0}, {}):
+            txt = fmt_entry_alert(**{**kw, **extra})
+            self.assertIn("滑点", txt, extra)
+            self.assertNotIn("延迟", txt, extra)
+
     def test_exit_alert_says_why_and_pnl(self):
         from app.hl.executor import fmt_exit_alert
         import datetime as dt
