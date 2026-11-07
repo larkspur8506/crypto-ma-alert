@@ -1137,6 +1137,11 @@ def _pnl_svg(pnl: List[List[float]], twr: List[List[float]],
     - 主曲线 = 累计盈亏（USDC，左轴）：0 基准线灰色虚线；正区间绿、负区间红
       —— 用**分段折线**实现（穿过 0 时插值出交点，两段各自着色），不是渐变、不靠 JS。
     - 叠加曲线 = 收益指数 TWR（独立缩放，右轴）：虚线；右侧标出该轴的 min/max。
+    - 桌面端铺满（2026-11-07）：容器宽 > viewBox 宽（760）时，默认的等比缩放会在
+      两侧留大片空白 —— 改 ``preserveAspectRatio="none"`` 拉伸铺满，折线全部加
+      ``vector-effect="non-scaling-stroke"``（线宽不随拉伸变粗）；SVG 内的 <text>
+      会被横向拉变形，所以 TWR min/max 刻度移成 HTML 覆盖层（.chartbox .axlbl），
+      零 JS、两套主题都走现有变量。
     """
     if len(pnl) < 2:
         return (f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' "
@@ -1199,10 +1204,12 @@ def _pnl_svg(pnl: List[List[float]], twr: List[List[float]],
             pts = [pts[0], (pts[0][0] + 0.1, pts[0][1])]   # 单点段也要可见
         coords = " ".join(f"{px},{py}" for px, py in pts)
         paths.append(f"<polyline points='{coords}' fill='none' class='{cls}' "
-                     f"stroke-width='2' stroke-linejoin='round' stroke-linecap='round'/>")
+                     f"stroke-width='2' stroke-linejoin='round' stroke-linecap='round' "
+                     f"vector-effect='non-scaling-stroke'/>")
 
     # ---- 叠加曲线：TWR 独立缩放（右轴）
     right = ""
+    labels = ""
     if len(pts_t) >= 2:
         ts_ = [p[0] for p in pts_t]
         vs = [p[1] for p in pts_t]
@@ -1216,31 +1223,44 @@ def _pnl_svg(pnl: List[List[float]], twr: List[List[float]],
 
         coords = " ".join(f"{sx(x)},{ty(v)}" for x, v in zip(ts_, vs))
         right = (f"<polyline points='{coords}' fill='none' class='gtwr' stroke-width='1.6' "
-                 f"stroke-linejoin='round' stroke-linecap='round'/>"
-                 # 右轴 min/max 两个刻度（可见文字，不靠悬停）
-                 + f"<text x='{width - pad_r + 3}' y='{ty(max(vs)) + 4}' class='gtext' "
-                   f"font-size='10'>{max(vs):,.1f}</text>"
-                 + f"<text x='{width - pad_r + 3}' y='{ty(min(vs)) + 4}' class='gtext' "
-                   f"font-size='10'>{min(vs):,.1f}</text>")
+                 f"stroke-linejoin='round' stroke-linecap='round' "
+                 f"vector-effect='non-scaling-stroke'/>")
+        # 右轴 min/max 两个刻度：preserveAspectRatio=none 会把 SVG 内 <text> 横向拉变形，
+        # 所以改成 HTML 覆盖层（.chartbox 相对定位 + axlbl 按 y 百分比定位，零 JS）。
+        labels = (f"<span class='axlbl' style='top:{ty(max(vs)) / height * 100:.1f}%'>"
+                  f"{max(vs):,.1f}</span>"
+                  f"<span class='axlbl' style='top:{ty(min(vs)) / height * 100:.1f}%'>"
+                  f"{min(vs):,.1f}</span>")
 
     grid = "".join(
         f"<line x1='{pad_l}' y1='{round(pad_t + f * plot_h, 1)}' "
         f"x2='{width - pad_r}' y2='{round(pad_t + f * plot_h, 1)}' "
-        f"class='gline' stroke-width='1'/>"
+        f"class='gline' stroke-width='1' vector-effect='non-scaling-stroke'/>"
         for f in (0.25, 0.5, 0.75))
     zero_y = sy(0.0)
     last_x, last_y = sx(xs[-1]), sy(ys[-1])
 
     return (
-        f"<svg class='chart' viewBox='0 0 {width} {height}' role='img' aria-label='盈亏曲线'>"
+        # preserveAspectRatio=none：横向铺满容器（桌面端 1180 宽不再两侧留白）；
+        # 线宽/圆点由 vector-effect 与 round-cap 短线兜住，不随拉伸变形。
+        f"<div class='chartbox'>"
+        f"<svg class='chart' viewBox='0 0 {width} {height}' preserveAspectRatio='none' "
+        f"role='img' aria-label='盈亏曲线'>"
         + grid
         # 0 基准线：盈亏曲线读的是「赚还是亏」，这条线必须在
         + f"<line x1='{pad_l}' y1='{zero_y}' x2='{width - pad_r}' y2='{zero_y}' "
-        f"class='gbase' stroke-width='1' stroke-dasharray='4 4' opacity='0.55'/>"
+        f"class='gbase' stroke-width='1' stroke-dasharray='4 4' opacity='0.55' "
+        f"vector-effect='non-scaling-stroke'/>"
         + right
         + "".join(paths)
-        + f"<circle cx='{last_x}' cy='{last_y}' r='3' class='gdot'/>"
-        + "</svg>")
+        # 末点圆点：circle 会被非等比拉伸成椭圆 —— 改用极短 round-cap 线段画点，
+        # 配合 non-scaling-stroke 在任何宽度下都是正圆。
+        + f"<line x1='{last_x}' y1='{last_y}' x2='{round(last_x + 0.01, 3)}' y2='{last_y}' "
+        f"class='gdot' stroke-width='6' stroke-linecap='round' "
+        f"vector-effect='non-scaling-stroke'/>"
+        + "</svg>"
+        + labels
+        + "</div>")
 # ---------------------------------------------------------------- HTML 渲染
 DASH_CSS = """<style>
 *{box-sizing:border-box}
@@ -1272,6 +1292,14 @@ h2{font-size:12px;margin:20px 0 8px;color:var(--h2);letter-spacing:1.5px}
 .pos{color:var(--pos)}.neg{color:var(--neg)}.warn{color:var(--warn)}.muted{color:var(--muted);font-size:12px}
 .tablewrap{overflow-x:auto;-webkit-overflow-scrolling:touch;
             border:1px solid var(--line);border-radius:10px;background:var(--card)}
+/* 右缘渐隐提示可横滚（2026-11-07）：渐隐层挂在包一层 .tscroll 的 ::after 上
+   （不能挂在 .tablewrap 自己 —— 滚动容器内的绝对定位子元素会随内容滚走）。
+   渐变到 var(--card) 色，亮暗主题各自融入卡底；无溢出的表格只有最右 16px
+   一层很淡的渐变，右对齐数字基本不受影响。 */
+.tscroll{position:relative}
+.tscroll::after{content:'';position:absolute;top:1px;bottom:1px;right:1px;width:16px;
+                border-radius:0 9px 9px 0;pointer-events:none;
+                background:linear-gradient(to left,var(--card) 3px,rgba(0,0,0,0))}
 table{border-collapse:collapse;width:100%;font-size:12.5px}
 th,td{border-bottom:1px solid var(--line);padding:6px 9px;text-align:left;white-space:nowrap}
 thead th{color:var(--muted);font-weight:500;font-size:11.5px;background:var(--card2)}
@@ -1285,6 +1313,12 @@ tr:last-child td{border-bottom:0}
 .chart-head{display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap;
             font-size:12px;color:var(--muted);margin-bottom:2px}
 .chart-head b{color:var(--fg)}
+/* 盈亏曲线的定位容器：SVG preserveAspectRatio=none 铺满后，右轴刻度以 HTML
+   覆盖层（.axlbl）按 y 百分比叠在图上 —— 相对定位锚点在这里。 */
+.chartbox{position:relative}
+.chartbox .axlbl{position:absolute;right:4px;transform:translateY(-50%);font-size:10px;
+                 line-height:1;color:var(--muted);font-variant-numeric:tabular-nums;
+                 pointer-events:none}
 svg.chart{display:block;width:100%;height:160px}
 svg.chart .gtext{fill:var(--muted)}
 svg.chart .gline{stroke:var(--line)}
@@ -1294,7 +1328,8 @@ svg.chart .gline2{stroke:var(--link)}
 svg.chart .gpos{stroke:var(--pos)}
 svg.chart .gneg{stroke:var(--neg)}
 svg.chart .gtwr{stroke:var(--link);stroke-dasharray:5 4;opacity:.9}
-svg.chart .gdot{fill:var(--link)}
+/* 末点圆点已改成 round-cap 短线段（抗非等比拉伸），所以走 stroke 不走 fill。 */
+svg.chart .gdot{stroke:var(--link);fill:none}
 .btn{display:inline-block;background:var(--btn);color:#fff;border-radius:6px;padding:5px 11px;
      font-size:12px;text-decoration:none;white-space:nowrap}
 .btn.gray{background:var(--btn-gray)}
@@ -1893,6 +1928,12 @@ def _sign(v: Any, unit: str = " U") -> tuple:
     return f"{f:+,.2f}{unit}", cls
 
 
+def _neg_txt(v: Any, txt: str) -> str:
+    """统计行里负值标红（现有 neg 类）；0 与正值原样返回。"""
+    f = _opt_num(v)
+    return f"<span class='neg'>{txt}</span>" if (f is not None and f < 0) else txt
+
+
 def _grace_seconds_cfg(cfg: Any) -> float:
     """面板侧读宽限秒数：脏值/越界一律按 900（与 main._grace_seconds 同口径）。
 
@@ -1946,7 +1987,7 @@ def _signals_html(signals: list) -> str:
     dicts = [_as_dict(x) for x in rows]
     with_pnl = any("net_pnl" in d for d in dicts)
     o.append("<h2>信号</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
+    o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
              "<th>标的</th><th>状态</th><th>方向</th><th class='num'>入场</th>"
              "<th class='num'>止损</th><th class='num'>数量</th>"
              + ("<th class='num'>净额（流水）</th>" if with_pnl else "")
@@ -1994,7 +2035,7 @@ def _signals_html(signals: list) -> str:
     if not rows:
         span = 8 if with_pnl else 7
         o.append(f"<tr><td colspan='{span}' class='muted'>暂无信号</td></tr>")
-    o.append("</tbody></table></div>")
+    o.append("</tbody></table></div></div>")
     return "".join(o)
 
 
@@ -2150,7 +2191,7 @@ def _render_body(p: dict) -> str:
     # 同一时刻同一事实只显示一份 —— 纯 CSS 显隐，零 JS）。表格仍是单一实现，
     # 不复制第二套「手机版表」。
     o.append("<h2>仓位</h2>")
-    o.append("<div class='tablewrap'><table><thead><tr>"
+    o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
              "<th>币种</th><th>方向</th><th class='num hidem'>数量</th><th class='num'>入场</th>"
              "<th class='num'>标记</th><th class='num'>浮盈浮亏</th><th class='num'>R</th>"
              "<th class='num'>止损</th><th class='num'>止损距离</th><th class='num hidem'>杠杆</th>"
@@ -2208,7 +2249,9 @@ def _render_body(p: dict) -> str:
     if mr is not None and mr["holding"]:
             upnl_txt, upnl_cls = _sign(mr["upnl"])
             pct = mr["upnl_pct"]
-            pct_txt = f" · {pct:+.2f}%" if pct is not None else ""
+            # MR 腿的 upnl_pct 是「价格涨跌幅」口径（mr.py 按 (mark-entry)/entry 算），
+            # 没有「浮盈 ÷ 保证金」的 ROE 分母 —— 不标注会被下面的 ROE 图例带偏（2026-11-07）。
+            pct_txt = (f" · {pct:+.2f}%（价格）" if pct is not None else "")
             dist_txt = (f"{mr['dist_to_exit_pct']:+.2f}%"
                         if mr["dist_to_exit_pct"] is not None else "—")
             o.append("<tr>"
@@ -2235,9 +2278,10 @@ def _render_body(p: dict) -> str:
         o.append(f"<tr><td colspan='13' class='muted'>"
                  f"{'交易所无持仓' if reachable else '交易所数据暂不可读'}"
                  f"（信号 / 下单 / 成交见「记录」页）</td></tr>")
-    o.append("</tbody></table></div>")
+    o.append("</tbody></table></div></div>")
     # 图例（可见文字，iOS 无悬停）：ROE 口径收口 + 窄屏小字行的存在说明。
     o.append('<div class="legend">浮盈 % = 浮盈 ÷ 保证金（ROE）· '
+             'QQQ 行标注「（价格）」的 % 是价格涨跌幅（无保证金分母，非 ROE）· '
              '窄屏隐藏列的数值见各仓下方小字行 · '
              'QQQ(MR) 腿不加止损，按收盘价与 SMA5 判离场</div>')
 
@@ -2322,13 +2366,14 @@ def _render_body(p: dict) -> str:
             w_twr = _opt_num(curve_meta.get("twr_total_pct")) or 0.0
             twr_label = "收益指数"
         # 小字一行（iOS 没有悬停，口径必须落在可见文字上）：四个数字一次说完。
+        # 统计行里的负值用现有 neg 类标红（净入金为负=净出金）。
         o.append(f"<div class='chart-head'><span>{curve_span}（{len(shown_pnl)} 个快照）</span>"
                  f"<span>累计盈亏 <b class='{'pos' if w_pnl >= 0 else 'neg'}'>"
                  f"{w_pnl:+,.2f} U</b></span>"
                  f"<span>{_span_links(span, str(p.get('admin_k') or ''), int(_num(p.get('refresh'))))}</span></div>")
-        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {w_pnl:+,.2f}U · "
-                 f"净入金 {w_dep:,.2f}U · 最大回撤 {w_dd:,.2f}U · "
-                 f"{twr_label} {w_twr:+.2f}%</div>")
+        o.append(f"<div class=\"legend\">{curve_span}口径：累计盈亏 {_neg_txt(w_pnl, f'{w_pnl:+,.2f}U')} · "
+                 f"净入金 {_neg_txt(w_dep, f'{w_dep:,.2f}U')} · 最大回撤 {w_dd:,.2f}U · "
+                 f"{twr_label} {_neg_txt(w_twr, f'{w_twr:+.2f}%')}</div>")
         o.append(_pnl_svg(shown_pnl, shown_twr))
         tail = f" · {_SNAPSHOT_RETENTION_NOTE}" if span == "all" else ""
         o.append('<div class="legend">实线=累计盈亏（U，左轴）· '
@@ -2365,7 +2410,7 @@ def _render_body(p: dict) -> str:
     # 异常态 / 判不清（fail-open）才照常渲染完整挂单表。子页 /admin/list/orders 不变。
     if not _orders_normal(positions, orders_open):
         o.append("<h2>交易所挂单</h2>")
-        o.append("<div class='tablewrap'><table><thead><tr>"
+        o.append("<div class='tscroll'><div class='tablewrap'><table><thead><tr>"
                  "<th>币种</th><th>类型</th><th>方向</th><th class='num'>数量</th>"
                  "<th class='num'>限价</th><th class='num'>触发价</th><th class='num'>时间</th>"
                  "</tr></thead><tbody>")
@@ -2384,7 +2429,7 @@ def _render_body(p: dict) -> str:
                      + "</tr>")
         if not orders_open:
             o.append("<tr><td colspan='7' class='muted'>交易所无挂单</td></tr>")
-        o.append("</tbody></table></div>")
+        o.append("</tbody></table></div></div>")
 
     # ---------------- 执行器（P3 R2 瘦身）----------------
     # 原「系统」卡收敛：对账/熔断两行删除（顶部状态条徽章是唯一出处）、

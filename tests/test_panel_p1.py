@@ -210,14 +210,19 @@ class TestCurveSpan(BaseCase):
         self.assertIn("近 18 天（5 个快照）", html, "span=30 标题必须变化（按实际首尾）")
         p = status_payload(self.hl_deps)["curve"]
         pnl = self._w(p["pnl"], 30)
-        self.assertIn(f"累计盈亏 {pnl[-1] - pnl[0]:+,.2f}U", html, "摘要行要按窗口重算")
+        # 2026-11-07：统计行负值套 <span class='neg'>，断言按包裹后的形态构造。
+        amt = f"{pnl[-1] - pnl[0]:+,.2f}U"
+        expect = (f"<span class='neg'>{amt}</span>" if amt.startswith("-") else amt)
+        self.assertIn(f"累计盈亏 {expect}", html, "摘要行要按窗口重算")
 
     def test_span_all_shows_retention_note_and_meta_match(self):
         html = self.hl(span="all")
         self.assertIn("全部（5 个快照）", html)
         self.assertIn("快照保留约 30 天，更早数据已清理", html, "「全部」必须注明保留期")
         meta = status_payload(self.hl_deps)["curve"]["meta"]
-        self.assertIn(f"累计盈亏 {meta['pnl_total']:+,.2f}U", html)
+        amt = f"{meta['pnl_total']:+,.2f}U"
+        expect = (f"<span class='neg'>{amt}</span>" if amt.startswith("-") else amt)
+        self.assertIn(f"累计盈亏 {expect}", html)
         self.assertIn(f"净入金 {meta['net_deposit']:,.2f}U", html)
         # 7/30 天窗不出现保留期注（那是「全部」的口径说明）
         self.assertNotIn("快照保留约 30 天", self.hl())
