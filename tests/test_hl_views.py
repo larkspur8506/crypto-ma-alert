@@ -643,6 +643,10 @@ class TestOtherRoutes(BaseCase):
         self.assertEqual(j["mode"], "live")
         self.assertTrue(j["reachable"])
         self.assertIsInstance(j["curve"], dict)
+        # 与 /api/hl/status 同口径（2026-11-07）：默认不展开 30d 点列，?curve=1 才有
+        self.assertEqual(j["curve"]["pnl"], [], "equity 默认 curve=0 不展开 30d 点列")
+        r_curve = self.client.get("/api/hl/equity", params={"curve": 1})
+        self.assertEqual(len(r_curve.json()["curve"]["pnl"]), 1)
 
     def test_api_snapshot_route(self):
         r = self.client.get("/api/hl/snapshot")
