@@ -477,6 +477,67 @@ def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
             f"<td>{' · '.join(notes) or '—'}</td></tr>")
 
 
+def _merged_funding_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
+    """资金流水「同日合并」行：金额 = 全天合计，余额口径不变（该日最后一条后的累计）。
+
+    逐条明细不在本页展示 —— 「全部 ›」子页（/admin/list/ledger）保留逐条原样。
+    """
+    amt = _opt_num(r.get("amount_usd"))
+    amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
+    # 与 _ledger_row_html 同一条小额规则：|x|<0.01 非 0 用 4 位小数（全天合计也可能很小）。
+    amt_txt = ("—" if amt is None
+               else (f"{amt:+.4f}" if amt != 0 and abs(amt) < 0.01 else f"{amt:+,.2f}"))
+    note = f"全天 {int(r.get('_cnt') or 0)} 条合并 · 明细见「全部」子页"
+    return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
+            f"<td>资金费汇总</td>"
+            f"<td class='num {amt_cls}'>{amt_txt}</td>"
+            f"<td class='num'>{_fmt(bal)}</td>"
+            f"<td class='num'>—</td>"
+            f"<td>{_esc(note)}</td></tr>")
+
+
+def _merge_funding_daily(rows: List[Dict[str, Any]],
+                         balances: List[Optional[float]],
+                         ) -> List[Tuple[Dict[str, Any], Optional[float]]]:
+    """同一天的资金费合并成一行（记录页展示层，治「每小时 1–2 条小额资金费刷屏」）。
+
+    - 仅当该日资金费 ≥2 条才合并（单条原样透传，不为合并而合并）；
+    - 合并行放在该日**最后一条**资金费的位置：rows 正序、合并行 ts 取该日最晚一条，
+      时间列仍单调不减；非资金费行（成交/出入金）原样透传；
+    - 金额 = 该日合计；余额 = 该日最后一条事件后的累计余额（口径与逐条时一致）；
+    - 纯展示：DB 原值、Σ全部流水、/admin/list/ledger 子页的逐条明细都不动。
+    """
+    last_idx: Dict[str, int] = {}
+    sums: Dict[str, float] = {}
+    cnt: Dict[str, int] = {}
+    for i, r in enumerate(rows):
+        if r.get("kind") != "funding":
+            continue
+        ts = _opt_num(r.get("ts"))
+        if ts is None:
+            continue
+        day = dt.datetime.fromtimestamp(ts, engine.DISPLAY_TZ).strftime("%m-%d")
+        last_idx[day] = i
+        sums[day] = sums.get(day, 0.0) + (_opt_num(r.get("amount_usd")) or 0.0)
+        cnt[day] = cnt.get(day, 0) + 1
+    out: List[Tuple[Dict[str, Any], Optional[float]]] = []
+    for i, (r, bal) in enumerate(zip(rows, balances)):
+        if r.get("kind") == "funding":
+            ts = _opt_num(r.get("ts"))
+            day = (dt.datetime.fromtimestamp(ts, engine.DISPLAY_TZ).strftime("%m-%d")
+                   if ts is not None else "")
+            if cnt.get(day, 0) < 2:
+                out.append((r, bal))
+                continue
+            if last_idx.get(day) != i:
+                continue                      # 同日更晚的那条接管展示
+            out.append(({"_merged_day": day, "ts": r.get("ts"),
+                         "amount_usd": sums.get(day, 0.0), "_cnt": cnt[day]}, bal))
+            continue
+        out.append((r, bal))
+    return out
+
+
 def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
     """「资金流水」区块（feat/funds-ledger）：记录页最前面的总资金流水表。
 
@@ -499,14 +560,18 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
     snap_d = dict(snap) if snap is not None else None
     equity = _num(snap_d.get("equity")) if snap_d else 0.0
     residual = equity - total
-    # 全量正序 running balance（期初 0），再切「最新 n 条」显示
+    # 全量正序 running balance（期初 0），再切「最新 n 条」显示。
+    # 同日资金费先合并成一行（展示层）：每小时 1–2 条小额资金费会把成交/出入金
+    # 挤出首屏（2026-11-07 用户确认），明细在「全部 ›」子页逐条保留。
     balances = hl_funding.running_balances(rows)
-    page = list(zip(rows[-n:] if n else [], balances[-n:] if n else []))
+    merged = _merge_funding_daily(rows, balances)
+    page = list(merged[-n:] if n else [])
     page.reverse()                      # 最新在前
 
     rows_html = ""
     for r, bal in page:
-        rows_html += _ledger_row_html(r, bal)
+        rows_html += (_merged_funding_row_html(r, bal) if "_merged_day" in r
+                      else _ledger_row_html(r, bal))
 
     equity_txt = "暂无快照" if not snap else f"{_fmt(equity)} U"
     head = (f"Σ全部流水 = {_fmt(total)} U ｜ 当前账户权益（最新快照）= {equity_txt} ｜ "
@@ -519,7 +584,8 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
                      "<th class='num'>余额</th><th class='num'>关联单</th><th>备注</th>",
                      rows_html, "暂无流水（等首次同步，或执行器未配置 HL 账户）", 6)
             + "<div class='legend'>余额 = 自账户 0 起累计（全量正序累加后再取当前页）· "
-              "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入 · 关联单 #N = 归集到的仓位</div>"
+              "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入 · 关联单 #N = 归集到的仓位 · "
+              "同日多条资金费合并为一行（金额=全天合计），逐条明细见「全部」子页</div>"
             "</div>")
 
 

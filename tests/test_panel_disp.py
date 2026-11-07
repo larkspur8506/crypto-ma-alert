@@ -229,5 +229,51 @@ class TestMrPricePctNote(BaseCase):
         self.assertIn("非 ROE", html)
 
 
+class TestFundsDailyMerge(BaseCase):
+    """资金流水同日合并（2026-11-07）：多条小时级小额资金费压成一行，明细在子页。
+
+    真渲染断言（口径同 #85/#86 的展示类验收链）：
+    - 合并行出现「资金费汇总」+「全天 N 条合并」，金额为全天合计（小额走 4 位小数）；
+    - 单条资金费的日不合并（原样透传，不为合并而合并）；
+    - 非资金费行（成交/出入金）不受影响；
+    - /admin/list/ledger 子页仍逐条展示（明细没丢）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        db = self.db
+        day0 = NOW - 3 * 3600.0            # 同一天 3 条资金费（穿插一条成交不相关）
+        db.hl_add_flow({"ts": day0, "kind": "funding", "amount": 0.0008,
+                        "hash": f"m1{NOW}"})
+        db.hl_add_flow({"ts": day0 + 3600.0, "kind": "funding", "amount": -0.0015,
+                        "hash": f"m2{NOW}"})
+        db.hl_add_flow({"ts": day0 + 7200.0, "kind": "funding", "amount": 0.0005,
+                        "hash": f"m3{NOW}"})
+        # 另一天只有 1 条（应原样透传，不合并）
+        db.hl_add_flow({"ts": day0 - 86400.0, "kind": "funding", "amount": 0.02,
+                        "hash": f"m4{NOW}"})
+
+    def test_records_page_merges_same_day_funding(self):
+        r = self.get("/admin", tab="records")
+        self.assertEqual(r.status_code, 200)
+        html = r.text
+        self.assertIn("资金费汇总", html, "同日 ≥2 条资金费应合并为一行")
+        self.assertIn("全天 3 条合并", html)
+        # 0.0008 − 0.0015 + 0.0005 = −0.0002 → 4 位小数
+        self.assertIn("-0.0002", html)
+        # 单条日不合并：仍是普通「资金费」行 + 2 位小数
+        self.assertIn("+0.02", html)
+        self.assertNotIn("全天 1 条合并", html)
+        # 合并行不是逐条渲染：3 条同日的单条金额（+0.0008/-0.0015/+0.0005）不再各占一行
+        self.assertNotIn("+0.0005", html)
+        # legend 说明合并口径
+        self.assertIn("同日多条资金费合并", html)
+
+    def test_ledger_subpage_keeps_detail(self):
+        r = self.get("/admin/list/ledger")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn("资金费汇总", r.text, "子页不应出现合并行（子页=逐条明细）")
+
+
 if __name__ == "__main__":
     unittest.main()

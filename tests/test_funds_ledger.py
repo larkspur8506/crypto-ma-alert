@@ -539,9 +539,14 @@ class TestPanelRender(BaseCase):
             self.assertIn(text, h, f"可见文本缺：{text}")
 
     def test_unattributed_funding_wording(self):
+        # 2026-11-07 起主记录页把同日 ≥2 条资金费合并成一行，「无持仓期资金费」
+        # 的逐条标注随明细移到「全部 ›」子页 —— 口径不丢，只是换了展示位置。
         self._seed()
         h = self._records_html()
-        self.assertIn("无持仓期资金费", h, "无在持仓位的资金费必须如实标注")
+        self.assertIn("资金费汇总", h, "同日 ≥2 条资金费主记录页合并为一行")
+        from app.admin_ui import render_list_subpage
+        sub = render_list_subpage(self.deps, "ledger", 20, {})
+        self.assertIn("无持仓期资金费", sub, "子页逐条明细保留「无持仓期资金费」标注")
 
     def test_recon_numbers(self):
         self._seed()

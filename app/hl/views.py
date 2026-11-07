@@ -2568,10 +2568,23 @@ def build_router(deps: DashboardDeps) -> Any:
         return status_payload(eff_deps, include_curve_points=bool(curve))
 
     @router.get("/api/hl/equity")
-    def hl_equity(request: Request, k: str = ""):
+    def hl_equity(request: Request, k: str = "", curve: int = 0, live: int = 0):
+        """只读权益 JSON（与 /api/hl/status 同一套瘦身口径，2026-11-07）。
+
+        - `curve=0`（默认）：不展开 30 天逐点 `curve.pnl`/`curve.twr`（省 ~410KB）；
+          传 `?curve=1` 返回完整点列（要画图才传）。
+        - `live=0`（默认）：若注入了 `snapshot_info_fn` 则优先读面板快照（缺失/过期
+          自动回落实时），省去每轮实连 Hyperliquid 的 ~1s 延迟；`?live=1` 强制实时。
+        - 当前无已知外部消费方（trade-hub / 脚本 / cron 均不读它），参数保持向后兼容。
+        """
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-        p = status_payload(deps)
+        eff_deps = deps
+        if not live and deps.snapshot_info_fn is not None:
+            sinfo = _call(deps.snapshot_info_fn)
+            if sinfo is not None:
+                eff_deps = replace(deps, info=sinfo)
+        p = status_payload(eff_deps, include_curve_points=bool(curve))
         a = p.get("account") or {}
         return {
             "ts": p.get("ts"),
