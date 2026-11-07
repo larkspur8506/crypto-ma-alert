@@ -371,6 +371,8 @@ def _coin_of(symbol: Any) -> str:
 # 那里合约就叫 BTC / ETH。面板一律显示 HL 侧的名字，免得看的人以为在交易 USDT 对。
 # 内部键（signal_bar_ms、幂等键、DB 里的 symbol）保持不动 —— 只换展示。
 _DISP_COIN = {"BTC_USDT": "BTC", "ETH_USDT": "ETH"}
+# 其它合约名（SOL_USDT…）的通用展示剥离：与 _disp 的后缀口径一致（2026-11-07）。
+_GENERIC_SYM_RE = re.compile(r"\b([A-Z]{2,10})_(?:USDT|USDC|USD)\b")
 
 
 def _disp(sym: Any) -> str:
@@ -386,15 +388,17 @@ def _disp(sym: Any) -> str:
 
 
 def _disp_text(text: Any) -> str:
-    """展示用：把日志文案里的信号层合约名换成 HL 侧合约名（只替换已知映射）。
+    """展示用：把日志文案里的信号层合约名换成 HL 侧合约名。
 
     DB 里存的原文本不动（审计保真），只有页面渲染走这里 ——
     否则交易后事件列表会出现「BTC_USDT 已开仓 0.00833 BTC」这种混着两种名字的句子。
+    已知映射（BTC/ETH）先精确替换；其余合约（如 SOL_USDT，2026-11-07 补）走通用
+    后缀剥离，与 ``_disp`` 的口径一致 —— 页面任何角落都不出现内部合约名。
     """
     out = str(text or "")
     for k, v in _DISP_COIN.items():
         out = out.replace(k, v)
-    return out
+    return _GENERIC_SYM_RE.sub(r"\1", out)
 
 
 def _addr_text(a: Any) -> str:

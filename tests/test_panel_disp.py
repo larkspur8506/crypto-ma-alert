@@ -56,6 +56,33 @@ class TestRecordsPageDisp(BaseCase):
         self.assertIn("已开仓 · ETH 做多", html)           # 消息正文走 _disp_text
         self.assertIn("+0.0008", html)                    # 小额流水 4 位小数
 
+    def test_records_page_other_symbols_in_messages(self):
+        """SOL_USDT 等其它合约的消息正文也要剥离（_disp_text 通用后缀口径）。"""
+        self.db.log_alert("SOL_USDT", BAR + 1, "exec_alert",
+                          "【HL执行】SOL_USDT 平仓完成 @ 93.41（ma20）", True)
+        self.db.hl_log_event("order", "SOL_USDT 已平仓 1.0 SOL", symbol="SOL_USDT")
+        html = self.get("/admin", tab="records").text
+        self.assertNotIn("_USDT", html)
+        self.assertIn("SOL 平仓完成 @ 93.41", html)
+
+    def test_disp_text_generic_suffix(self):
+        from app.hl.views import _disp_text
+        self.assertEqual(_disp_text("SOL_USDT 已平仓"), "SOL 已平仓")
+        self.assertEqual(_disp_text("BTC_USDT 已开仓"), "BTC 已开仓")
+        self.assertEqual(_disp_text("XPL_USDT @ 1.23"), "XPL @ 1.23")
+        self.assertEqual(_disp_text("普通文本不动"), "普通文本不动")
+
+    def test_fills_tiny_closed_pnl_not_zero(self):
+        """成交表 |cp|<0.01 非 0 → 4 位小数，不再显示 ±0.00。"""
+        self.db.hl_upsert_fill(
+            tid="tiny", symbol="ETH_USDT", coin="ETH", side=-1, sz=0.01, px=3_000.0,
+            fee=0.0, fee_token="USDC", fee_quote=0.0, dir="Close Short",
+            closed_pnl=-0.0004, ts=1_700_000_020_000.0)
+        html = self.get("/admin", tab="records").text
+        self.assertNotIn("_USDT", html)
+        self.assertIn("-0.0004", html)
+        self.assertNotIn(">-0.00<", html)
+
     def test_alerts_subpage_no_internal_symbol(self):
         r = self.get("/admin/list/alerts")
         self.assertEqual(r.status_code, 200)
@@ -121,6 +148,14 @@ class TestLedgerAmountPrecision(unittest.TestCase):
     def test_small_nonzero_gets_four_decimals(self):
         self.assertEqual(self._amt(0.0008), "+0.0008")
         self.assertEqual(self._amt(-0.005), "-0.0050")
+
+    def test_num_small_for_fills(self):
+        from app.admin_ui import _num_small
+        self.assertEqual(_num_small(-0.0004), "-0.0004")
+        self.assertEqual(_num_small(0.008), "0.0080")
+        self.assertEqual(_num_small(0), "0.00")
+        self.assertEqual(_num_small(1.5), "1.50")
+        self.assertEqual(_num_small(None), "—")
 
     def test_zero_and_normal_keep_two_decimals(self):
         self.assertEqual(self._amt(0), "+0.00")
