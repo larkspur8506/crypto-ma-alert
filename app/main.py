@@ -816,6 +816,7 @@ def _hl_deps():
         mode_fn=hl_mode,
         base_url_fn=lambda: hl_params().base_url,
         mr_fn=lambda: dict(_MR_STATUS) if _MR_STATUS else None,
+        snapshot_info_fn=lambda: panel_snapshot_info() if panel_snapshot_on() else None,
     )
 
 

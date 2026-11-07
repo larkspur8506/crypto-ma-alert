@@ -31,7 +31,7 @@ import math
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Request
@@ -101,6 +101,9 @@ class DashboardDeps:
     now_fn: Callable[[], float] = time.time
     #: `() -> dict | None`，MR 腿状态块（app/hl/mr.py 的 tick() 返回值；main 是唯一 writer）。
     mr_fn: Optional[Callable[[], Any]] = None
+    #: 可选：快照优先读取器（`SnapshotInfo`）。`/api/hl/status` 默认（`live=0`）用它免去每次实连交易所，
+    #: 显式传 `?live=1` 或未注入时仍用 `info`（实时客户端）。
+    snapshot_info_fn: Optional[Callable[[], Any]] = None
 
 
 # ---------------------------------------------------------------- 小工具
@@ -634,8 +637,12 @@ def _perf_stats(rows: List[Any]) -> Dict[str, Any]:
             "total_r": round(r_sum, 4)}
 
 
-def status_payload(deps: DashboardDeps) -> dict:
-    """组装监控 JSON（schema_version=1）。任何字段缺失/接口失败都不抛异常。"""
+def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) -> dict:
+    """组装监控 JSON（schema_version=1）。任何字段缺失/接口失败都不抛异常。
+
+    `include_curve_points=False` 时省去 `hl_snapshots` 30 天全量读取与逐点计算（约 440KB JSON），
+    `curve.pnl`/`curve.twr` 置空列表，但保留 `curve.meta` 的回撤熔断（DD Guard）与分窗净入金状态。
+    """
     now = _num(_call(deps.now_fn), time.time())
     address = ""
     try:
@@ -903,13 +910,13 @@ def status_payload(deps: DashboardDeps) -> dict:
     # 「剔除出入金的累计盈亏」，另叠一条时间加权收益指数（TWR，起点 100）：
     # 前者回答「交易赚了多少 U」，后者回答「收益率多少」（入金的时点不影响它）。
     # 计算全在 app/hl/flows.py（纯本地，不打接口）；equity 仍用于熔断基线与顶部数字。
-    snaps = _db_call(deps.db, "hl_snapshots", now - 30 * _DAY, 20000) or []
     flows = _db_call(deps.db, "hl_flows_since", 0.0) or []
     # 「流水可信吗」：有过一次**成功**同步（hl_flows_synced_at）或本地已有流水。
     # 两者都没有 = 从没拉成功过 → 不画曲线（不退回权益曲线：那正是要删掉的东西，
     # 而且会给出误导性走势），只显示一句提示。
     synced_at = _opt_num(_config_get(deps, "hl_flows_synced_at", "0")) or 0.0
     flows_ok = bool(flows) or synced_at > 0
+    snaps = (_db_call(deps.db, "hl_snapshots", now - 30 * _DAY, 20000) or []) if include_curve_points else []
     curve = hl_flows.curve(
         snaps, flows, now=now, window_s=30 * _DAY, flows_ok=flows_ok,
         flows_note="" if flows_ok else "出入金流水读取失败，盈亏曲线暂不可用（系统会自动重试）")
@@ -2543,10 +2550,22 @@ def build_router(deps: DashboardDeps) -> Any:
         return HTMLResponse(render_dashboard(payload))
 
     @router.get("/api/hl/status")
-    def hl_status(request: Request, k: str = ""):
+    def hl_status(request: Request, k: str = "", curve: int = 0, live: int = 0):
+        """只读状态 JSON。
+
+        - `curve=0`（默认）：不展开 30 天逐点 `curve.pnl`/`curve.twr`（省 ~440KB），保留 `curve.meta`；
+          传 `?curve=1` 返回完整点列。
+        - `live=0`（默认）：若注入了 `snapshot_info_fn` 则优先读面板快照（缺失/过期自动回落实时），
+          省去每轮实连 Hyperliquid 的 ~1s 延迟；传 `?live=1` 强制走实时客户端。
+        """
         if _admin_required(deps, k, request):
             raise HTTPException(401, "需要 ?k=<ADMIN_TOKEN>")
-        return status_payload(deps)
+        eff_deps = deps
+        if not live and deps.snapshot_info_fn is not None:
+            sinfo = _call(deps.snapshot_info_fn)
+            if sinfo is not None:
+                eff_deps = replace(deps, info=sinfo)
+        return status_payload(eff_deps, include_curve_points=bool(curve))
 
     @router.get("/api/hl/equity")
     def hl_equity(request: Request, k: str = ""):

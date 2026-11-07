@@ -618,10 +618,16 @@ class TestFailureModes(BaseCase):
 
 class TestOtherRoutes(BaseCase):
     def test_api_status_route_schema(self):
+        self.db.hl_add_snapshot({"ts": FIXED_NOW, "equity": 1234.0, "positions": []})
         r = self.client.get("/api/hl/status")
         self.assertEqual(r.status_code, 200)
-        self.assertEqual(r.json()["schema_version"], 1)
+        j = r.json()
+        self.assertEqual(j["schema_version"], 1)
         self.assertEqual(r.headers["content-type"].split(";")[0], "application/json")
+        self.assertEqual(j["curve"]["pnl"], [], "默认 curve=0 不展开 30d 点列")
+        self.assertIn("dd_status", j["curve"]["meta"])
+        r_curve = self.client.get("/api/hl/status", params={"curve": 1})
+        self.assertEqual(len(r_curve.json()["curve"]["pnl"]), 1)
 
     def test_api_equity_route(self):
         self.insert_fill("f1", closed_pnl=33.0, ts=FIXED_NOW)
