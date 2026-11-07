@@ -49,8 +49,8 @@ from app.hl import dd as hl_dd
 from app.hl import funding as hl_funding
 from app.hl.pnl import QUOTE_FEE_TOKENS   # M3：费用未折算/老数据缺手续费的判据同源
 from app.hl.views import (DASH_CSS, DEFAULT_ROWS, ROW_CHOICES, ROWS_COOKIE, _FILL_BS,
-                        _ST_TXT, _agent_badge_html, _disp, _fee_quoted, _fmt_sz, _kv,
-                        _render_body, _stuck_badge_html, normalize_span,
+                        _ST_TXT, _agent_badge_html, _disp, _disp_text, _fee_quoted,
+                        _fmt_sz, _kv, _render_body, _stuck_badge_html, normalize_span,
                         _signals_html, normalize_rows, status_payload)
 from app.ui_theme import (ICON_LINKS, THEME_COOKIE, DEFAULT_THEME, H1_BLOCK, PRODUCT_NAME,
                           normalize_theme, theme_attr,
@@ -299,11 +299,11 @@ def _msg_cell(msg: str) -> str:
 
 def _table(thead: str, rows_html: str, empty: str, empty_cols: int) -> str:
     if rows_html:
-        return f"<div class='tablewrap'><table><thead><tr>{thead}</tr></thead>" \
-               f"<tbody>{rows_html}</tbody></table></div>"
-    return (f"<div class='tablewrap'><table><thead><tr>{thead}</tr></thead>"
+        return (f"<div class='tscroll'><div class='tablewrap'><table><thead><tr>{thead}</tr></thead>"
+                f"<tbody>{rows_html}</tbody></table></div></div>")
+    return (f"<div class='tscroll'><div class='tablewrap'><table><thead><tr>{thead}</tr></thead>"
             f"<tbody><tr><td colspan='{empty_cols}' class='muted'>{_esc(empty)}</td></tr>"
-            f"</tbody></table></div>")
+            f"</tbody></table></div></div>")
 
 
 def _call(fn: Optional[Callable], default: Any = None) -> Any:
@@ -452,9 +452,13 @@ def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
             tail = tail.split(f"|{_coin_txt}|", 1)[1]
     if tail and tail != "fund:":
         notes.append(_esc(tail))
+    # 金额：|x|<0.01 的非零流水（如 +0.0008 的资金费）用 2 位小数会显示成 ±0.00，
+    # 看起来像没发生 —— 这类小额改显 4 位小数；其余与 0 保持 2 位。
+    amt_txt = ("—" if amt is None
+               else (f"{amt:+.4f}" if amt != 0 and abs(amt) < 0.01 else f"{amt:+,.2f}"))
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
             f"<td>{_esc(kind)}</td>"
-            f"<td class='num {amt_cls}'>{('—' if amt is None else f'{amt:+,.2f}')}</td>"
+            f"<td class='num {amt_cls}'>{amt_txt}</td>"
             f"<td class='num'>{_fmt(bal)}</td>"
             f"<td class='num'>{_esc(link)}</td>"
             f"<td>{' · '.join(notes) or '—'}</td></tr>")
@@ -616,10 +620,12 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         _kind = str(r.get("kind") or "—")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
-                 f"<td>{_esc(r.get('symbol') or '—')}</td>"
+                 # 标的列与消息正文都走 HL 侧显示名（记录页不得出现内部合约名，2026-11-07）；
+                 # DB 原值不动，只在渲染层换。
+                 f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
                  f"<td><span class='{'pos' if ok else 'neg'}'>"
                  f"{'已送达' if ok else '失败'}</span></td>"
-                 f"<td>{_msg_cell(msg)}</td></tr>")
+                 f"<td>{_msg_cell(_disp_text(msg))}</td></tr>")
     # 空表文案区分「真没有」和「被滤光了」：不让人误以为系统没在跑。
     _alert_empty = ("暂无提醒日志" if _alert_raw_n == 0
                     else "该时间窗内只有心跳类例行记录")
@@ -651,8 +657,8 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
         msg = str(r.get("message") or "")
         rows += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                  f"<td>{_esc(_EV_TXT.get(kind, kind))}</td>"
-                 f"<td>{_esc(r.get('symbol') or '—')}</td>"
-                 f"<td>{_msg_cell(msg)}</td></tr>")
+                 f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
+                 f"<td>{_msg_cell(_disp_text(msg))}</td></tr>")
     # 空表文案区分「真没有」和「被滤光了」。
     _event_empty = ("暂无执行器事件" if _event_raw_n == 0
                     else "该时间窗内只有心跳 / 对账一致例行行")
@@ -686,7 +692,7 @@ _LIST_SUBPAGE_CFG: Dict[str, Dict[str, Any]] = {
                                                 ("position_id", "关联单 #", "number"))},
     "events": {"title": "执行器事件", "filters": (("kind", "类型", _EV_TXT),)},
     "alerts": {"title": "提醒日志", "filters": (("kind", "类型", _ALERT_KIND_TXT),)},
-    "positions": {"title": "信号 / 仓位历史", "filters": (("symbol", "标的", None),
+    "positions": {"title": "信号 / 仓位历史", "filters": (("symbol", "标的", _disp),
                                                           ("status", "状态", _ST_TXT))},
 }
 
@@ -806,6 +812,22 @@ def _subpage_parse(deps: AdminDeps, slug: str, params: Any) -> Dict[str, Any]:
                 filters[key] = int(v)
             except ValueError:
                 raw.pop(key)
+        elif callable(kind):
+            # 展示名 ↔ 内部键（2026-11-07）：下拉 option 的 value 用 HL 显示名
+            # （页面 HTML 不得出现内部合约名），取数前映射回内部键；
+            # 旧链接 / 手输内部键也照认（映射不到就原样透传，行为同以前），
+            # 且回显统一改写成显示名，下拉的选中态才对得上。
+            rev: Dict[str, str] = {}
+            fwd: Dict[str, str] = {}
+            try:
+                for o in (deps.db.list_subpage_options(slug, key) or []):
+                    d = str(kind(o))
+                    rev.setdefault(d, str(o))
+                    fwd.setdefault(str(o), d)
+            except Exception:                                         # noqa: BLE001
+                rev, fwd = {}, {}
+            filters[key] = rev.get(v, v)
+            raw[key] = fwd.get(filters[key], v)
         else:
             filters[key] = v
     tf, tt = _date_bounds(params.get("df", ""), params.get("dt", ""), spec["time_unit"])
@@ -869,18 +891,18 @@ def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
             _kind = str(r.get("kind") or "—")
             out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                     f"<td>{_esc(_ALERT_KIND_TXT.get(_kind, _kind))}</td>"
-                    f"<td>{_esc(r.get('symbol') or '—')}</td>"
+                    f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
                     f"<td><span class='{'pos' if ok else 'neg'}'>"
                     f"{'已送达' if ok else '失败'}</span></td>"
-                    f"<td>{_msg_cell(str(r.get('message') or ''))}</td></tr>")
+                    f"<td>{_msg_cell(_disp_text(str(r.get('message') or '')))}</td></tr>")
         return out
     if slug == "events":
         for r in rows:
             kind = str(r.get("kind") or "—")
             out += (f"<tr><td class='num'>{_ts(r.get('created_at'))}</td>"
                     f"<td>{_esc(_EV_TXT.get(kind, kind))}</td>"
-                    f"<td>{_esc(r.get('symbol') or '—')}</td>"
-                    f"<td>{_msg_cell(str(r.get('message') or ''))}</td></tr>")
+                    f"<td>{_esc(_disp(r.get('symbol')) or _coin('', r.get('symbol')) or '—')}</td>"
+                    f"<td>{_msg_cell(_disp_text(str(r.get('message') or '')))}</td></tr>")
         return out
     if slug == "positions":
         for r in rows:
@@ -1046,12 +1068,22 @@ def render_list_subpage(deps: AdminDeps, slug: str, rows_n: int, params: Any) ->
             opts = list(deps.db.list_subpage_options(slug, key) or [])
         except Exception:                                             # noqa: BLE001
             opts = []
-        if cur and cur not in opts:
-            opts.append(cur)                    # 当前筛选值不在去重列表（如刚删的行）也要回显
+
+        def _opt_pair(v: str) -> Tuple[str, str]:
+            """(option value, 显示文案)。callable kind（symbol 展示名映射）：
+            value 与文案都用显示名 —— 页面 HTML 不出现内部合约名，取数侧再映射回去。"""
+            if callable(kind):
+                d = str(kind(v))
+                return d, d
+            return v, (kind.get(v, v) if isinstance(kind, dict) else v)
+
+        # 当前筛选值不在去重列表（如刚删的行）也要回显；callable kind 时按显示名比。
+        if cur and cur not in [_opt_pair(o)[0] for o in opts]:
+            opts.append(cur)
         items = "".join(
-            f"<option value='{_esc(v)}'{' selected' if v == cur else ''}>"
-            f"{_esc(kind.get(v, v) if isinstance(kind, dict) else v)}</option>"
-            for v in opts)
+            f"<option value='{_esc(val)}'{' selected' if val == cur else ''}>"
+            f"{_esc(lbl)}</option>"
+            for v in opts for val, lbl in (_opt_pair(v),))
         form.append(f"<label class='chk'>{_esc(label)} <select name='{_esc(key)}'>"
                     f"<option value=''>全部</option>{items}</select></label>")
     form.append(f"<label class='chk'>从 <input type='date' name='df' value='{_esc(parsed['raw'].get('df', ''))}'></label>")
