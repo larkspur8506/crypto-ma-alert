@@ -245,6 +245,19 @@ def _fmt(v: Any, dp: int = 2) -> str:
     return "—" if f is None else f"{f:,.{dp}f}"
 
 
+def _num_small(v: Any, dp: int = 2, dp_small: int = 4) -> str:
+    """数值单元格：|x|<0.01 的非零值用 dp_small 位小数（2026-11-07）。
+
+    2 位小数会把 -0.0004 这类小额平仓盈亏显示成 ±0.00 —— 看起来像零，
+    实际不是零；其余（含 0）保持 dp 位。"""
+    f = _opt_num(v)
+    if f is None:
+        return "—"
+    if f != 0 and abs(f) < 0.01:
+        return f"{f:.{dp_small}f}"
+    return f"{f:,.{dp}f}"
+
+
 def _ts(v: Any) -> str:
     """时间 → 北京时间（口径同 app.engine：秒/毫秒都认，>1e12 视为毫秒）。"""
     f = _opt_num(v)
@@ -573,7 +586,7 @@ def render_records(deps: AdminDeps, rows_n: int = DEFAULT_ROWS,
                  f"<td class='num'>{_fmt(r.get('sz'), 4)}</td>"
                  f"<td class='num'>{_fmt(r.get('px'))}</td>"
                  f"<td class='num'>{fee_txt}</td>"
-                 f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
+                 f"<td class='num {cp_cls}'>{_num_small(cp)}</td>"
                  f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
     o.append(_table("<th>时间</th><th>币种</th><th>买卖</th><th class='num'>数量</th>"
                     "<th class='num'>价格</th><th class='num'>手续费</th>"
@@ -882,7 +895,7 @@ def _subpage_rows_html(slug: str, rows: List[Dict[str, Any]],
                     f"<td class='num'>{_fmt(r.get('sz'), 4)}</td>"
                     f"<td class='num'>{_fmt(r.get('px'))}</td>"
                     f"<td class='num'>{fee_txt}</td>"
-                    f"<td class='num {cp_cls}'>{_fmt(cp)}</td>"
+                    f"<td class='num {cp_cls}'>{_num_small(cp)}</td>"
                     f"<td>{'是' if r.get('reduce_only') else '—'}</td></tr>")
         return out
     if slug == "alerts":
