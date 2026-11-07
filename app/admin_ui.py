@@ -487,7 +487,7 @@ def _merged_funding_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
     # 与 _ledger_row_html 同一条小额规则：|x|<0.01 非 0 用 4 位小数（全天合计也可能很小）。
     amt_txt = ("—" if amt is None
                else (f"{amt:+.4f}" if amt != 0 and abs(amt) < 0.01 else f"{amt:+,.2f}"))
-    note = f"全天 {int(r.get('_cnt') or 0)} 条合并 · 明细见「全部 ›」"
+    note = f"全天 {int(r.get('_cnt') or 0)} 条合并 · 明细见「全部」子页"
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
             f"<td>资金费汇总</td>"
             f"<td class='num {amt_cls}'>{amt_txt}</td>"
@@ -585,7 +585,7 @@ def _funds_ledger_html(deps: AdminDeps, n: int) -> str:
                      rows_html, "暂无流水（等首次同步，或执行器未配置 HL 账户）", 6)
             + "<div class='legend'>余额 = 自账户 0 起累计（全量正序累加后再取当前页）· "
               "成交行金额 = 平仓盈亏 − 手续费 · 资金费正 = 收入 · 关联单 #N = 归集到的仓位 · "
-              "同日多条资金费合并为一行（金额=全天合计），逐条明细在「全部 ›」</div>"
+              "同日多条资金费合并为一行（金额=全天合计），逐条明细见「全部」子页</div>"
             "</div>")
 
 

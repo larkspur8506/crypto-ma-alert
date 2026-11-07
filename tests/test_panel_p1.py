@@ -362,8 +362,10 @@ class TestWordFixes(BaseCase):
         self.assertEqual(row.count("BTC"), 1, "币名只出现一次（曾渲染成 BTC · |BTC|+0.009152）")
         self.assertNotIn("|BTC|", row)
         self.assertNotIn("|BTC|", html)
-        # hash 类 ref（不含 |币名| 段）原样保留
-        self.db.hl_add_funding({"ts": NOW - 7200, "coin": "ETH", "amount_usd": 0.02,
+        # hash 类 ref（不含 |币名| 段）原样保留；两条放不同「显示日」——
+        # 同日 ≥2 条资金费会被记录页合并成「资金费汇总」（见 test_panel_disp），
+        # 逐条词面要单测就得各占一天。
+        self.db.hl_add_funding({"ts": NOW - 90000, "coin": "ETH", "amount_usd": 0.02,
                                 "position_id": None, "ref": "fund:0xabc123def4567890"})
         html2 = self.admin(tab="records")
         self.assertIn("def4567890", html2, "hash 类截尾不受去重影响")
