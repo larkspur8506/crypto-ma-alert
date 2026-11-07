@@ -315,15 +315,26 @@ class TestWiring(unittest.TestCase):
         self.assertNotIn("HL 延迟 <b>0 ms</b>", r.text)
         self.assertNotIn("HL 延迟 <b>1 ms</b>", r.text)
 
-    def test_status_api_keeps_live_semantics(self):
-        """`/api/hl/status` 走实时读数：延迟是本次请求实测，不属于快照。"""
+    def test_status_api_defaults_to_snapshot_and_supports_live_flag(self):
+        """`/api/hl/status` 默认走快照（零网络）且不展开全量 curve；`?live=1` 走实时，`?curve=1` 展开点列。"""
+        self.mod.db.hl_add_snapshot({"ts": time.time(), "equity": 42.0, "positions": []})
         self.assertTrue(self._capture())
+        self._write_latency(456.7, age_s=300.0)
+        self.info.reset()
         with self.TestClient(self.mod.app) as c:
             got = c.get("/api/hl/status", params={"k": "snap-tk"}).json()
-        net = got["network"]
-        self.assertIsInstance(net["latency_ms"], (int, float))
-        self.assertFalse(net["latency_from_snapshot"])
-        self.assertIsNone(net["latency_age_s"])
+            self.assertEqual(self.info.total, 0, "默认 live=0 应读快照不打 HL")
+            self.assertEqual(got["curve"]["pnl"], [], "默认 curve=0 不展开 30d 点列")
+            self.assertIn("net_deposit", got["curve"]["meta"])
+            net = got["network"]
+            self.assertTrue(net["latency_from_snapshot"])
+            self.assertAlmostEqual(net["latency_ms"], 456.7)
+            # 显式 ?live=1&curve=1 走实时并展开点列
+            live_got = c.get("/api/hl/status", params={"k": "snap-tk", "live": 1, "curve": 1}).json()
+            self.assertGreaterEqual(self.info.snapshots, 1)
+            self.assertFalse(live_got["network"]["latency_from_snapshot"])
+            self.assertIsNone(live_got["network"]["latency_age_s"])
+            self.assertEqual(len(live_got["curve"]["pnl"]), 1)
 
     def test_live_mode_still_shows_latency(self):
         """没有快照（回落实时）时延迟徽章照常给数字 —— 这条防止修上一条修过头。"""

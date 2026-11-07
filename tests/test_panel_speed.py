@@ -364,12 +364,16 @@ class TestFullAppPanelSpeed(unittest.TestCase):
             self.assertEqual(self.info.snapshots, 1, f"四个 Tab 只该取一次快照：{self.info.calls}")
             self.assertEqual(self.info.total, 4)
 
-    def test_json_api_is_not_cached(self):
-        """/api/hl/* 保持逐次现取（运维 curl 与巡检脚本依赖它读到「现在」）。"""
+    def test_json_api_defaults_to_cached_and_live_flag_bypasses(self):
+        """/api/hl/status 默认走快照/缓存（零重复请求），传 ?live=1 保持逐次现取。"""
         with self.TestClient(self.mod.app) as c:
             for _ in range(2):
                 self.assertEqual(c.get("/api/hl/status", params={"k": TOKEN}).status_code, 200)
-            self.assertEqual(self.info.snapshots, 2)
+            self.assertEqual(self.info.snapshots, 1, "默认走缓存/快照，TTL 内两次只取一次")
+            self.info.reset()
+            for _ in range(2):
+                self.assertEqual(c.get("/api/hl/status", params={"k": TOKEN, "live": 1}).status_code, 200)
+            self.assertEqual(self.info.snapshots, 2, "live=1 逐次现取")
 
     def test_executor_info_is_not_wrapped(self):
         """执行器/看护拿的是 get_hl_info() 真身：两次 snapshot 就是两次请求。"""
