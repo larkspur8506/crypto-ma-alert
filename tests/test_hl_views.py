@@ -476,6 +476,52 @@ class TestStatusPayload(BaseCase):
         self.assertAlmostEqual(ev_at, p["events"][0]["ts"], places=6)
 
 
+class TestCurveOmission(BaseCase):
+    """`curve=0` 的诚实口径（2026-11-08 审核 P3）：省点列不许把汇总数写成 0。
+
+    `/api/hl/status` 与 `/api/hl/equity` 默认 `curve=0`（省 ~440KB），此时 pnl/twr 点列不读，
+    由点列导出的 pnl_total / max_dd_pnl / twr_total_pct / points / equity_base 是「没算」
+    而不是「0」—— 写成 0 会让消费方把「省带宽」读成「这账户没赚没亏、最大回撤 0」。
+    """
+
+    def _seed(self) -> None:
+        now = FIXED_NOW
+        self.db.set_config("hl_flows_synced_at", str(int(now)))
+        for i in range(10):
+            self.db.hl_add_snapshot({"ts": now - (9 - i) * 3600, "equity": 1000.0 + i * 10,
+                                     "positions": []})
+
+    def test_full_curve_has_numbers_and_no_flag(self):
+        self._seed()
+        meta = self.payload()["curve"]["meta"]
+        self.assertFalse(meta.get("curve_omitted"))
+        for k in ("pnl_total", "max_dd_pnl", "twr_total_pct", "points"):
+            self.assertIsNotNone(meta.get(k), k)
+
+    def test_omitted_curve_is_none_not_zero(self):
+        self._seed()
+        curve = status_payload(self.deps, include_curve_points=False)["curve"]
+        self.assertEqual(curve["pnl"], [])
+        self.assertEqual(curve["twr"], [])
+        m = curve["meta"]
+        self.assertTrue(m.get("curve_omitted"))
+        for k in ("pnl_total", "pnl_7d", "max_dd_pnl", "twr_total_pct", "points", "equity_base"):
+            self.assertIsNone(m[k], f"{k} 省略时必须是 None，不能是 0")
+        # 与点列无关的两类仍是真的：DD Guard 状态、净入金。
+        self.assertIn("dd_status", m)
+        self.assertIsNotNone(m.get("net_deposit"))
+        self.assertIn("net_deposit_span", m)
+
+    def test_api_default_is_omitted(self):
+        self._seed()
+        m = self.client.get("/api/hl/status").json()["curve"]["meta"]
+        self.assertTrue(m.get("curve_omitted"))
+        self.assertIsNone(m.get("pnl_total"))
+        full = self.client.get("/api/hl/status", params={"curve": 1}).json()["curve"]["meta"]
+        self.assertFalse(full.get("curve_omitted"))
+        self.assertIsNotNone(full.get("pnl_total"))
+
+
 class TestSystemAndReconcile(BaseCase):
     def test_system_field_types(self):
         s = self.payload()["system"]

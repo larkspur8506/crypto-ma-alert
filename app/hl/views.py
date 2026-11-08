@@ -642,6 +642,8 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
 
     `include_curve_points=False` 时省去 `hl_snapshots` 30 天全量读取与逐点计算（约 440KB JSON），
     `curve.pnl`/`curve.twr` 置空列表，但保留 `curve.meta` 的回撤熔断（DD Guard）与分窗净入金状态。
+    此时**由点列导出的汇总数一律置 None 并标 `curve_omitted=True`** —— 它们是「没算」而不是 0，
+    写成 0 会让消费方把「省了 440KB」读成「这账户没赚没亏、最大回撤 0」（2026-11-08 审核 P3）。
     """
     now = _num(_call(deps.now_fn), time.time())
     address = ""
@@ -939,6 +941,13 @@ def status_payload(deps: DashboardDeps, *, include_curve_points: bool = True) ->
                 "7": round(dep_7, 6), "30": round(dep_30, 6)}
         except Exception as e:                                    # noqa: BLE001
             logger.warning("[hl-views] 分窗净入金计算失败（渲染层回退全期口径）：%s", e)
+        # 省略点列（`curve=0`）时，由点列导出的量是**没算**而不是 0：一律 None + 显式标记。
+        # 净入金（net_deposit / net_deposit_span）与 dd_* 仍是真的（各自独立于点列）。
+        if not include_curve_points:
+            for _k in ("pnl_total", "pnl_7d", "max_dd_pnl", "twr_total_pct",
+                       "points", "equity_base"):
+                curve["meta"][_k] = None
+            curve["meta"]["curve_omitted"] = True
 
     # ---------------- 事件 / 系统 ----------------
     events: List[dict] = []
