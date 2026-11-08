@@ -165,6 +165,49 @@ class TestLedgerAmountPrecision(unittest.TestCase):
     def test_none_is_dash(self):
         self.assertEqual(self._amt(None), "—")
 
+    def test_four_decimals_still_zero_falls_back_to_six(self):
+        """4 位仍圆成 0.0000 的量级再退到 6 位（2026-11-08 审核 P3）。
+
+        否则「治好了 ±0.00」只是换成「±0.0000」，同一个坑换位数。"""
+        from app.admin_ui import _num_small, _signed_small
+        self.assertEqual(self._amt(0.00002), "+0.000020")
+        self.assertEqual(self._amt(-0.00003), "-0.000030")
+        self.assertEqual(_num_small(-0.00004), "-0.000040")
+        self.assertEqual(_signed_small(0), "+0.00")          # 真 0 仍是 2 位
+        self.assertEqual(_signed_small(None), "—")
+
+
+class TestFundingDayKey(unittest.TestCase):
+    """资金费合并的日键带年份：跨年后同一天不能被合成一行（2026-11-08 审核 P3）。"""
+
+    @staticmethod
+    def _rows():
+        import datetime as dt
+        tz = dt.timezone(dt.timedelta(hours=8))
+        # 2026-11-07 与 2027-11-07 的同一时段（北京时间 10:00），MM-DD 完全相同
+        t26 = dt.datetime(2026, 11, 7, 10, 0, tzinfo=tz).timestamp()
+        t27 = dt.datetime(2027, 11, 7, 10, 0, tzinfo=tz).timestamp()
+        rows = [
+            {"ts": t26, "kind": "funding", "amount_usd": 0.5},
+            {"ts": t26 + 3600, "kind": "funding", "amount_usd": 0.5},
+            {"ts": t27, "kind": "funding", "amount_usd": -9.0},
+            {"ts": t27 + 3600, "kind": "funding", "amount_usd": -9.0},
+        ]
+        return rows
+
+    def test_same_month_day_different_year_is_not_merged(self):
+        from app.admin_ui import _merge_funding_daily
+        rows = self._rows()
+        merged = _merge_funding_daily(rows, [None] * len(rows))
+        self.assertEqual(len(merged), 2, "两年的 11-07 必须各一行")
+        self.assertAlmostEqual(merged[0][0]["amount_usd"], 1.0)
+        self.assertAlmostEqual(merged[1][0]["amount_usd"], -18.0)
+
+    def test_day_key_carries_year(self):
+        from app.admin_ui import _funding_day
+        ts = self._rows()[0]["ts"]
+        self.assertEqual(_funding_day(ts), "2026-11-07")
+
 
 class TestPnlSvgGeometry(unittest.TestCase):
     """盈亏曲线：铺满 + 抗拉伸 + 文字出 SVG。"""

@@ -249,13 +249,29 @@ def _num_small(v: Any, dp: int = 2, dp_small: int = 4) -> str:
     """数值单元格：|x|<0.01 的非零值用 dp_small 位小数（2026-11-07）。
 
     2 位小数会把 -0.0004 这类小额平仓盈亏显示成 ±0.00 —— 看起来像零，
-    实际不是零；其余（含 0）保持 dp 位。"""
+    实际不是零；其余（含 0）保持 dp 位。
+    4 位仍会圆成 0.0000 的量级（如 -0.00003）再退两档到 6 位 —— 否则「治好了 ±0.00，
+    又冒出 ±0.0000」，同一个坑换个位数（2026-11-08 审核 P3）。"""
     f = _opt_num(v)
     if f is None:
         return "—"
     if f != 0 and abs(f) < 0.01:
-        return f"{f:.{dp_small}f}"
+        txt = f"{f:.{dp_small}f}"
+        return txt if _opt_num(txt) else f"{f:.{dp_small + 2}f}"
     return f"{f:,.{dp}f}"
+
+
+def _signed_small(v: Any) -> str:
+    """资金流水金额：带符号 + 千分位；小额同一套「4 位→6 位」退档规则。
+
+    与 `_num_small` 只差正号（流水表要能一眼看出收/付），退档理由相同。"""
+    f = _opt_num(v)
+    if f is None:
+        return "—"
+    if f != 0 and abs(f) < 0.01:
+        txt = f"{f:+.4f}"
+        return txt if _opt_num(txt) else f"{f:+.6f}"
+    return f"{f:+,.2f}"
 
 
 def _ts(v: Any) -> str:
@@ -466,9 +482,8 @@ def _ledger_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
     if tail and tail != "fund:":
         notes.append(_esc(tail))
     # 金额：|x|<0.01 的非零流水（如 +0.0008 的资金费）用 2 位小数会显示成 ±0.00，
-    # 看起来像没发生 —— 这类小额改显 4 位小数；其余与 0 保持 2 位。
-    amt_txt = ("—" if amt is None
-               else (f"{amt:+.4f}" if amt != 0 and abs(amt) < 0.01 else f"{amt:+,.2f}"))
+    # 看起来像没发生 —— 这类小额改显 4 位小数（更小的量级自动退到 6 位，见 _signed_small）。
+    amt_txt = _signed_small(amt)
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
             f"<td>{_esc(kind)}</td>"
             f"<td class='num {amt_cls}'>{amt_txt}</td>"
@@ -484,9 +499,8 @@ def _merged_funding_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
     """
     amt = _opt_num(r.get("amount_usd"))
     amt_cls = "pos" if (amt or 0) > 0 else ("neg" if (amt or 0) < 0 else "")
-    # 与 _ledger_row_html 同一条小额规则：|x|<0.01 非 0 用 4 位小数（全天合计也可能很小）。
-    amt_txt = ("—" if amt is None
-               else (f"{amt:+.4f}" if amt != 0 and abs(amt) < 0.01 else f"{amt:+,.2f}"))
+    # 与 _ledger_row_html 同一条小额规则（4 位，更小退 6 位）—— 全天合计也可能很小。
+    amt_txt = _signed_small(amt)
     note = f"全天 {int(r.get('_cnt') or 0)} 条合并 · 明细见「全部」子页"
     return (f"<tr><td class='num'>{_ts(r.get('ts'))}</td>"
             f"<td>资金费汇总</td>"
@@ -494,6 +508,14 @@ def _merged_funding_row_html(r: Dict[str, Any], bal: Optional[float]) -> str:
             f"<td class='num'>{_fmt(bal)}</td>"
             f"<td class='num'>—</td>"
             f"<td>{_esc(note)}</td></tr>")
+
+
+def _funding_day(ts: Optional[float]) -> str:
+    """资金费同日合并的日键：**必须带年份**。
+
+    `%m-%d` 会把 2026-11-07 与 2027-11-07 判成同一天（合并行金额变成两年的合计）——
+    账本是无窗口全量读取，跨年后必然踩到（2026-11-08 审核 P3）。"""
+    return dt.datetime.fromtimestamp(float(ts), engine.DISPLAY_TZ).strftime("%Y-%m-%d")
 
 
 def _merge_funding_daily(rows: List[Dict[str, Any]],
@@ -516,7 +538,7 @@ def _merge_funding_daily(rows: List[Dict[str, Any]],
         ts = _opt_num(r.get("ts"))
         if ts is None:
             continue
-        day = dt.datetime.fromtimestamp(ts, engine.DISPLAY_TZ).strftime("%m-%d")
+        day = _funding_day(ts)
         last_idx[day] = i
         sums[day] = sums.get(day, 0.0) + (_opt_num(r.get("amount_usd")) or 0.0)
         cnt[day] = cnt.get(day, 0) + 1
@@ -524,8 +546,7 @@ def _merge_funding_daily(rows: List[Dict[str, Any]],
     for i, (r, bal) in enumerate(zip(rows, balances)):
         if r.get("kind") == "funding":
             ts = _opt_num(r.get("ts"))
-            day = (dt.datetime.fromtimestamp(ts, engine.DISPLAY_TZ).strftime("%m-%d")
-                   if ts is not None else "")
+            day = (_funding_day(ts) if ts is not None else "")
             if cnt.get(day, 0) < 2:
                 out.append((r, bal))
                 continue
